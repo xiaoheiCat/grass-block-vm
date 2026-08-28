@@ -41,8 +41,26 @@ public class QemuCommandBuilderTests : IDisposable
         Assert.DoesNotContain("virtio-blk", j);
         Assert.Contains("-device e1000,netdev=net", j);          // Windows 原生可识别网卡
         Assert.Contains("OVMF_CODE.secboot.fd", j);              // Secure Boot 固件
-        Assert.Contains("tpm-tis", j);                           // TPM 2.0
+        // TPM 参数依赖 GrassCore 先拉起模拟器宿主（Windows 实机阶段交付）；
+        // 宿主未就绪时跳过（配置里的意图保留），否则 QEMU 初始化即失败
+        Assert.DoesNotContain("tpm-tis", j);
+        Assert.Contains("-display none", j);                     // 用户永远看不见 QEMU 自己的窗口
         Assert.Contains("-rtc base=localtime", j);               // Windows 期望本地时间 RTC
+    }
+
+    [Fact]
+    public void TpmArgs_EmittedOnlyWhenHostReady()
+    {
+        var config = OsProfileLibrary.CreateDefaultConfig("windows-11", "TPM VM");
+        config.Devices.Add(new DiskDevice { Path = "disks/system.qcow2", SizeBytes = 80L * 1024 * 1024 * 1024, CreatedOrder = 10 });
+        var withHost = string.Join(" ", Build(config, _pkg.Path));
+
+        // 宿主就绪：TPM 2.0 参数生成
+        var builder = new QemuCommandBuilder(config, Path.Combine(_dir, "fw")) { TpmHostReady = true };
+        var ready = string.Join(" ", builder.Build(_pkg.Path).Args);
+
+        Assert.DoesNotContain("tpm-tis", withHost);   // 默认：宿主未就绪
+        Assert.Contains("tpm-tis", ready);            // 宿主就绪：TPM 2.0 生效
     }
 
     [Fact]

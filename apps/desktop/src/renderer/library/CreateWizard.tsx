@@ -27,6 +27,7 @@ const STEP_TITLES: Record<WizardState['step'], string> = {
 
 interface GrassApi {
   coreCall<T = unknown>(method: string, params?: unknown): Promise<T>;
+  pickOpenFile(filterName: string, extensions: string[]): Promise<string | null>;
 }
 const api: GrassApi | undefined = (window as unknown as { grassvm?: GrassApi }).grassvm;
 
@@ -38,9 +39,12 @@ export function CreateWizard(props: {
 }): React.ReactElement {
   const [state, setState] = useState<WizardState>(() => initialWizardState(props.profiles));
   const [name, setName] = useState('');
-  const [isoPath, setIsoPath] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // ISO 路径归属向导状态（canAdvance/toCreateRequest 都读它），不再用脱钩的本地 state
+  const isoPath = state.isoPath;
+  const setIsoPath = (v: string | null): void =>
+    setState((s) => ({ ...s, isoPath: v && v.trim() ? v.trim() : null }));
 
   const sorted = useMemo(() => sortProfilesForDisplay(props.profiles), [props.profiles]);
   const selected = state.profiles.find((p) => p.id === state.selectedProfileId) ?? null;
@@ -115,6 +119,16 @@ export function CreateWizard(props: {
                   placeholder="例如 C:\ISO\ubuntu-24.04-desktop-amd64.iso"
                   onChange={(e) => setIsoPath(e.target.value)}
                 />
+                <button
+                  className="btn-ghost"
+                  onClick={async () => {
+                    if (!api) return;
+                    const picked = await api.pickOpenFile('安装镜像（ISO）', ['iso']);
+                    if (picked) setIsoPath(picked);
+                  }}
+                >
+                  浏览…
+                </button>
               </label>
             </div>
           )}

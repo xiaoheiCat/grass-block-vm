@@ -16,7 +16,8 @@ public static class SnapshotService
     private static readonly JsonSerializerOptions Opts = new() { WriteIndented = true };
 
     public static Snapshot Create(GrassVmPackage package, VmConfiguration config, string name,
-        string? description = null, bool isUpgradeProtection = false)
+        string? description = null, bool isUpgradeProtection = false,
+        GrassCore.Qemu.TransactionalDiskOps? diskOps = null)
     {
         var snap = new Snapshot
         {
@@ -39,13 +40,21 @@ public static class SnapshotService
                 .OrderByDescending(s => s.CreatedAt).FirstOrDefault();
         snap.ParentSnapshotUuid = parent?.Uuid;
 
-        // 每个"包内"磁盘设备生成 overlay 引用（包外磁盘不参与数据回滚）
+        // 每个"包内"磁盘设备生成 overlay（包外磁盘不参与数据回滚）。
+        // overlay 落在 snapshots/<uuid>/disks/，backing = 当前工作盘文件；
+        // 链接克隆与恢复都以它为锚点，所以必须在创建快照时真实生成（不是只登记引用）。
         foreach (var disk in config.DevicesOfType<DiskDevice>().Where(d => !d.IsExternal))
         {
-            var overlayFile = $"disks/disk-{disk.DeviceId}.qcow2";
-            snap.DiskOverlayRefs[disk.DeviceId] = overlayFile;
-            // 实际 overlay 创建（qemu-img create -f qcow2 -b backing）由 GrassCore 调用 qemu-img 完成；
-            // 这里登记引用，Windows 实机联调阶段与 QMP stop/commit 序列对齐。
+            var overlayRel = $"disks/disk-{disk.DeviceId}.qcow2";
+            snap.DiskOverlayRefs[disk.DeviceId] = overlayRel;
+            if (diskOps is not null)
+            {
+                var overlayAbs = System.IO.Path.Combine(package.SnapshotsPath, snap.Uuid, overlayRel.Replace('/', System.IO.Path.DirectorySeparatorChar));
+                Directory.CreateDirectory(System.IO.Path.GetDirectoryName(overlayAbs)!);
+                var backingAbs = GrassCore.GrassVm.PathPolicy.Resolve(package, disk.Path);
+                if (File.Exists(backingAbs))
+                    diskOps.CreateOverlay(backingAbs, overlayAbs);
+            }
         }
         WriteSnapshot(package, snap);
         // 新快照成为当前工作位置

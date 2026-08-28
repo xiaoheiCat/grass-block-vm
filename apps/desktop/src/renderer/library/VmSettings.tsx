@@ -287,7 +287,8 @@ function renderPane(d: (typeof DEVICE_ORDER)[number], locked: boolean, p: PanePr
   }
 }
 
-function networkModeLabel(mode?: string): string {
+/** 与 C# NetworkMode 枚举的 camelCase 线值一一对应 */
+export function networkModeLabel(mode?: string): string {
   switch (mode) {
     case 'nat':
       return 'NAT（默认）';
@@ -295,7 +296,7 @@ function networkModeLabel(mode?: string): string {
       return '桥接';
     case 'hostOnly':
       return 'Host-only';
-    case 'none':
+    case 'disconnected':
       return '断开';
     default:
       return mode ?? '未知';

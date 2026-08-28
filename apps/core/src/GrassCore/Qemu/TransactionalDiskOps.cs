@@ -119,10 +119,12 @@ public sealed class TransactionalDiskOps
     {
         // 取消 = Kill qemu-img（整棵进程树），等待退出后只清理临时产物，原文件不动
         using var reg = ct.Register(() => op.Cancel());
-        // stderr 并行排水：等待退出期间子进程的输出不会塞满管道造成死锁
+        // stdout/stderr 并行排水：等待退出期间子进程的输出不会塞满管道造成死锁
         var errTask = op.Process!.StandardError.ReadToEndAsync(CancellationToken.None);
+        var outTask = op.Process.StandardOutput.ReadToEndAsync(CancellationToken.None);
         await op.Process.WaitForExitAsync(CancellationToken.None);
         var err = (await errTask).Trim();
+        _ = await outTask;
         if (ct.IsCancellationRequested)
         {
             CleanupTemp(op);
@@ -186,6 +188,12 @@ public sealed class StartupPreflight
         }
         if (!config.HasDisplayDevice)
             problems.Add(new Problem("此虚拟机没有显示设备，无法启动。", Fatal: true));
+        if (config.NeedsNvram && !File.Exists(Path.Combine(package.FirmwarePath, "VARS.fd")))
+        {
+            problems.Add(new Problem(
+                "此虚拟机的启动固件数据（NVRAM）缺失。请在设置中重建，或删除后重新创建这台虚拟机。",
+                Fatal: true));
+        }
 
         foreach (var disk in config.Disks)
         {
@@ -212,6 +220,7 @@ public sealed class StartupPreflight
 /// <summary>预检用的配置视图（避免 Qemu 层直接依赖 Config 命名空间的循环）。</summary>
 public sealed record VmConfigView(
     bool HasDisplayDevice,
+    bool NeedsNvram,
     IReadOnlyList<VmConfigView.DiskView> Disks,
     IReadOnlyList<VmConfigView.CdView> Cds)
 {

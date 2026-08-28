@@ -22,7 +22,8 @@ public sealed class GrassCoreService
     private readonly string _ovmfDir;
     private readonly string _bundledQemuMajor;
     private readonly IQemuProcessLauncher _launcher;
-    private readonly Dictionary<string, RunningVm> _running = new(StringComparer.OrdinalIgnoreCase);
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, RunningVm> _running =
+        new(StringComparer.OrdinalIgnoreCase);
 
     public GrassCoreService(HostDb db, string qemuSystemPath, string qemuImgPath, string ovmfDir,
         string bundledQemuMajor, IQemuProcessLauncher? launcher = null,
@@ -187,14 +188,28 @@ public sealed class GrassCoreService
             throw new GrassCoreException(
                 "此虚拟机已挂起。请使用“恢复”回到挂起时的状态；如不需要保存的状态，请先恢复后再正常关机。");
 
-        // 预检：资源、vm.lock、显示设备（WHPX 检测在 Windows 主机上执行）
+        // 已在运行（本 Core 实例）：幂等拒绝，不触碰任何状态
+        if (_running.ContainsKey(pkg.Path))
+            throw new GrassCoreException("此虚拟机已经在运行。");
+
+        // 预检：资源、vm.lock、显示设备、NVRAM（WHPX 检测在 Windows 主机上执行）
         var view = ToConfigView(config);
         var problems = StartupPreflight.Check(pkg, view);
         if (problems.Any(p => p.Fatal))
             throw new GrassCoreException(string.Join("\n", problems.Where(p => p.Fatal).Select(p => p.UserMessage)));
 
+        // WHPX：只使用硬件虚拟化，初始化失败即阻止启动，绝不静默回退 TCG
+        if (OperatingSystem.IsWindows())
+        {
+            var whpx = WhpxCapability.CheckWindows();
+            if (!whpx.Available)
+                throw new GrassCoreException(
+                    $"此电脑无法使用硬件虚拟化（WHPX）：{whpx.UserGuidance}");
+        }
+
         var @lock = new VmLock(pkg);
         @lock.Acquire();
+        bool lockAcquired = true; // 预检通过后到这里才拥有锁；此前抛出都不属于本调用
         Process? proc = null;
         try
         {
@@ -235,13 +250,14 @@ public sealed class GrassCoreService
         }
         catch
         {
-            // 启动失败回滚：不留幻影"运行中"（杀已拉起的进程、清 runtime、释放锁）
-            RollbackStart(pkg, proc);
+            // 启动失败回滚：只清理【本次调用】获得的资源（锁/进程/runtime）。
+            // 若失败发生在取锁之前（预检拒绝），不触碰磁盘上的任何状态——那是别人的锁。
+            if (lockAcquired) RollbackStart(pkg, proc);
             throw;
         }
     }
 
-    /// <summary>启动失败回滚（QEMU 未成功进入可控状态）。</summary>
+    /// <summary>启动失败回滚（QEMU 未成功进入可控状态）。调用方必须持有 vm.lock。</summary>
     private static void RollbackStart(GrassVmPackage pkg, Process? proc)
     {
         try
@@ -280,9 +296,14 @@ public sealed class GrassCoreService
             throw new GrassCoreException(
                 "此挂起状态是在不同的硬件或 QEMU 版本上保存的，无法保证正确恢复。建议重新启动虚拟机。");
 
+        if (_running.ContainsKey(pkg.Path))
+            throw new GrassCoreException("此虚拟机已经在运行。");
+
         var @lock = new VmLock(pkg);
         @lock.Acquire();
+        bool lockAcquired = true;
         Process? proc = null;
+        bool registered = false;
         try
         {
             var sessionId = Guid.NewGuid().ToString("N")[..12];
@@ -303,6 +324,7 @@ public sealed class GrassCoreService
             var vm = new RunningVm(pkg.Path, session, proc);
             vm.Qmp = TryConnectQmp(session.QmpPipe);
             _running[pkg.Path] = vm;
+            registered = true;
             WatchQemuProcess(vm);
 
             // 恢复确认：-incoming 迁移完成（query-status=running）后才清除挂起标记。
@@ -340,9 +362,10 @@ public sealed class GrassCoreService
         }
         catch
         {
-            // 失败回滚与 StartVm 同规则：不留幻影运行中（已拉起的进程一并终止）
-            _running.Remove(pkg.Path);
-            RollbackStart(pkg, proc);
+            // 失败回滚与 StartVm 同规则：只清理本次调用获得的资源；
+            // 仅在确实注册进 _running 后才移除（别人的运行实例绝不动）
+            if (registered) _running.TryRemove(pkg.Path, out _);
+            if (lockAcquired) RollbackStart(pkg, proc);
             throw;
         }
     }
@@ -451,18 +474,21 @@ public sealed class GrassCoreService
 
     private QmpClient? TryConnectQmp(string pipeName)
     {
+        QmpClient? client = null;
         try
         {
             var transport = _qmpTransportFactory(pipeName);
             if (transport is null) return null;
-            var client = new QmpClient(transport);
+            client = new QmpClient(transport);
             // 在线程池线程完成握手（避免捕获调用方上下文死锁）；QEMU 启动窗口内可能未就绪 → 限时等待
             Task.Run(() => client.ConnectAsync()).WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
             return client;
         }
         catch
         {
-            return null; // QMP 未就绪（QEMU 尚在启动窗口内）；后续操作会再次尝试
+            // 未就绪/超时：释放本次失败的连接（调用方后续会重试），不累积泄漏句柄
+            client?.Dispose();
+            return null;
         }
     }
 
@@ -529,13 +555,26 @@ public sealed class GrassCoreService
             }
             Thread.Sleep(500);
         }
-        qmp.ForceQuitAsync().GetAwaiter().GetResult();
 
-        // 状态落盘：标记挂起 + 指纹（只保证相同宿主 CPU + 同一 QEMU major 下恢复）
+        // 先落盘挂起标记再退出 QEMU：若 Core 在 quit 前后崩溃，VM 一致地处于"已挂起"，
+        // suspend.state 不会被静默丢弃（顺序颠倒会让保存的会话凭空消失）。
         var state = VmState.Load(pkg);
         state.SuspendedStatePath = PathPolicy.NormalizeReference(pkg, stateFile);
         state.SuspendFingerprint = CurrentHostFingerprint();
         state.Save(pkg);
+
+        try
+        {
+            qmp.ForceQuitAsync().GetAwaiter().GetResult();
+        }
+        catch
+        {
+            // quit 失败：标记回滚（QEMU 仍在运行/可控，用户可重试挂起或正常关机）
+            state.SuspendedStatePath = null;
+            state.SuspendFingerprint = null;
+            state.Save(pkg);
+            throw;
+        }
 
         ReleaseVm(pkg, clearRuntime: false); // 挂起后退出 QEMU，vm.lock 释放；suspend.state 在包内
         return new { suspended = true, stateFile };
@@ -543,7 +582,7 @@ public sealed class GrassCoreService
 
     private void ReleaseVm(GrassVmPackage pkg, bool clearRuntime = true)
     {
-        if (_running.Remove(pkg.Path, out var vm))
+        if (_running.TryRemove(pkg.Path, out var vm))
         {
             vm.Qmp?.Dispose();
             // 正常关机后清空 runtime/ 并删除 vm.lock；挂起路径保留 runtime 记录片刻（session 已写入 state）
@@ -692,9 +731,21 @@ public sealed class GrassCoreService
 
     // ---------- 克隆 ----------
 
+    /// <summary>克隆/快照等重操作的关机状态守卫：运行/锁定/挂起都不允许（Core 是唯一守门人）。</summary>
+    private void EnsureStoppedForMutation(GrassVmPackage pkg)
+    {
+        if (_running.ContainsKey(pkg.Path))
+            throw new GrassCoreException("虚拟机正在运行，关机后才能执行此操作。");
+        if (File.Exists(pkg.LockPath))
+            throw new GrassCoreException("虚拟机被锁定（可能异常退出残留）。请先解除锁定。");
+        if (VmState.Load(pkg).SuspendedStatePath is not null)
+            throw new GrassCoreException("虚拟机已挂起。请先恢复并正常关机后再执行此操作。");
+    }
+
     public object FullClone(string packagePath, string newName)
     {
         var pkg = new GrassVmPackage(packagePath);
+        EnsureStoppedForMutation(pkg);
         var cloner = new Clone.CloneService(new Qemu.TransactionalDiskOps(_qemuImgPath));
         var target = cloner.FullCloneAsync(pkg, newName).GetAwaiter().GetResult();
         _db.UpsertIndex(new HostDb.VmIndexEntry(target.Path, target.Name, null, DateTimeOffset.UtcNow.ToString("o"), null));
@@ -704,6 +755,7 @@ public sealed class GrassCoreService
     public object LinkedClone(string packagePath, string snapshotUuid, string newName)
     {
         var pkg = new GrassVmPackage(packagePath);
+        EnsureStoppedForMutation(pkg);
         var cloner = new Clone.CloneService(new Qemu.TransactionalDiskOps(_qemuImgPath));
         var target = cloner.LinkedClone(pkg, snapshotUuid, newName);
         _db.UpsertIndex(new HostDb.VmIndexEntry(target.Path, target.Name, null, DateTimeOffset.UtcNow.ToString("o"), null));
@@ -801,8 +853,10 @@ public sealed class GrassCoreService
     public object CreateSnapshot(string packagePath, string name, string? description)
     {
         var pkg = new GrassVmPackage(packagePath);
+        EnsureStoppedForMutation(pkg);
         var config = new ConfigStore(pkg).Load();
-        var snap = SnapshotService.Create(pkg, config, name, description);
+        var snap = SnapshotService.Create(pkg, config, name, description,
+            diskOps: new Qemu.TransactionalDiskOps(_qemuImgPath));
         return new { uuid = snap.Uuid };
     }
 
@@ -811,6 +865,7 @@ public sealed class GrassCoreService
     public object RestoreSnapshot(string packagePath, string uuid)
     {
         var pkg = new GrassVmPackage(packagePath);
+        EnsureStoppedForMutation(pkg);
         var plan = SnapshotPlanner.PlanRestore(SnapshotService.LoadTree(pkg), uuid);
         SnapshotService.Restore(pkg, uuid);
         return new { restored = uuid, warnings = plan.Warnings };
@@ -832,6 +887,7 @@ public sealed class GrassCoreService
     public object DeleteSnapshot(string packagePath, string uuid)
     {
         var pkg = new GrassVmPackage(packagePath);
+        EnsureStoppedForMutation(pkg);
         SnapshotService.Delete(pkg, uuid);
         return new { deleted = uuid };
     }
@@ -866,7 +922,10 @@ public sealed class GrassCoreService
             .Select(d => new VmConfigView.DiskView(d.Path, "硬盘")).ToList();
         var cds = config.DevicesOfType<CdromDevice>()
             .Select(c => new VmConfigView.CdView(c.IsoPath, "CD/DVD")).ToList();
-        return new VmConfigView(config.HasDisplayDevice, disks, cds);
+        return new VmConfigView(
+            config.HasDisplayDevice,
+            NeedsNvram: config.Firmware.Kind == FirmwareKind.Uefi,
+            disks, cds);
     }
 }
 

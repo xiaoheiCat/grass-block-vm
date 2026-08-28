@@ -11,11 +11,20 @@ import crypto from 'node:crypto';
 export interface WsConnection extends EventEmitter {
   send(data: Buffer): void;
   close(): void;
+  /** 立即断开（服务端拆除时用，不走关闭握手）。 */
+  terminate(): void;
   on(event: 'message', listener: (data: Buffer) => void): this;
   on(event: 'close', listener: () => void): this;
 }
 
 export class WebSocketServer extends EventEmitter {
+  private readonly conns = new Set<WsConnImpl>();
+
+  /** 当前连接（拆除桥时用于终止全部会话）。 */
+  get clients(): ReadonlySet<WsConnImpl> {
+    return this.conns;
+  }
+
   constructor(server: http.Server) {
     super();
     server.on('upgrade', (req, socket, head) => this.handleUpgrade(req, socket as net.Socket, head));
@@ -40,6 +49,8 @@ export class WebSocketServer extends EventEmitter {
     socket.setNoDelay(true);
 
     const conn = new WsConnImpl(socket);
+    this.conns.add(conn);
+    conn.on('close', () => this.conns.delete(conn));
     this.emit('connection', conn);
 
     socket.on('data', (chunk: Buffer) => conn.pushRaw(chunk));
@@ -57,11 +68,14 @@ class WsConnImpl extends EventEmitter implements WsConnection {
   }
 
   /** 喂入原始字节；解析数据帧（客户端帧必须带 mask）。 */
+  private fragments: Buffer[] = [];
+
   pushRaw(chunk: Buffer): void {
     if (this.closed) return;
     this.buf = Buffer.concat([this.buf, chunk]);
     for (;;) {
       if (this.buf.length < 2) break;
+      const fin = (this.buf[0] & 0x80) !== 0;
       const opcode = this.buf[0] & 0x0f;
       const masked = (this.buf[1] & 0x80) !== 0;
       let len = this.buf[1] & 0x7f;
@@ -95,7 +109,21 @@ class WsConnImpl extends EventEmitter implements WsConnection {
         this.writeFrame(0xa, Buffer.alloc(0)); // ping → pong
         continue;
       }
-      if (opcode === 0x1 || opcode === 0x2) this.emit('message', payload);
+      // 分片消息：首帧（text/binary）缓存，continuation（0x0）追加，FIN 时合并交付
+      if (opcode === 0x1 || opcode === 0x2) {
+        if (fin) {
+          this.emit('message', payload);
+        } else {
+          this.fragments = [payload];
+        }
+      } else if (opcode === 0x0) {
+        this.fragments.push(payload);
+        if (fin) {
+          const whole = Buffer.concat(this.fragments);
+          this.fragments = [];
+          this.emit('message', whole);
+        }
+      }
     }
   }
 
@@ -109,6 +137,12 @@ class WsConnImpl extends EventEmitter implements WsConnection {
     this.writeFrame(0x8, Buffer.alloc(0));
     this.closed = true;
     this.socket.end();
+  }
+
+  terminate(): void {
+    this.closed = true;
+    this.socket.destroy();
+    this.emit('close');
   }
 
   private writeFrame(opcode: number, payload: Buffer): void {

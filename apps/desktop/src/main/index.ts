@@ -69,7 +69,9 @@ function createDisplayWindow(vmName: string, spicePort: number, packagePath: str
  * SPICE WebSocket↔TCP 桥（参考 electerm 的做法，不修改 spice-client 源码）：
  * WebSocket 收到的字节直接写 TCP；TCP 数据原样回推 WebSocket。无协议转换。
  */
-function startSpiceBridge(spicePort: number): Promise<number> {
+function startSpiceBridge(
+  spicePort: number,
+): Promise<{ server: http.Server; wss: WebSocketServer }> {
   const server = http.createServer();
   const wss = new WebSocketServer(server);
   wss.on('connection', (ws) => {
@@ -83,8 +85,7 @@ function startSpiceBridge(spicePort: number): Promise<number> {
     tcp.on('close', () => ws.close());
   });
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => {
-    const addr = server.address();
-    resolve(typeof addr === 'object' && addr ? addr.port : 0);
+    resolve({ server, wss });
   }));
 }
 
@@ -95,9 +96,21 @@ ipcMain.handle('core:call', async (_e, method: string, params?: unknown) => {
   return b.call(method, params);
 });
 
+// 每个显示器窗口一个 SPICE 桥；窗口关闭时拆除（否则每次开窗泄漏一个 HTTP 服务器）
+const displayBridges = new Map<number, { server: http.Server; wss: WebSocketServer }>();
+
 ipcMain.handle('display:open', async (_e, vmName: string, spicePort: number, packagePath: string) => {
-  await startSpiceBridge(spicePort);
-  createDisplayWindow(vmName, spicePort, packagePath);
+  const bridge = await startSpiceBridge(spicePort);
+  const win = createDisplayWindow(vmName, spicePort, packagePath);
+  displayBridges.set(win.id, bridge);
+  win.on('closed', () => {
+    const b = displayBridges.get(win.id);
+    if (b) {
+      displayBridges.delete(win.id);
+      for (const client of b.wss.clients) client.terminate();
+      b.server.close();
+    }
+  });
   return true;
 });
 

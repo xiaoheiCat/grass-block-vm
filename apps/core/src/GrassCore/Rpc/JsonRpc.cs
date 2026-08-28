@@ -62,9 +62,18 @@ public sealed class JsonRpcConnection
         ["error"] = new Dictionary<string, object?> { ["code"] = code, ["message"] = message },
     });
 
+    /// <summary>RPC 线上格式：camelCase 属性 + camelCase 枚举（与 apps/desktop 的 TS 契约一致）。</summary>
+    internal static readonly JsonSerializerOptions WireOpts = new(JsonSerializerDefaults.General)
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DictionaryKeyPolicy = JsonNamingPolicy.CamelCase,
+        Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter(
+            System.Text.Json.JsonNamingPolicy.CamelCase) },
+    };
+
     private static JsonElement ToElement(object obj)
     {
-        var json = JsonSerializer.Serialize(obj);
+        var json = JsonSerializer.Serialize(obj, WireOpts);
         return JsonDocument.Parse(json).RootElement.Clone();
     }
 }

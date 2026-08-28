@@ -36,6 +36,9 @@ public sealed class QemuCommandBuilder
 
     public VmConfiguration Config { get; }
 
+    /// <summary>TPM 模拟器宿主是否就绪（默认否：宿主进程随 Windows 实机阶段交付）。</summary>
+    public bool TpmHostReady { get; init; }
+
     public QemuCommandLine Build(string packageRoot, string? runtimeSessionId = null, string? incomingStateFile = null)
     {
         var sessionId = runtimeSessionId ?? RandomHex(12);
@@ -88,10 +91,11 @@ public sealed class QemuCommandBuilder
         }
         // 传统 BIOS：SeaBIOS 内置于 QEMU，无需参数
 
-        if (Config.Firmware.Tpm && Config.DevicesOfType<TpmDevice>().Any(t => t.Enabled))
+        // TPM 2.0：需要 GrassCore 先把 TPM 模拟器宿主进程拉起（管道就绪）才能生成这三组参数；
+        // 模拟器宿主随 GrassSpiceHelper/Windows 实机阶段交付。宿主未就绪时跳过 TPM 参数
+        // （配置里的用户意图保留，将来宿主可用即恢复），否则 QEMU 初始化即失败。
+        if (Config.Firmware.Tpm && Config.DevicesOfType<TpmDevice>().Any(t => t.Enabled) && TpmHostReady)
         {
-            // TPM 2.0：TPM emulator 经 GrassCore 管理的本地通道接入（Windows 上由 Core 承载模拟器；
-            // 管道名与会话绑定，token 只存在于进程内存）
             args.AddRange(new[] { "-chardev", "pipe,id=chrtpm,name=\\\\.\\pipe\\grassvm-tpm-emulator" });
             args.AddRange(new[] { "-tpmdev", "emulator,id=tpm0,chardev=chrtpm" });
             args.AddRange(new[] { "-device", "tpm-tis,tpmdev=tpm0" });
@@ -110,13 +114,18 @@ public sealed class QemuCommandBuilder
                 switch (_profile.SystemDiskBus)
                 {
                     case DiskBus.Sata:
-                        // q35 内建 ich9-ahci：端口形如 bus=ahci0.0 / ahci0.1 ...（每控制器 6 口）
-                        args.AddRange(new[] { "-device", $"ide-hd,drive={id},bus=ahci0.{sataPort % 6},bootindex={BootIndex(BootClass.Disk)}" });
+                        // q35 内建 ich9-ahci：每控制器 6 口（ahci0.0–ahci0.5），超限必须报错而非回绕
+                        if (sataPort >= 6)
+                            throw new InvalidOperationException("SATA 设备数量超出上限（6）。请移除一些设备后再启动。");
+                        args.AddRange(new[] { "-device", $"ide-hd,drive={id},bus=ahci0.{sataPort},bootindex={BootIndex(BootClass.Disk)}" });
                         sataPort++;
                         break;
                     case DiskBus.Ide:
-                        // pc(i440fx) 内建 IDE：ide.0 主 / ide.1 副
-                        args.AddRange(new[] { "-device", $"ide-hd,drive={id},bus=ide.{disk.CreatedOrder % 2},bootindex={BootIndex(BootClass.Disk)}" });
+                        // pc(i440fx) 内建 IDE：ide.0/ide.1 两条总线，unit 0/1（共 4 设备）
+                        if (sataPort >= 4)
+                            throw new InvalidOperationException("IDE 设备数量超出上限（4）。请移除一些设备后再启动。");
+                        args.AddRange(new[] { "-device", $"ide-hd,drive={id},bus=ide.{sataPort / 2},unit={sataPort % 2},bootindex={BootIndex(BootClass.Disk)}" });
+                        sataPort++;
                         break;
                     case DiskBus.Virtio:
                         args.AddRange(new[] { "-device", $"virtio-blk-pci,drive={id},bootindex={BootIndex(BootClass.Disk)}" });
@@ -132,10 +141,18 @@ public sealed class QemuCommandBuilder
                     : $"media=cdrom,file={PathPolicy.Resolve(new GrassVmPackage(packageRoot), cd.IsoPath)}";
                 args.AddRange(new[] { "-drive", $"if=none,{media},id={id},readonly=on" });
                 // 光驱接到 SATA/IDE；热插拔换盘由 QMP blockdev-change-medium 完成
-                var bus = _profile.SystemDiskBus == DiskBus.Virtio || _profile.Machine == MachineKind.Q35
-                    ? $"bus=ahci0.{sataPort}"
-                    : $"bus=ide.{(cd.CreatedOrder % 2) + 1}";
-                args.AddRange(new[] { "-device", $"ide-cd,drive={id},{bus},bootindex={BootIndex(BootClass.Cd)}" });
+                if (_profile.SystemDiskBus == DiskBus.Virtio || _profile.Machine == MachineKind.Q35)
+                {
+                    if (sataPort >= 6)
+                        throw new InvalidOperationException("SATA 设备数量超出上限（6）。请移除一些设备后再启动。");
+                    args.AddRange(new[] { "-device", $"ide-cd,drive={id},bus=ahci0.{sataPort},bootindex={BootIndex(BootClass.Cd)}" });
+                }
+                else
+                {
+                    if (sataPort >= 4)
+                        throw new InvalidOperationException("IDE 设备数量超出上限（4）。请移除一些设备后再启动。");
+                    args.AddRange(new[] { "-device", $"ide-cd,drive={id},bus=ide.{sataPort / 2},unit={sataPort % 2},bootindex={BootIndex(BootClass.Cd)}" });
+                }
                 sataPort++;
                 break;
             }

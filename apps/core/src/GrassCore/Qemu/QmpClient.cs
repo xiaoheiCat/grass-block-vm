@@ -116,8 +116,12 @@ public sealed class QmpClient : IDisposable
         {
             _sendLock.Release();
         }
-        // 响应由常驻读循环匹配 id 后完成；ct 取消时清理 pending
-        using var reg = ct.Register(() => _pending.TryRemove(id, out _));
+        // 响应由常驻读循环匹配 id 后完成；ct 取消 → 唤醒等待方（而不是永远挂起）
+        using var reg = ct.Register(() =>
+        {
+            _pending.TryRemove(id, out _);
+            tcs.TrySetCanceled(ct);
+        });
         return await tcs.Task.ConfigureAwait(false);
     }
 

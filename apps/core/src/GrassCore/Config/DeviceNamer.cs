@@ -50,7 +50,13 @@ public static class ConfigJson
         WriteIndented = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
-        Converters = { new VmDeviceJsonConverter() },
+        // 枚举写 camelCase（"nat"/"bridged"/"uefi"）；读取大小写不敏感，旧包 "Nat" 仍可解析
+        Converters =
+        {
+            new VmDeviceJsonConverter(),
+            new System.Text.Json.Serialization.JsonStringEnumConverter(
+                System.Text.Json.JsonNamingPolicy.CamelCase),
+        },
     };
 
     public static string Serialize(VmConfiguration config) => JsonSerializer.Serialize(config, Options);

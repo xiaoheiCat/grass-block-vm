@@ -84,6 +84,7 @@ public class SuspendResumeServiceTests : IDisposable
         Directory.CreateDirectory(root);
         db.SetPreference("libraryRoot", root);
         Directory.CreateDirectory(Path.Combine(_dir, "fw"));
+        File.WriteAllText(Path.Combine(_dir, "fw", "OVMF_VARS.fd"), "vars-template");
 
         var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(),
             Path.Combine(_dir, "fw"), "11", launcher,
@@ -157,6 +158,7 @@ public class SuspendResumeServiceTests : IDisposable
         Directory.CreateDirectory(root);
         db.SetPreference("libraryRoot", root);
         Directory.CreateDirectory(Path.Combine(_dir, "fw"));
+        File.WriteAllText(Path.Combine(_dir, "fw", "OVMF_VARS.fd"), "vars-template");
 
         var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(),
             Path.Combine(_dir, "fw"), "11", launcher,
@@ -190,6 +192,7 @@ public class SuspendResumeServiceTests : IDisposable
         Directory.CreateDirectory(root);
         db.SetPreference("libraryRoot", root);
         Directory.CreateDirectory(Path.Combine(_dir, "fw"));
+        File.WriteAllText(Path.Combine(_dir, "fw", "OVMF_VARS.fd"), "vars-template");
 
         var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(),
             Path.Combine(_dir, "fw"), "11", launcher,
@@ -231,6 +234,7 @@ public class SuspendResumeServiceTests : IDisposable
         Directory.CreateDirectory(root);
         db.SetPreference("libraryRoot", root);
         Directory.CreateDirectory(Path.Combine(_dir, "fw"));
+        File.WriteAllText(Path.Combine(_dir, "fw", "OVMF_VARS.fd"), "vars-template");
 
         var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(),
             Path.Combine(_dir, "fw"), "11", launcher,
@@ -260,5 +264,40 @@ public class SuspendResumeServiceTests : IDisposable
         // 运行中拒绝修改（唯一例外 CD/DVD 走 changeMedium）
         service.StartVm(vmPath);
         Assert.Throws<GrassCoreException>(() => service.UpdateConfig(vmPath, json));
+    }
+
+    [Fact]
+    public void StartVm_RejectedByPreflight_DestroysNothing_OfAnExistingSession()
+    {
+        // 场景：VM 已被另一个会话锁定运行（vm.lock + session.json 在），本实例 startVm 预检拒绝。
+        // 关键断言：拒绝路径不得删除别人的锁/session（否则互斥失效 → 双开 → 磁盘损坏）。
+        var launcher = new RecordingLauncher();
+        using var db = new HostDb(Path.Combine(_dir, "grass.db"));
+        var root = Path.Combine(_dir, "root5");
+        Directory.CreateDirectory(root);
+        db.SetPreference("libraryRoot", root);
+        Directory.CreateDirectory(Path.Combine(_dir, "fw"));
+        File.WriteAllText(Path.Combine(_dir, "fw", "OVMF_VARS.fd"), "vars-template");
+
+        var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(),
+            Path.Combine(_dir, "fw"), "11", launcher, qmpTransportFactory: _ => null);
+
+        var vmPath = ((GrassCoreService.CreateVmResult)service.CreateVm(System.Text.Json.JsonSerializer.SerializeToElement(new
+        {
+            name = "别人在用", profileId = "ubuntu", diskGiB = 8, isoPath = (string?)null,
+            cpuCores = 1, memoryMiB = 1024, startAfterCreate = false,
+        }))).Path;
+        var pkg = new GrassVm.GrassVmPackage(vmPath);
+
+        // 人为制造"另一个会话正在运行"：锁 + session
+        new GrassVm.VmLock(pkg).Acquire();
+        var sessionJson = """{"sessionId":"other","qmpPipe":"pipe","startedAt":"2026-01-01T00:00:00Z","qemuPid":4194304}""";
+        File.WriteAllText(pkg.SessionPath, sessionJson);
+
+        Assert.Throws<GrassCoreException>(() => service.StartVm(vmPath));
+
+        // 预检拒绝后：锁与 session 原封不动（属于那个运行中的会话）
+        Assert.True(File.Exists(pkg.LockPath), "vm.lock 被拒绝路径删除——互斥被破坏");
+        Assert.Equal(sessionJson, File.ReadAllText(pkg.SessionPath));
     }
 }
