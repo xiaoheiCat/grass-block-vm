@@ -73,6 +73,7 @@ public sealed class QmpClient : IDisposable
     /// <summary>读 greeting 并完成能力协商（QMP 握手）。</summary>
     public async Task ConnectAsync(CancellationToken ct = default)
     {
+        ThrowIfDisposed();
         var greeting = await ReadMessageAsync(ct).ConfigureAwait(false);
         if (!greeting.RootElement.TryGetProperty("QMP", out _))
             throw new QmpException("对端不是 QMP 服务（缺少 greeting）。");
@@ -109,7 +110,15 @@ public sealed class QmpClient : IDisposable
         int id;
         var tcs = new TaskCompletionSource<JsonDocument>(TaskCreationOptions.RunContinuationsAsynchronously);
         ThrowIfDisposed();
-        await _sendLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            await _sendLock.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            // 检查与等待之间被 Dispose：给调用方干净的"QMP 不可用"而不是裸 ODE
+            throw new QmpException("QMP 连接已关闭。");
+        }
         try
         {
             ThrowIfDisposed(); // 等锁期间可能已被释放

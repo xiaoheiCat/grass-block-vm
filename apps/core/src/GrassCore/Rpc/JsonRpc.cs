@@ -105,16 +105,22 @@ public static class Transport
             var name = pipeName ?? DefaultPipeName;
             while (!ct.IsCancellationRequested)
             {
-                await using var server = new NamedPipeServerStream(name, PipeDirection.InOut,
+                var server = new NamedPipeServerStream(name, PipeDirection.InOut,
                     NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Byte,
                     PipeOptions.Asynchronous);
                 await server.WaitForConnectionAsync(ct);
                 var conn = new JsonRpcConnection(server);
                 Interlocked.Increment(ref _activeConnections);
+                // 释放归连接处理器所有：循环体的 await using 会在【每次迭代末】就把刚接上的
+                // 管道关掉（作用域是迭代而不是外层函数）——Core 在 Windows 上完全不可达。
                 _ = Task.Run(async () =>
                 {
                     try { await handler(conn); }
-                    finally { Interlocked.Decrement(ref _activeConnections); }
+                    finally
+                    {
+                        Interlocked.Decrement(ref _activeConnections);
+                        server.Dispose();
+                    }
                 }, ct);
             }
         }

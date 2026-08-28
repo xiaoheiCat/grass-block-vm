@@ -157,6 +157,10 @@ public sealed class GrassCoreService
         var name = args.GetProperty("name").GetString()!;
         var profileId = args.GetProperty("profileId").GetString()!;
         var diskGiB = args.GetProperty("diskGiB").GetInt64();
+        // 名称同时是包目录名与 QEMU -name 值：文件系统非法字符或逗号（QEMU 选项解析分隔符）都拒绝
+        if (string.IsNullOrWhiteSpace(name) || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || name.Contains(','))
+            throw new GrassCoreException(
+                $"虚拟机名称不合法：{name}（不能为空，不能包含文件系统不允许的字符或逗号）");
         var isoPath = args.TryGetProperty("isoPath", out var iso) && iso.ValueKind != JsonValueKind.Null ? iso.GetString() : null;
 
         // 向导可调参数：cpuCores / memoryMiB（缺省 = Profile 推荐；钳制到安全范围）
@@ -512,6 +516,11 @@ public sealed class GrassCoreService
                 // 必然"不存在"，按死了处理会解锁别人正在运行的 VM）
                 if (session.MachineId is not null && session.MachineId != MachineId)
                     continue;
+                // PID 未写入（Core 在 Start 与回写 session 之间崩溃）≠ 死了。
+                // 此时 QEMU 可能正在运行：按"死了"清 runtime/放锁会破坏 vm.lock 永不自动清除的
+                // 不变式（残留锁交给用户手动确认解锁）
+                if (session.QemuPid <= 0)
+                    continue;
                 if (!result.QemuAlive)
                 {
                     // QEMU 已不在（比如 Core 崩溃期间客户机内正常关机）：做干净收尾
@@ -769,7 +778,9 @@ public sealed class GrassCoreService
     /// 保存配置：仅关机状态允许（运行中唯一可改的是 CD/DVD，走 changeMedium）。
     /// 值域钳制：CPU 1..宿主核数，内存 512MB..宿主一半，磁盘/设备数量上限。
     /// </summary>
-    public object UpdateConfig(string packagePath, string configJson)
+    public object UpdateConfig(string packagePath, string configJson) => WithPackageGate(packagePath, () => UpdateConfigCore(packagePath, configJson));
+
+    private object UpdateConfigCore(string packagePath, string configJson)
     {
         var pkg = new GrassVmPackage(packagePath);
         if (_running.ContainsKey(pkg.Path))
@@ -797,8 +808,9 @@ public sealed class GrassCoreService
         var maxMem = Math.Max(512, (int)(GetTotalHostMemoryMiB() / 2));
         config.MemoryMiB = Math.Clamp(config.MemoryMiB, 512, maxMem);
         if (string.IsNullOrWhiteSpace(config.Name)) throw new GrassCoreException("虚拟机名称不能为空。");
-        if (config.Name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
-            throw new GrassCoreException("名称包含文件系统不允许的字符。");
+        if (config.Name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || config.Name.Contains(','))
+            throw new GrassCoreException(
+                "名称包含文件系统或 QEMU 不允许的字符（含逗号）。");
         if (config.Devices.Count > 16)
             throw new GrassCoreException("设备数量超出上限（16）。");
 
@@ -823,7 +835,9 @@ public sealed class GrassCoreService
     }
 
     /// <summary>扩容硬盘（只能扩大；qemu-img resize 事务化执行 + 魔数校验保持链完整）。</summary>
-    public object ResizeDisk(string packagePath, string deviceId, long newGiB)
+    public object ResizeDisk(string packagePath, string deviceId, long newGiB) => WithPackageGate(packagePath, () => ResizeDiskCore(packagePath, deviceId, newGiB));
+
+    private object ResizeDiskCore(string packagePath, string deviceId, long newGiB)
     {
         var pkg = new GrassVmPackage(packagePath);
         if (_running.ContainsKey(pkg.Path))
@@ -861,7 +875,9 @@ public sealed class GrassCoreService
             throw new GrassCoreException("虚拟机已挂起。请先恢复并正常关机后再执行此操作。");
     }
 
-    public object FullClone(string packagePath, string newName)
+    public object FullClone(string packagePath, string newName) => WithPackageGate(packagePath, () => FullCloneCore(packagePath, newName));
+
+    private object FullCloneCore(string packagePath, string newName)
     {
         var pkg = new GrassVmPackage(packagePath);
         EnsureStoppedForMutation(pkg);
@@ -871,7 +887,9 @@ public sealed class GrassCoreService
         return new { path = target.Path, name = target.Name };
     }
 
-    public object LinkedClone(string packagePath, string snapshotUuid, string newName)
+    public object LinkedClone(string packagePath, string snapshotUuid, string newName) => WithPackageGate(packagePath, () => LinkedCloneCore(packagePath, snapshotUuid, newName));
+
+    private object LinkedCloneCore(string packagePath, string snapshotUuid, string newName)
     {
         var pkg = new GrassVmPackage(packagePath);
         EnsureStoppedForMutation(pkg);
@@ -883,7 +901,9 @@ public sealed class GrassCoreService
 
     // ---------- 导入导出（导出前必须关机）----------
 
-    public object ExportZip(string packagePath, string zipPath)
+    public object ExportZip(string packagePath, string zipPath) => WithPackageGate(packagePath, () => ExportZipCore(packagePath, zipPath));
+
+    private object ExportZipCore(string packagePath, string zipPath)
     {
         var pkg = new GrassVmPackage(packagePath);
         ExportImport.GrassVmZip.EnsureExportable(pkg, _running.ContainsKey(pkg.Path));
@@ -958,7 +978,9 @@ public sealed class GrassCoreService
     }
 
     /// <summary>OVF 目录导出（当前有效状态；OVA 打包由导出器完成）。</summary>
-    public object ExportOvf(string packagePath, string destDir)
+    public object ExportOvf(string packagePath, string destDir) => WithPackageGate(packagePath, () => ExportOvfCore(packagePath, destDir));
+
+    private object ExportOvfCore(string packagePath, string destDir)
     {
         var pkg = new GrassVmPackage(packagePath);
         ExportImport.GrassVmZip.EnsureExportable(pkg, _running.ContainsKey(pkg.Path));
@@ -969,7 +991,9 @@ public sealed class GrassCoreService
 
     // ---------- 快照 ----------
 
-    public object CreateSnapshot(string packagePath, string name, string? description)
+    public object CreateSnapshot(string packagePath, string name, string? description) => WithPackageGate(packagePath, () => CreateSnapshotCore(packagePath, name, description));
+
+    private object CreateSnapshotCore(string packagePath, string name, string? description)
     {
         var pkg = new GrassVmPackage(packagePath);
         EnsureStoppedForMutation(pkg);
@@ -981,7 +1005,9 @@ public sealed class GrassCoreService
 
     public object ListSnapshots(string packagePath) => SnapshotService.List(new GrassVmPackage(packagePath));
 
-    public object RestoreSnapshot(string packagePath, string uuid)
+    public object RestoreSnapshot(string packagePath, string uuid) => WithPackageGate(packagePath, () => RestoreSnapshotCore(packagePath, uuid));
+
+    private object RestoreSnapshotCore(string packagePath, string uuid)
     {
         var pkg = new GrassVmPackage(packagePath);
         EnsureStoppedForMutation(pkg);
@@ -1003,7 +1029,9 @@ public sealed class GrassCoreService
         };
     }
 
-    public object DeleteSnapshot(string packagePath, string uuid)
+    public object DeleteSnapshot(string packagePath, string uuid) => WithPackageGate(packagePath, () => DeleteSnapshotCore(packagePath, uuid));
+
+    private object DeleteSnapshotCore(string packagePath, string uuid)
     {
         var pkg = new GrassVmPackage(packagePath);
         EnsureStoppedForMutation(pkg);

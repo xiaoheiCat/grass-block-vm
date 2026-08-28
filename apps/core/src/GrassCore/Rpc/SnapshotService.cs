@@ -88,12 +88,13 @@ public static class SnapshotService
                 {
                     snap.DiskOverlayRefs[disk.DeviceId] = frozenRel;
                     Directory.CreateDirectory(System.IO.Path.GetDirectoryName(frozenAbs)!);
-                    // 顺序（崩溃安全）：① 在工作路径旁生成暂存 overlay（backing=冻结点的相对引用，
-                    // 与最终位置的相对路径一致；qemu-img create -b 不要求 backing 已存在）；
+                    // 顺序（崩溃安全）：① 生成暂存 overlay——backing（冻结点）此刻还不存在，
+                    // 用 -u + 显式尺寸（真实 qemu-img 会拒绝打开不存在的 backing，-u 跳过打开）；
                     // ② 冻结：工作盘原子改名进快照；③ 换入：暂存改名为工作盘。
                     // ②③ 之间崩溃 → RepairStagedOverlays 幂等完成换入。
                     var staged = activeAbs + StagedOverlaySuffix;
-                    diskOps.CreateOverlay(frozenAbs, staged, relativeBacking: true);
+                    diskOps.CreateOverlay(frozenAbs, staged, relativeBacking: true,
+                        deferBackingVirtualSize: disk.SizeBytes > 0 ? disk.SizeBytes : 64L * 1024 * 1024 * 1024);
                     File.Move(activeAbs, frozenAbs);
                     File.Move(staged, activeAbs);
                 }
@@ -175,9 +176,12 @@ public static class SnapshotService
                 if (!File.Exists(frozenAbs)) continue; // 元数据先行时代的快照：保留只回滚配置
                 var activeAbs = GrassCore.GrassVm.PathPolicy.Resolve(package, restoredDiskPath(restored, deviceId));
                 if (string.Equals(activeAbs, frozenAbs, StringComparison.OrdinalIgnoreCase)) continue;
-                // 崩溃安全顺序：先造暂存 overlay，再删旧工作盘（未快照更改，调用方已警告），最后换入
+                // 崩溃安全顺序：先造暂存 overlay（-u：冻结点在场但保持同一套语义），再删旧
+                // 工作盘（未快照更改，调用方已警告），最后换入
                 var staged = activeAbs + StagedOverlaySuffix;
-                diskOps.CreateOverlay(frozenAbs, staged, relativeBacking: true);
+                var dev = restored.Devices.OfType<DiskDevice>().FirstOrDefault(d => d.DeviceId == deviceId);
+                diskOps.CreateOverlay(frozenAbs, staged, relativeBacking: true,
+                    deferBackingVirtualSize: dev is { SizeBytes: > 0 } ? dev.SizeBytes : 64L * 1024 * 1024 * 1024);
                 File.Delete(activeAbs);
                 File.Move(staged, activeAbs);
             }
@@ -214,6 +218,8 @@ public static class SnapshotService
         var parentUuid = deleted.ParentSnapshotUuid;
         var dir = System.IO.Path.Combine(package.SnapshotsPath, uuid);
 
+        // 任一设备落入"链根保留"分支 → 物理目录就不能整体删除（后代 overlay 还指着它）
+        var anyDeviceKeptAsBase = false;
         if (diskOps is not null)
         {
             foreach (var (deviceId, frozenRel) in deleted.DiskOverlayRefs)
@@ -245,6 +251,7 @@ public static class SnapshotService
 
                 if (parentFrozen is not null && File.Exists(parentFrozen))
                 {
+                    // 正常路径：commit + rebase
                     // 被删层先并入父（客户机可见内容不变），后代改挂父
                     diskOps.CommitOverlay(frozenAbs);
                     foreach (var dep in dependents)
@@ -253,7 +260,9 @@ public static class SnapshotService
                 }
                 else
                 {
-                    // 链根基座：物理文件必须保留（后代 overlay 的 backing），只做元数据删除
+                    // 链根基座（无父）或父缺这张盘：物理文件必须保留（后代 overlay 的 backing），
+                    // 只做元数据删除——目录级决策必须知道这件事
+                    anyDeviceKeptAsBase = true;
                 }
             }
         }
@@ -271,7 +280,8 @@ public static class SnapshotService
         if (Directory.Exists(dir))
         {
             var frozenFiles = Directory.EnumerateFiles(dir, "*.qcow2", SearchOption.AllDirectories).ToList();
-            var keepPhysical = parentUuid is null || diskOps is null && frozenFiles.Count > 0;
+            var keepPhysical = parentUuid is null || anyDeviceKeptAsBase
+                || diskOps is null && frozenFiles.Count > 0;
             if (keepPhysical)
             {
                 foreach (var f in Directory.EnumerateFiles(dir))

@@ -46,7 +46,7 @@ public sealed class QemuCommandBuilder
         var sessionId = runtimeSessionId ?? RandomHex(12);
         var args = new List<string>
         {
-            "-name", Config.Name,
+            "-name", Esc(Config.Name),
             "-machine", _profile.Machine switch
             {
                 MachineKind.Q35 => "q35",

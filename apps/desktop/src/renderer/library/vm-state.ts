@@ -75,6 +75,7 @@ export function osBadge(osProfileId: string): { emoji: string; label: string } {
 export function validateWizard(name: string, isoPath: string | null): string | null {
   if (!name.trim()) return '请给虚拟机起个名字。';
   if (/[\\/:*?"<>|]/.test(name)) return '名称不能包含这些字符：\\ / : * ? " < > |';
+  if (name.includes(',')) return '名称不能包含逗号。';
   if (!isoPath) return '请选择一个安装光盘镜像（ISO）。';
   if (!isoPath.toLowerCase().endsWith('.iso')) return '请选择 .iso 格式的安装镜像。';
   return null;

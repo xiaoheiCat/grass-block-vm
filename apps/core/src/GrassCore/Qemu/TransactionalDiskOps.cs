@@ -95,7 +95,13 @@ public sealed class TransactionalDiskOps
     /// 快照链必须用相对引用：包整体复制/导出导入到别的机器后链依然完整。
     /// 链接克隆保持绝对引用（backing 在另一个包里，本就不可迁移）。
     /// </param>
-    public void CreateOverlay(string backingFile, string overlayPath, bool relativeBacking)
+    /// <param name="deferBacking">
+    /// true = 暂存模式：backing 尚不存在（快照冻结的崩溃安全顺序——overlay 先生成、
+    /// 工作盘稍后才改名成 backing）。用 -u 跳过打开 backing（真实 qemu-img 会拒绝打开
+    /// 不存在的 backing）+ 显式虚拟尺寸（-u 必须给 size）。
+    /// </param>
+    public void CreateOverlay(string backingFile, string overlayPath, bool relativeBacking,
+        long? deferBackingVirtualSize = null)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(overlayPath)!);
         var backing = relativeBacking
@@ -103,7 +109,17 @@ public sealed class TransactionalDiskOps
             : backingFile;
         var tmp = overlayPath + TempSuffix;
         DeleteIfExists(tmp);
-        using var op = Run(["create", "-f", "qcow2", "-b", backing, "-F", "qcow2", tmp], tmp);
+        List<string> args;
+        if (deferBackingVirtualSize is { } size)
+        {
+            args = ["create", "-f", "qcow2", "-u", "-b", backing, "-F", "qcow2",
+                "-o", $"size={size}", tmp];
+        }
+        else
+        {
+            args = ["create", "-f", "qcow2", "-b", backing, "-F", "qcow2", tmp];
+        }
+        using var op = Run([.. args], tmp);
         WaitForAsync(op, CancellationToken.None).GetAwaiter().GetResult();
         VerifyImage(tmp, "qcow2");
         File.Move(tmp, overlayPath, overwrite: false);

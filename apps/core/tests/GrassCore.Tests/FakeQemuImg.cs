@@ -22,6 +22,14 @@ public static class FakeQemuImg
                     Add-Content -Path (Join-Path $PSScriptRoot 'chain-ops.log') -Value ($Rest -join ' ')
                     exit 0
                 }
+                # 与真实 qemu-img 一致：无 -u 时 backing 必须存在
+                if ($Rest[0] -eq 'create' -and ($Rest -notcontains '-u')) {
+                    $bi = [Array]::IndexOf($Rest, '-b')
+                    if ($bi -ge 0 -and $bi + 1 -lt $Rest.Count -and -not (Test-Path $Rest[$bi + 1])) {
+                        Write-Error "qemu-img: Could not open backing image '$($Rest[$bi + 1])'"
+                        exit 1
+                    }
+                }
                 $target = $Rest | Where-Object { "$_" -match '\.(qcow2|vmdk)' } | Select-Object -Last 1
                 if ($target) {
                     if ("$target" -match '\.vmdk') {
@@ -42,6 +50,14 @@ public static class FakeQemuImg
         File.WriteAllText(sh, """
             #!/bin/sh
             case "$1" in commit|rebase) printf '%s\n' "$*" >> "$0.chain-ops.log"; exit 0;; esac
+            # 与真实 qemu-img 一致：无 -u 时 backing 必须已存在（否则 exit 1）
+            if [ "$1" = "create" ] && ! printf '%s\n' "$*" | grep -q ' -u '; then
+              b=$(printf '%s\n' "$@" | sed -n 's/.*-b \([^ ]*\).*/\1/p')
+              if [ -n "$b" ] && [ ! -e "$b" ]; then
+                echo "qemu-img: Could not open backing image '$b': No such file or directory" >&2
+                exit 1
+              fi
+            fi
             target=$(printf '%s\n' "$@" | grep -E '\.(qcow2|vmdk)' | tail -1)
             case "$target" in
               *vmdk*) printf '# Disk DescriptorFile\nfake-vmdk' > "$target" ;;

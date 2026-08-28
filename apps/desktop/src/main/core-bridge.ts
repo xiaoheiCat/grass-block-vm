@@ -15,6 +15,8 @@ export class CoreBridge extends EventEmitter {
   private proc: ChildProcess | null = null;
   private nextId = 1;
   private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  /** 单飞：并发首调共享同一个连接尝试（否则会孵出多个 GrassCore 进程，双重接管） */
+  private connecting: Promise<void> | null = null;
 
   constructor(private coreExe: string) {
     super();
@@ -22,6 +24,14 @@ export class CoreBridge extends EventEmitter {
 
   /** 连接（必要时先拉起 GrassCore 进程）。 */
   async ensureRunning(): Promise<void> {
+    if (this.connecting) return this.connecting;
+    this.connecting = this.connectInner().finally(() => {
+      this.connecting = null;
+    });
+    return this.connecting;
+  }
+
+  private async connectInner(): Promise<void> {
     if (process.platform === 'win32') {
       // Windows：先试连接既有 Core（UI 重开时复用），失败再拉起
       try {
