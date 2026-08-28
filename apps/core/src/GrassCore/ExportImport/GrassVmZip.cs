@@ -62,6 +62,15 @@ public static class GrassVmZip
                     // 包内相对路径存储（导入后在任意位置解开都保持自包含）
                     zip.CreateEntryFromFile(file, prefix + rel, CompressionLevel.Optimal);
                 }
+                // 快照工作位置随档案走（state.json 属本机痕迹被排除，但没有它导入方会把
+                // 新快照挂到"最新叶"——与导出时的物理链位置不符，树会说谎）
+                var position = Config.VmState.Load(package).CurrentSnapshotUuid;
+                if (position is not null)
+                {
+                    var entry = zip.CreateEntry(prefix + "snapshots/position.marker");
+                    using var w = new StreamWriter(entry.Open());
+                    w.Write(position);
+                }
             }
             if (File.Exists(zipPath)) File.Delete(zipPath);
             File.Move(tempZip, zipPath);
@@ -112,6 +121,19 @@ public static class GrassVmZip
             var pkg0 = new GrassVmPackage(staging);
             // 档案刻意不含 runtime/logs 等瞬态目录；导入时补齐固定结构（确定无损修复）
             pkg0.EnsureStructure();
+            // 恢复快照工作位置（导出方写入的树拓扑语义；marker 只在档案里存在，落盘后转为 state）
+            var marker = Path.Combine(staging, "snapshots", "position.marker");
+            if (File.Exists(marker))
+            {
+                var uuid = File.ReadAllText(marker).Trim();
+                if (Rpc.SnapshotService.LoadTree(pkg0).All.Any(s => s.Uuid == uuid))
+                {
+                    var state = Config.VmState.Load(pkg0);
+                    state.CurrentSnapshotUuid = uuid;
+                    state.Save(pkg0);
+                }
+                File.Delete(marker);
+            }
             Directory.Move(staging, target);
         }
         catch

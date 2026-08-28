@@ -15,14 +15,25 @@ public sealed class JsonRpcConnection
 
     public JsonRpcConnection(Stream stream) => _stream = stream;
 
+    private readonly SemaphoreSlim _sendGate = new(1, 1);
+
+    /// <summary>并发请求的响应可能同时回写：整帧（长度+JSON+flush）持锁串行，防止帧交错。</summary>
     public async Task SendAsync(JsonElement response, CancellationToken ct = default)
     {
         var bytes = JsonSerializer.SerializeToUtf8Bytes(response);
         // 帧格式：4 字节小端长度 + JSON（简单可靠，避免粘包）
         var len = BitConverter.GetBytes((int)bytes.Length);
-        await _stream.WriteAsync(len, ct);
-        await _stream.WriteAsync(bytes, ct);
-        await _stream.FlushAsync(ct);
+        await _sendGate.WaitAsync(ct);
+        try
+        {
+            await _stream.WriteAsync(len, ct);
+            await _stream.WriteAsync(bytes, ct);
+            await _stream.FlushAsync(ct);
+        }
+        finally
+        {
+            _sendGate.Release();
+        }
     }
 
     public async Task<JsonElement?> ReceiveAsync(CancellationToken ct = default)

@@ -192,6 +192,9 @@ public sealed class GrassCoreService
         if (_running.ContainsKey(pkg.Path))
             throw new GrassCoreException("此虚拟机已经在运行。");
 
+        // 修复"快照换入中断"残留（幂等）：工作盘缺失但暂存 overlay 完好 → 完成换入
+        SnapshotService.RepairStagedOverlays(pkg);
+
         // 预检：资源、vm.lock、显示设备、NVRAM（WHPX 检测在 Windows 主机上执行）
         var view = ToConfigView(config);
         var problems = StartupPreflight.Check(pkg, view);
@@ -300,8 +303,9 @@ public sealed class GrassCoreService
         if (_running.ContainsKey(pkg.Path))
             throw new GrassCoreException("此虚拟机已经在运行。");
 
-        // 与 StartVm 同一套预检：挂起恢复同样要磁盘/固件在位，否则 QEMU 秒退、
-        // 用户只看到"恢复没反应"（标记被保守保留，卡片永远停在已挂起）
+        // 与 StartVm 同一套预检（含换入中断修复）：挂起恢复同样要磁盘/固件在位，
+        // 否则 QEMU 秒退、用户只看到"恢复没反应"
+        SnapshotService.RepairStagedOverlays(pkg);
         var view = ToConfigView(config);
         var problems = StartupPreflight.Check(pkg, view);
         if (problems.Any(p => p.Fatal))
@@ -415,15 +419,24 @@ public sealed class GrassCoreService
         };
     }
 
-    /// <summary>升级保护快照：跨版本首次正常关机后保留至少 24 小时，之后自动删除。</summary>
-    private static void TryDeleteExpiredUpgradeProtection(GrassVmPackage pkg)
+    /// <summary>
+    /// 升级保护快照：跨版本首次正常关机后保留至少 24 小时，之后自动删除。
+    /// 有链接克隆依赖时跳过（交互删除路径会先向用户列明影响）。
+    /// </summary>
+    private void TryDeleteExpiredUpgradeProtection(GrassVmPackage pkg)
     {
         try
         {
             var tree = SnapshotService.LoadTree(pkg);
             var expired = tree.All.Where(s =>
                 SnapshotPlanner.ShouldDeleteUpgradeProtection(s, DateTimeOffset.Now, cleanShutdown: true));
-            foreach (var s in expired) SnapshotService.Delete(pkg, s.Uuid);
+            foreach (var s in expired)
+            {
+                // 有链接克隆以此为基线 → 交回交互路径（删除前必须向用户列明影响）
+                var plan = SnapshotPlanner.PlanDelete(tree, s.Uuid, SnapshotService.FindLinkedCloneReferences(pkg));
+                if (plan.AffectedLinkedClones.Count > 0) continue;
+                SnapshotService.Delete(pkg, s.Uuid, new Qemu.TransactionalDiskOps(_qemuImgPath));
+            }
         }
         catch
         {
@@ -456,6 +469,16 @@ public sealed class GrassCoreService
                     continue;
                 }
                 var proc = Process.GetProcessById(session.QemuPid);
+                // PID 复用防护：进程名必须还是 QEMU（否则是别人复用了 PID——把它当 QEMU 接管
+                // 会在错误进程退出时误清 runtime/误放锁）
+                if (!proc.ProcessName.Contains("qemu", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (Directory.Exists(pkg.RuntimePath))
+                        foreach (var f in Directory.EnumerateFiles(pkg.RuntimePath)) File.Delete(f);
+                    new VmLock(pkg).Release();
+                    dead.Add(pkg.Path);
+                    continue;
+                }
                 var vm = new RunningVm(pkg.Path, session, proc);
                 vm.Qmp = TryConnectQmp(session.QmpPipe);
                 // 挂起标记 + 活着的 QEMU = 上次 Core 在"标记已落盘、quit 未送达"窗口崩溃。

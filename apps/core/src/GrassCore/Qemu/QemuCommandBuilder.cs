@@ -89,7 +89,7 @@ public sealed class QemuCommandBuilder
             var code = Config.Firmware.SecureBoot ? "OVMF_CODE.secboot.fd" : "OVMF_CODE.fd";
             args.AddRange(new[] { "-drive", $"if=pflash,format=raw,readonly=on,file={Combine(_ovmfDir, code)}" });
             var nvram = Combine(packageRoot, GrassVmPackage.FirmwareDir, "VARS.fd");
-            args.AddRange(new[] { "-drive", $"if=pflash,format=raw,file={nvram}" });
+            args.AddRange(new[] { "-drive", $"if=pflash,format=raw,file={Esc(nvram)}" });
         }
         // 传统 BIOS：SeaBIOS 内置于 QEMU，无需参数
 
@@ -104,6 +104,10 @@ public sealed class QemuCommandBuilder
         }
     }
 
+
+    /// <summary>QEMU 选项串里 "," 是参数分隔符：值内逗号必须写成 ",,"（如含逗号的用户目录路径）。</summary>
+    private static string Esc(string value) => value.Replace(",", ",,");
+
     private void AddDevice(List<string> args, VmDevice device, string packageRoot, ref int sataPort)
     {
         switch (device)
@@ -112,7 +116,7 @@ public sealed class QemuCommandBuilder
             {
                 var abs = PathPolicy.Resolve(new GrassVmPackage(packageRoot), disk.Path);
                 var id = "disk" + disk.CreatedOrder;
-                args.AddRange(new[] { "-drive", $"file={abs},if=none,format=qcow2,id={id}" });
+                args.AddRange(new[] { "-drive", $"file={Esc(abs)},if=none,format=qcow2,id={id}" });
                 switch (_profile.SystemDiskBus)
                 {
                     case DiskBus.Sata:
@@ -140,7 +144,7 @@ public sealed class QemuCommandBuilder
                 var id = "cd" + cd.CreatedOrder;
                 var media = cd.IsoPath is null
                     ? "media=cdrom"
-                    : $"media=cdrom,file={PathPolicy.Resolve(new GrassVmPackage(packageRoot), cd.IsoPath)}";
+                    : $"media=cdrom,file={Esc(PathPolicy.Resolve(new GrassVmPackage(packageRoot), cd.IsoPath))}";
                 args.AddRange(new[] { "-drive", $"if=none,{media},id={id},readonly=on" });
                 // 光驱接到 SATA/IDE；热插拔换盘由 QMP blockdev-change-medium 完成
                 if (_profile.SystemDiskBus == DiskBus.Virtio || _profile.Machine == MachineKind.Q35)
@@ -206,7 +210,12 @@ public sealed class QemuCommandBuilder
         }
     }
 
-    private static string TapName(NetworkDevice net) => $"GrassVM-Tap-{Math.Abs(net.DeviceId.GetHashCode()) % 10000}";
+    // TAP 适配器名必须跨进程稳定（安装器按这个名字部署；string.GetHashCode 每进程随机化不可用）
+    private static string TapName(NetworkDevice net)
+    {
+        var hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(net.DeviceId));
+        return $"GrassVM-Tap-{BitConverter.ToString(hash, 0, 2).Replace("-", "")}";
+    }
 
     private int BootIndex(BootClass @class)
     {

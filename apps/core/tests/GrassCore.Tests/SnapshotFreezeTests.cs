@@ -35,20 +35,7 @@ public class SnapshotFreezeTests : IDisposable
         File.WriteAllBytes(Path.Combine(_pkg.Path, "disks/system.qcow2"), "BASE-V1"u8.ToArray());
     }
 
-    private static string WriteFakeQemuImg()
-    {
-        if (OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("此测试当前仅在 POSIX CI 上运行假 qemu-img。");
-        var sh = Path.Combine(Path.GetTempPath(), "fake-qemu-img-" + Guid.NewGuid().ToString("N"));
-        File.WriteAllText(sh, """
-            #!/bin/sh
-            case "$1" in commit|rebase) exit 0;; esac
-            target=$(printf '%s\n' "$@" | grep -E '\.(qcow2|vmdk)' | tail -1)
-            printf 'QFI\373' > "$target"
-            printf '%s\n' "$*" >> "$target"
-            """);
-        Process.Start("chmod", $"+x {sh}")!.WaitForExit();
-        return sh;
-    }
+    private string WriteFakeQemuImg() => FakeQemuImg.Create(Path.Combine(_dir, "fakes"));
 
     private TransactionalDiskOps Ops => new(_fakeImg);
 
@@ -128,5 +115,42 @@ public class SnapshotFreezeTests : IDisposable
     {
         try { Directory.Delete(_dir, recursive: true); } catch { }
         try { File.Delete(_fakeImg); } catch { }
+    }
+
+    [Fact]
+    public void Delete_WithoutDiskOps_KeepsPhysicalFrozenFiles()
+    {
+        // 升级保护自动删除曾以无 diskOps 调 Delete：物理目录被无条件删除 → 链断 + 数据丢失。
+        // 兜底语义：没有链维护工具时只删元数据，冻结文件一个都不许动。
+        var config = new ConfigStore(_pkg).Load();
+        var s1 = SnapshotService.Create(_pkg, config, "s1", diskOps: Ops);
+        var s2 = SnapshotService.Create(_pkg, config, "s2", diskOps: Ops);
+
+        SnapshotService.Delete(_pkg, s1.Uuid); // 注意：不传 diskOps
+
+        // 元数据消失（树不再显示），物理冻结文件保留（工作 overlay 的 backing 仍可解析）
+        Assert.False(File.Exists(Path.Combine(_pkg.SnapshotsPath, s1.Uuid, "metadata.json")));
+        Assert.True(File.Exists(FrozenDisk(_pkg, s1)), "无 diskOps 的删除把冻结文件物理删除了——链断/数据丢失");
+        Assert.True(File.Exists(FrozenDisk(_pkg, s2)));
+    }
+
+    [Fact]
+    public void RepairStagedOverlays_CompletesInterruptedSwap()
+    {
+        // 崩溃窗口：新 overlay 已生成（暂存名）、工作盘已被冻结移走 → 工作路径缺失。
+        // 修复 = 把暂存换入工作路径（幂等）。
+        var config = new ConfigStore(_pkg).Load();
+        var s1 = SnapshotService.Create(_pkg, config, "s1", diskOps: Ops);
+
+        // 人为复现"换入中断"：工作盘改名回暂存
+        var active = ActiveDisk;
+        File.Move(active, active + SnapshotService.StagedOverlaySuffix);
+        Assert.False(File.Exists(active));
+
+        SnapshotService.RepairStagedOverlays(_pkg);
+
+        Assert.True(File.Exists(active));
+        Assert.False(File.Exists(active + SnapshotService.StagedOverlaySuffix));
+        Assert.True(File.Exists(FrozenDisk(_pkg, s1))); // 冻结点不受影响
     }
 }

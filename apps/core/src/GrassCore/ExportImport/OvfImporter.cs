@@ -274,7 +274,10 @@ public sealed class OvfImporter(TransactionalDiskOps diskOps)
 
     private static long ToMiB(long qty, string units)
     {
-        var u = units.Trim().ToLowerInvariant().Replace("byte*", "b");
+        // CIM/OVF 常见两种写法："byte*" 与 "byte * 2^30"（带空格的指数形式）——先去空格再归一化
+        var u = units.Trim().ToLowerInvariant().Replace(" ", "");
+        u = u.Replace("byte*2^30", "g").Replace("byte*2^20", "m").Replace("byte*2^0", "b")
+            .Replace("byte*", "b");
         return u switch
         {
             "b" or "bytes" => qty / (1024 * 1024),

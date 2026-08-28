@@ -29,6 +29,8 @@ public class QemuImgTransactionTests : IDisposable
             var bat = Path.Combine(_dir, "qemu-img.bat");
             File.WriteAllText(bat, """
                 @echo off
+                if /i "%1"=="commit" exit /B 0
+                if /i "%1"=="rebase" exit /B 0
                 echo %* | findstr /C:"crash-mode" >nul && exit /B 1
                 echo %* | findstr /C:"slow-mode" >nul && (ping -n 30 127.0.0.1 >nul)
                 for %%a in (%*) do set LAST=%%~a

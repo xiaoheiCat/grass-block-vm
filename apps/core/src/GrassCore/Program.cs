@@ -63,28 +63,41 @@ public static class Program
 
     private static async Task HandleConnectionAsync(JsonRpcConnection conn, GrassCoreService service)
     {
+        // 每个请求在线程池上执行、响应按完成顺序回写（JSON-RPC id 配对，客户端不依赖顺序）。
+        // 不能串行等待：挂起大内存 VM 时 migrate 轮询可达分钟级，串行会把同一连接上的
+        // scanLibrary（3 秒轮询）/ forceOff 全部堵死——用户既看不到状态也取消不了。
+        var pending = new List<Task>();
         while (true)
         {
             JsonElement? request;
             try { request = await conn.ReceiveAsync(); }
-            catch (Exception) { break; } // 连接关闭
+            catch (Exception)
+            {
+                break; // 连接关闭
+            }
             if (request is null) break;
 
-            try
+            pending.Add(Task.Run(() =>
             {
-                var method = request.Value.GetProperty("method").GetString()!;
-                var id = request.Value.TryGetProperty("id", out var idEl) ? idEl : (JsonElement?)null;
-                JsonElement p = request.Value.TryGetProperty("params", out var pEl) ? pEl : JsonDocument.Parse("{}").RootElement;
-                object result = Dispatch(service, method, p);
-                if (id is not null)
-                    await conn.SendAsync(JsonRpcConnection.Ok(result, id.Value));
-            }
-            catch (Exception ex)
-            {
-                if (request.Value.TryGetProperty("id", out var idEl2) && idEl2.ValueKind != JsonValueKind.Null)
-                    await conn.SendAsync(JsonRpcConnection.Error(-32000, ex.Message, idEl2));
-            }
+                try
+                {
+                    var method = request.Value.GetProperty("method").GetString()!;
+                    var id = request.Value.TryGetProperty("id", out var idEl) ? idEl : (JsonElement?)null;
+                    JsonElement p = request.Value.TryGetProperty("params", out var pEl) ? pEl : JsonDocument.Parse("{}").RootElement;
+                    object result = Dispatch(service, method, p);
+                    if (id is not null)
+                        conn.SendAsync(JsonRpcConnection.Ok(result, id.Value)).GetAwaiter().GetResult();
+                }
+                catch (Exception ex)
+                {
+                    if (request.Value.TryGetProperty("id", out var idEl2) && idEl2.ValueKind != JsonValueKind.Null)
+                        conn.SendAsync(JsonRpcConnection.Error(-32000, ex.Message, idEl2)).GetAwaiter().GetResult();
+                }
+            }));
+            pending.RemoveAll(t => t.IsCompleted);
         }
+        // 连接关闭：等在途回写结束（新请求不再产生）
+        await Task.WhenAll(pending);
     }
 
     private static object Dispatch(GrassCoreService s, string method, JsonElement p) => method switch

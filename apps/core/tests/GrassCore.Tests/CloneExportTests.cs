@@ -28,23 +28,7 @@ public class CloneExportTests : IDisposable
 
     public void Dispose() { try { Directory.Delete(_dir, recursive: true); } catch { } }
 
-    private static string CreateFakeQemuImg()
-    {
-        if (OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("此测试当前仅在 POSIX CI 上运行假 qemu-img。");
-        var sh = Path.Combine(Path.GetTempPath(), "fake-qemu-img-" + Guid.NewGuid().ToString("N"));
-        File.WriteAllText(sh, """
-            #!/bin/sh
-            case "$1" in commit|rebase) exit 0;; esac
-            target=$(printf '%s\n' "$@" | grep -E '\.(qcow2|vmdk)' | tail -1)
-            case "$target" in
-              *vmdk*) printf '# Disk DescriptorFile\nfake-vmdk' > "$target" ;;
-              *)      printf 'QFI\373' > "$target" ;;
-            esac
-            printf '%s\n' "$*" >> "$target"
-            """);
-        Process.Start("chmod", $"+x {sh}")!.WaitForExit();
-        return sh;
-    }
+    private static string CreateFakeQemuImg() => FakeQemuImg.Create(Path.Combine(Path.GetTempPath(), "grassvm-fakes-" + Guid.NewGuid().ToString("N")));
 
     private TransactionalDiskOps Ops() => new(_fakeQemuImg);
 

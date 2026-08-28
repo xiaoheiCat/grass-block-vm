@@ -54,7 +54,7 @@ public sealed class QmpClient : IDisposable
     private readonly IQmpTransport _transport;
     private readonly StreamReader _reader;
     private readonly StreamWriter _writer;
-    private readonly Dictionary<string, Action<JsonElement>> _eventHandlers = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Action<JsonElement>> _eventHandlers = new();
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, TaskCompletionSource<JsonDocument>> _pending = new();
     private Task? _readLoop;
     private volatile bool _disposed;
@@ -98,13 +98,21 @@ public sealed class QmpClient : IDisposable
     /// <summary>注册事件处理（BLOCK_JOB_COMPLETED / SPICE_CONNECTED / DEVICE_DELETED …）。</summary>
     public void On(string eventName, Action<JsonElement> handler) => _eventHandlers[eventName] = handler;
 
+    /// <summary>发送前检查 disposed，给出干净的 QMP 不可用错误（而不是 ObjectDisposedException）。</summary>
+    private void ThrowIfDisposed()
+    {
+        if (_disposed) throw new QmpException("QMP 连接已关闭。");
+    }
+
     private async Task<JsonDocument> ExecuteRawAsync(object payload, CancellationToken ct)
     {
         int id;
         var tcs = new TaskCompletionSource<JsonDocument>(TaskCreationOptions.RunContinuationsAsynchronously);
+        ThrowIfDisposed();
         await _sendLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
+            ThrowIfDisposed(); // 等锁期间可能已被释放
             id = _nextId++;
             _pending[id] = tcs;
             var json = JsonSerializer.Serialize(payload);
@@ -177,10 +185,14 @@ public sealed class QmpClient : IDisposable
     public void Dispose()
     {
         _disposed = true;
-        _writer.Dispose();
-        _reader.Dispose();
+        // 在途命令立即失败（否则只能等读循环碰巧观察到流关闭，调用方白白挂住）
+        foreach (var (_, tcs) in _pending)
+            tcs.TrySetException(new QmpException("QMP 连接已关闭。"));
+        _pending.Clear();
+        try { _writer.Dispose(); } catch (ObjectDisposedException) { }
+        try { _reader.Dispose(); } catch (ObjectDisposedException) { }
         _transport.Dispose();
-        _sendLock.Dispose();
+        try { _sendLock.Dispose(); } catch (ObjectDisposedException) { }
     }
 }
 

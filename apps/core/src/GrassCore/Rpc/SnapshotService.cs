@@ -15,6 +15,28 @@ public static class SnapshotService
 {
     private static readonly JsonSerializerOptions Opts = new() { WriteIndented = true };
 
+    /// <summary>
+    /// 工作盘的"暂存 overlay"后缀：新 overlay 先落在这里，工作盘冻结后再原子换入。
+    /// 崩溃恢复：工作盘不存在而暂存存在 → 完成换入（见 <see cref="RepairStagedOverlays"/>）。
+    /// </summary>
+    public const string StagedOverlaySuffix = ".grass-overlay-staged";
+
+    /// <summary>
+    /// 修复"换入中断"窗口：Create/Restore 在【新 overlay 已生成、还没换到工作路径】之间崩溃时，
+    /// 工作盘缺失但暂存 overlay 完好——把它换入即可恢复。幂等；在启动/恢复入口调用。
+    /// </summary>
+    public static void RepairStagedOverlays(GrassVmPackage package)
+    {
+        foreach (var staged in Directory.EnumerateFiles(package.Path, "*" + StagedOverlaySuffix, SearchOption.AllDirectories))
+        {
+            var active = staged[..^StagedOverlaySuffix.Length];
+            if (!File.Exists(active))
+                File.Move(staged, active); // 完成被中断的换入
+            else
+                File.Delete(staged);       // 换入已完成，暂存是残留
+        }
+    }
+
     public static Snapshot Create(GrassVmPackage package, VmConfiguration config, string name,
         string? description = null, bool isUpgradeProtection = false,
         GrassCore.Qemu.TransactionalDiskOps? diskOps = null)
@@ -58,9 +80,14 @@ public static class SnapshotService
                 if (File.Exists(activeAbs))
                 {
                     Directory.CreateDirectory(System.IO.Path.GetDirectoryName(frozenAbs)!);
+                    // 顺序（崩溃安全）：① 在工作路径旁生成暂存 overlay（backing=冻结点的相对引用，
+                    // 与最终位置的相对路径一致；qemu-img create -b 不要求 backing 已存在）；
+                    // ② 冻结：工作盘原子改名进快照；③ 换入：暂存改名为工作盘。
+                    // ②③ 之间崩溃 → RepairStagedOverlays 幂等完成换入。
+                    var staged = activeAbs + StagedOverlaySuffix;
+                    diskOps.CreateOverlay(frozenAbs, staged, relativeBacking: true);
                     File.Move(activeAbs, frozenAbs);
-                    // 相对引用：包整体迁移（导出/导入/复制）后链依然完整
-                    diskOps.CreateOverlay(frozenAbs, activeAbs, relativeBacking: true); // 原路径的新工作 overlay
+                    File.Move(staged, activeAbs);
                 }
             }
         }
@@ -140,8 +167,11 @@ public static class SnapshotService
                 if (!File.Exists(frozenAbs)) continue; // 元数据先行时代的快照：保留只回滚配置
                 var activeAbs = GrassCore.GrassVm.PathPolicy.Resolve(package, restoredDiskPath(restored, deviceId));
                 if (string.Equals(activeAbs, frozenAbs, StringComparison.OrdinalIgnoreCase)) continue;
-                File.Delete(activeAbs); // 工作链头（其内容属于"未快照的更改"）
-                diskOps.CreateOverlay(frozenAbs, activeAbs, relativeBacking: true);
+                // 崩溃安全顺序：先造暂存 overlay，再删旧工作盘（未快照更改，调用方已警告），最后换入
+                var staged = activeAbs + StagedOverlaySuffix;
+                diskOps.CreateOverlay(frozenAbs, staged, relativeBacking: true);
+                File.Delete(activeAbs);
+                File.Move(staged, activeAbs);
             }
             var frozenVars = System.IO.Path.Combine(package.SnapshotsPath, uuid, "VARS.fd");
             if (File.Exists(frozenVars))
@@ -222,10 +252,14 @@ public static class SnapshotService
             WriteSnapshot(package, child);
         }
 
-        // 物理目录：链根保留 disks/（仍是后代的基座），其余整目录删除
+        // 物理目录：链根保留 disks/（仍是后代的基座），其余整目录删除。
+        // 没有 diskOps（无法做 commit/rebase 链维护）而冻结文件还在 → 只删元数据：
+        // 物理文件是某条 overlay 链的一部分，删了就是数据丢失/断链。
         if (Directory.Exists(dir))
         {
-            if (parentUuid is null)
+            var frozenFiles = Directory.EnumerateFiles(dir, "*.qcow2", SearchOption.AllDirectories).ToList();
+            var keepPhysical = parentUuid is null || diskOps is null && frozenFiles.Count > 0;
+            if (keepPhysical)
             {
                 foreach (var f in Directory.EnumerateFiles(dir))
                     if (!f.Contains("disks")) File.Delete(f);
