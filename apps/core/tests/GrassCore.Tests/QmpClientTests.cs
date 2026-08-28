@@ -124,11 +124,11 @@ public class QmpClientTests
         {
             var sawStop = new TaskCompletionSource<System.Text.Json.JsonElement>();
             qmp.On("STOP", e => sawStop.TrySetResult(e));
-            var stopped = await qmp.StopAsync(); // 服务端在响应 stop 前发事件？之后发——事件在下一次命令等待中派发
+            var stopped = await qmp.StopAsync(); // 服务端在响应 stop 之后异步发送 STOP 事件
             Assert.Equal("{}", stopped.ToString());
-            // 事件在响应之后到达：再执行一个命令等待期间派发
-            var finished = await qmp.MigrationFinishedAsync();
-            Assert.True(finished);
+            // 常驻读循环：事件即时派发，无需等待下一条命令
+            var finished = await qmp.MigrationStatusAsync();
+            Assert.Equal("completed", finished);
             var winner = await Task.WhenAny(sawStop.Task, Task.Delay(3000));
             Assert.Equal(sawStop.Task, winner); // STOP 事件已分派
         });
@@ -141,7 +141,7 @@ public class QmpClientTests
         {
             await qmp.StopAsync();
             await qmp.MigrateToFileAsync(@"C:\VM\state.dat");
-            Assert.True(await qmp.MigrationFinishedAsync());
+            Assert.Equal("completed", await qmp.MigrationStatusAsync());
         });
     }
 }

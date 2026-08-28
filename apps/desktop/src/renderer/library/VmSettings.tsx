@@ -46,12 +46,18 @@ const api: GrassApi | undefined = (window as unknown as { grassvm?: GrassApi }).
 
 export function VmSettings(props: { vm: VmSummary; onClose(): void }): React.ReactElement {
   const [selected, setSelected] = useState<(typeof DEVICE_ORDER)[number]>('cpu-memory');
-  const running = props.vm.state === 'running' || props.vm.state === 'suspending';
+  const suspendedNow = props.vm.state === 'suspended';
+  const lockedNow =
+    props.vm.state === 'running' ||
+    props.vm.state === 'suspending' ||
+    props.vm.state === 'starting' ||
+    suspendedNow;
   const [config, setConfig] = useState<VmConfigView | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
   const [cpu, setCpu] = useState(0);
   const [mem, setMem] = useState(0);
+  const [hostInfo, setHostInfo] = useState<{ cpuCores: number; memoryMiB: number } | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -61,6 +67,7 @@ export function VmSettings(props: { vm: VmSummary; onClose(): void }): React.Rea
         setConfig(c);
         setCpu(c.cpuCores);
         setMem(c.memoryMiB);
+        setHostInfo(await api.coreCall<{ cpuCores: number; memoryMiB: number }>('getHostInfo'));
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       }
@@ -82,7 +89,9 @@ export function VmSettings(props: { vm: VmSummary; onClose(): void }): React.Rea
     }
   }, [api, config, cpu, mem, props.vm.path]);
 
-  const hostCores = navigator.hardwareConcurrency || 8;
+  // 上限来自 Core（宿主真实内存；拿不到时退回保守的每核 2GB 估算）
+  const hostCores = hostInfo?.cpuCores ?? navigator.hardwareConcurrency ?? 8;
+  const hostMemMiB = hostInfo?.memoryMiB ?? hostCores * 2048;
   const edit = (setter: (v: number) => void) => (v: number) => {
     setter(v);
     setDirty(true);
@@ -97,9 +106,14 @@ export function VmSettings(props: { vm: VmSummary; onClose(): void }): React.Rea
             完成
           </button>
         </header>
-        {running && (
+        {lockedNow && !suspendedNow && (
           <div className="banner-quiet">
             这台虚拟机正在运行。运行期间无法修改的设置已锁定，正常关机后即可更改。
+          </div>
+        )}
+        {suspendedNow && (
+          <div className="banner-quiet">
+            这台虚拟机已挂起。保存的运行状态绑定挂起时的硬件配置，请先恢复并正常关机后再修改设置。
           </div>
         )}
         {error && <div className="banner-error">{error}</div>}
@@ -116,11 +130,12 @@ export function VmSettings(props: { vm: VmSummary; onClose(): void }): React.Rea
             ))}
           </nav>
           <section className="settings-pane">
-            {renderPane(selected, running, {
+            {renderPane(selected, lockedNow, {
               config,
               cpu,
               mem,
               hostCores,
+              hostMemMiB,
               dirty,
               setCpu: edit(setCpu),
               setMem: edit(setMem),
@@ -138,6 +153,7 @@ interface PaneProps {
   cpu: number;
   mem: number;
   hostCores: number;
+  hostMemMiB: number;
   dirty: boolean;
   setCpu(v: number): void;
   setMem(v: number): void;
@@ -195,7 +211,7 @@ function renderPane(d: (typeof DEVICE_ORDER)[number], locked: boolean, p: PanePr
             <input
               type="range"
               min={512}
-              max={Math.max(512, Math.floor((p.hostCores * 1024) / 2 / 512) * 512)}
+              max={Math.max(512, Math.floor(p.hostMemMiB / 2 / 512) * 512)}
               step={512}
               value={p.mem}
               disabled={locked}

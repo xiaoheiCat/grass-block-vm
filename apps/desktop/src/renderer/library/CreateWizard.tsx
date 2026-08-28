@@ -60,15 +60,8 @@ export function CreateWizard(props: {
     setCreating(true);
     setError(null);
     try {
+      // "创建后立即启动"由 Core 在 createVm 内一并完成（启动失败不回滚创建，错误原样提示）
       await api.coreCall('createVm', req);
-      if (req.startAfterCreate) {
-        // 启动失败不回滚创建（VM 已存在，错误提示用户手动处理）
-        try {
-          await api.coreCall('scanLibrary');
-        } catch {
-          /* 提示但不阻塞 */
-        }
-      }
       props.onCreated();
       props.onClose();
     } catch (e) {

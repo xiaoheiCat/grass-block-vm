@@ -37,20 +37,36 @@ public static class GrassVmZip
     {
         if (isRunning || File.Exists(package.LockPath))
             throw new GrassCoreException("导出前必须先正常关机。运行中或挂起的虚拟机不允许导出。");
+        // 挂起的 VM 没有 vm.lock 也不在运行，但挂起状态绑定宿主指纹，导出的档案无法在别处恢复
+        if (Config.VmState.Load(package).SuspendedStatePath is not null)
+            throw new GrassCoreException("此虚拟机已挂起。请先恢复并正常关机后再导出。");
     }
 
     /// <summary>导出 .grassvm.zip（完整档案）。条目以 &lt;包名&gt;.grassvm/ 为前缀，导入时保持同名。</summary>
     public static void Export(GrassVmPackage package, string zipPath)
     {
-        if (File.Exists(zipPath)) File.Delete(zipPath);
-        var prefix = Path.GetFileName(package.Path) + "/";
-        using var zip = ZipFile.Open(zipPath, ZipArchiveMode.Create);
-        foreach (var file in Directory.EnumerateFiles(package.Path, "*", SearchOption.AllDirectories))
+        // 写临时文件后原子改名：导出失败不破坏调用方已有的旧档案
+        var tempZip = zipPath + ".grass-tmp";
+        try
         {
-            var rel = Path.GetRelativePath(package.Path, file).Replace('\\', '/');
-            if (IsExcluded(rel)) continue;
-            // 包内相对路径存储（导入后在任意位置解开都保持自包含）
-            zip.CreateEntryFromFile(file, prefix + rel, CompressionLevel.Optimal);
+            var prefix = Path.GetFileName(package.Path) + "/";
+            using (var zip = ZipFile.Open(tempZip, ZipArchiveMode.Create))
+            {
+                foreach (var file in Directory.EnumerateFiles(package.Path, "*", SearchOption.AllDirectories))
+                {
+                    var rel = Path.GetRelativePath(package.Path, file).Replace('\\', '/');
+                    if (IsExcluded(rel)) continue;
+                    // 包内相对路径存储（导入后在任意位置解开都保持自包含）
+                    zip.CreateEntryFromFile(file, prefix + rel, CompressionLevel.Optimal);
+                }
+            }
+            if (File.Exists(zipPath)) File.Delete(zipPath);
+            File.Move(tempZip, zipPath);
+        }
+        catch
+        {
+            try { if (File.Exists(tempZip)) File.Delete(tempZip); } catch { }
+            throw;
         }
     }
 
@@ -61,6 +77,8 @@ public static class GrassVmZip
     public static GrassVmPackage Import(string zipPath, string libraryRoot)
     {
         using var zip = ZipFile.OpenRead(zipPath);
+        if (zip.Entries.Count == 0)
+            throw new GrassCoreException("这是一个空的压缩包，不是有效的虚拟机档案。");
         // 包名取第一个一级目录（导出时以包根内容 + 包名目录形式写入）
         var first = zip.Entries[0].FullName.Split('/')[0];
         var pkgName = first.EndsWith(GrassVmPackage.Extension, StringComparison.OrdinalIgnoreCase)
@@ -69,23 +87,35 @@ public static class GrassVmZip
         var target = Path.Combine(libraryRoot, pkgName + GrassVmPackage.Extension);
         if (Directory.Exists(target) || File.Exists(target))
             throw new GrassCoreException($"目标位置已存在同名虚拟机：{pkgName}。");
-        Directory.CreateDirectory(target);
-        foreach (var entry in zip.Entries)
+        // 先解压到临时名，全部成功后改名成包：中途失败（zip-slip/IO 错误）不留半成品
+        var staging = Path.Combine(libraryRoot,
+            $".importing-{Guid.NewGuid().ToString("N")[..8]}-{pkgName}{GrassVmPackage.Extension}");
+        try
         {
-            var rel = first.EndsWith(GrassVmPackage.Extension, StringComparison.OrdinalIgnoreCase)
-                ? entry.FullName[(first.Length + 1)..]
-                : entry.FullName;
-            if (string.IsNullOrEmpty(rel)) continue;
-            var dest = Path.GetFullPath(Path.Combine(target, rel));
-            if (!dest.StartsWith(target + Path.DirectorySeparatorChar, StringComparison.Ordinal))
-                throw new GrassCoreException("压缩包包含非法路径（zip slip），已拒绝导入。");
-            if (IsExcluded(rel)) continue; // 本机痕迹即使被人塞进包里也不导入
-            Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
-            entry.ExtractToFile(dest, overwrite: false);
+            Directory.CreateDirectory(staging);
+            foreach (var entry in zip.Entries)
+            {
+                var rel = first.EndsWith(GrassVmPackage.Extension, StringComparison.OrdinalIgnoreCase)
+                    ? entry.FullName[(first.Length + 1)..]
+                    : entry.FullName;
+                if (string.IsNullOrEmpty(rel)) continue;
+                var dest = Path.GetFullPath(Path.Combine(staging, rel));
+                if (!dest.StartsWith(staging + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+                    throw new GrassCoreException("压缩包包含非法路径（zip slip），已拒绝导入。");
+                if (IsExcluded(rel)) continue; // 本机痕迹即使被人塞进包里也不导入
+                Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
+                entry.ExtractToFile(dest, overwrite: false);
+            }
+            var pkg0 = new GrassVmPackage(staging);
+            // 档案刻意不含 runtime/logs 等瞬态目录；导入时补齐固定结构（确定无损修复）
+            pkg0.EnsureStructure();
+            Directory.Move(staging, target);
         }
-        var pkg = new GrassVmPackage(target);
-        // 档案刻意不含 runtime/logs 等瞬态目录；导入时补齐固定结构（确定无损修复）
-        pkg.EnsureStructure();
-        return pkg;
+        catch
+        {
+            try { if (Directory.Exists(staging)) Directory.Delete(staging, recursive: true); } catch { }
+            throw;
+        }
+        return new GrassVmPackage(target);
     }
 }

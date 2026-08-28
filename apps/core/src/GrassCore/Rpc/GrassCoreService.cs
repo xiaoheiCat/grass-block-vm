@@ -46,6 +46,8 @@ public sealed class GrassCoreService
     public sealed record RunningVm(string PackagePath, RuntimeSession Session, Process Process)
     {
         public QmpClient? Qmp { get; set; }
+        /// <summary>已发送 ACPI 电源按钮请求（正常关机的唯一可信信号；quit/崩溃不算）。</summary>
+        public volatile bool AcpiShutdownRequested;
     }
 
     /// <summary>当前 Library Root（宿主只有一个；更改只影响之后创建/导入）。</summary>
@@ -117,10 +119,15 @@ public sealed class GrassCoreService
         var diskGiB = args.GetProperty("diskGiB").GetInt64();
         var isoPath = args.TryGetProperty("isoPath", out var iso) && iso.ValueKind != JsonValueKind.Null ? iso.GetString() : null;
 
+        // 向导可调参数：cpuCores / memoryMiB（缺省 = Profile 推荐；钳制到安全范围）
         var root = _db.LibraryRoot ?? throw new InvalidOperationException("尚未设置虚拟机存档位置。");
         var profile = OsProfileLibrary.ById(profileId);
         var pkg = GrassVmPackage.CreateNew(root, name);
         var config = OsProfileLibrary.CreateDefaultConfig(profileId, name);
+        if (args.TryGetProperty("cpuCores", out var cpuEl) && cpuEl.ValueKind == JsonValueKind.Number)
+            config.CpuCores = Math.Clamp(cpuEl.GetInt32(), 1, Math.Max(1, Environment.ProcessorCount));
+        if (args.TryGetProperty("memoryMiB", out var memEl) && memEl.ValueKind == JsonValueKind.Number)
+            config.MemoryMiB = Math.Clamp(memEl.GetInt32(), 512, Math.Max(512, (int)(GetTotalHostMemoryMiB() / 2)));
 
         // 向导强制的"至少一个可启动来源"（普通安装场景），底层模型不被限制
         var order = DeviceNamer.NextCreatedOrder(config);
@@ -153,10 +160,19 @@ public sealed class GrassCoreService
 
         new ConfigStore(pkg).Save(config);
         _db.UpsertIndex(new HostDb.VmIndexEntry(pkg.Path, pkg.Name, null, DateTimeOffset.UtcNow.ToString("o"), null));
+        // "创建后立即启动"（向导默认开）：由 Core 一并完成，UI 只负责刷新
+        if (args.TryGetProperty("startAfterCreate", out var sac) && sac.ValueKind == JsonValueKind.True)
+        {
+            StartVm(pkg.Path);
+            return new CreateVmResult(pkg.Path, pkg.Name) { Started = true };
+        }
         return new CreateVmResult(pkg.Path, pkg.Name);
     }
 
-    public sealed record CreateVmResult(string Path, string Name);
+    public sealed record CreateVmResult(string Path, string Name)
+    {
+        public bool Started { get; init; }
+    }
 
     // ---------- 启动 / 电源 ----------
 
@@ -179,41 +195,71 @@ public sealed class GrassCoreService
 
         var @lock = new VmLock(pkg);
         @lock.Acquire();
-
-        // 升级保护：跨 QEMU major 首启 → 备份元数据 + 隐藏保护快照（由快照服务落盘）
-        if (UpgradeProtection.NeedsProtection(state.LastQemuMajor, _bundledQemuMajor))
+        Process? proc = null;
+        try
         {
-            var plan = UpgradeProtection.CreatePlan(pkg, state.LastQemuMajor!, _bundledQemuMajor);
-            UpgradeProtection.BackupMetadata(pkg, plan.MetadataBackupDir);
-            SnapshotService.Create(pkg, config, name: "升级保护快照", isUpgradeProtection: true);
+            // 升级保护：跨 QEMU major 首启 → 备份元数据 + 隐藏保护快照（由快照服务落盘）
+            if (UpgradeProtection.NeedsProtection(state.LastQemuMajor, _bundledQemuMajor))
+            {
+                var plan = UpgradeProtection.CreatePlan(pkg, state.LastQemuMajor!, _bundledQemuMajor);
+                UpgradeProtection.BackupMetadata(pkg, plan.MetadataBackupDir);
+                SnapshotService.Create(pkg, config, name: "升级保护快照", isUpgradeProtection: true);
+            }
+
+            var sessionId = Guid.NewGuid().ToString("N")[..12];
+            var cmd = new QemuCommandBuilder(config, _ovmfDir).Build(pkg.Path, sessionId);
+            var session = new RuntimeSession
+            {
+                SessionId = sessionId,
+                QmpPipe = cmd.QmpPipeName,
+                StartedAt = DateTimeOffset.UtcNow,
+                QemuMajorAtStart = _bundledQemuMajor,
+            };
+            Directory.CreateDirectory(pkg.RuntimePath);
+            AtomicFile.WriteJsonValidated(pkg.SessionPath, session.Serialize());
+
+            proc = _launcher.Start(cmd);
+            session.QemuPid = proc.Id;
+            AtomicFile.WriteJsonValidated(pkg.SessionPath, session.Serialize());
+
+            state.LastQemuMajor = _bundledQemuMajor;
+            state.LastStartedAt = DateTimeOffset.UtcNow;
+            state.SuspendedStatePath = null;
+            state.Save(pkg);
+
+            var vm = new RunningVm(pkg.Path, session, proc);
+            vm.Qmp = TryConnectQmp(session.QmpPipe);
+            _running[pkg.Path] = vm;
+            WatchQemuProcess(vm);
+            return new { qemuPid = proc.Id, qmpPipe = cmd.QmpPipeName, sessionId };
         }
-
-        var sessionId = Guid.NewGuid().ToString("N")[..12];
-        var cmd = new QemuCommandBuilder(config, _ovmfDir).Build(pkg.Path, sessionId);
-        var session = new RuntimeSession
+        catch
         {
-            SessionId = sessionId,
-            QmpPipe = cmd.QmpPipeName,
-            StartedAt = DateTimeOffset.UtcNow,
-            QemuMajorAtStart = _bundledQemuMajor,
-        };
-        Directory.CreateDirectory(pkg.RuntimePath);
-        AtomicFile.WriteJsonValidated(pkg.SessionPath, session.Serialize());
+            // 启动失败回滚：不留幻影"运行中"（杀已拉起的进程、清 runtime、释放锁）
+            RollbackStart(pkg, proc);
+            throw;
+        }
+    }
 
-        var proc = _launcher.Start(cmd);
-        session.QemuPid = proc.Id;
-        AtomicFile.WriteJsonValidated(pkg.SessionPath, session.Serialize());
-
-        state.LastQemuMajor = _bundledQemuMajor;
-        state.LastStartedAt = DateTimeOffset.UtcNow;
-        state.SuspendedStatePath = null;
-        state.Save(pkg);
-
-        var vm = new RunningVm(pkg.Path, session, proc);
-        vm.Qmp = TryConnectQmp(session.QmpPipe);
-        _running[pkg.Path] = vm;
-        WatchQemuProcess(vm);
-        return new { qemuPid = proc.Id, qmpPipe = cmd.QmpPipeName, sessionId };
+    /// <summary>启动失败回滚（QEMU 未成功进入可控状态）。</summary>
+    private static void RollbackStart(GrassVmPackage pkg, Process? proc)
+    {
+        try
+        {
+            if (proc is { HasExited: false })
+            {
+                proc.Kill(entireProcessTree: true);
+                proc.WaitForExit(5000);
+            }
+        }
+        catch { /* 尽力而为 */ }
+        try
+        {
+            if (Directory.Exists(pkg.RuntimePath))
+                foreach (var f in Directory.EnumerateFiles(pkg.RuntimePath)) File.Delete(f);
+            new VmLock(pkg).Release();
+        }
+        catch { /* 下次启动预检会给残留锁诊断 */ }
     }
 
     /// <summary>挂起恢复：-incoming 从保存状态回到挂起瞬间。只保证相同宿主 CPU + 同一 QEMU major。</summary>
@@ -236,6 +282,7 @@ public sealed class GrassCoreService
 
         var @lock = new VmLock(pkg);
         @lock.Acquire();
+        Process? proc = null;
         try
         {
             var sessionId = Guid.NewGuid().ToString("N")[..12];
@@ -249,24 +296,53 @@ public sealed class GrassCoreService
             };
             Directory.CreateDirectory(pkg.RuntimePath);
             AtomicFile.WriteJsonValidated(pkg.SessionPath, session.Serialize());
-            var proc = _launcher.Start(cmd);
+            proc = _launcher.Start(cmd);
             session.QemuPid = proc.Id;
             AtomicFile.WriteJsonValidated(pkg.SessionPath, session.Serialize());
-
-            // 恢复完成：清除挂起标记（状态文件保留到下次正常关机？不——恢复即消费）
-            state.SuspendedStatePath = null;
-            state.SuspendFingerprint = null;
-            state.Save(pkg);
 
             var vm = new RunningVm(pkg.Path, session, proc);
             vm.Qmp = TryConnectQmp(session.QmpPipe);
             _running[pkg.Path] = vm;
             WatchQemuProcess(vm);
+
+            // 恢复确认：-incoming 迁移完成（query-status=running）后才清除挂起标记。
+            // 一次失败的恢复尝试不能毁掉整个保存的会话（保守：失败时标记保留，可重试）。
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(5);
+                    while (DateTime.UtcNow < deadline && !vm.Process.HasExited)
+                    {
+                        var q = vm.Qmp ?? TryConnectQmp(session.QmpPipe);
+                        if (q is not null)
+                        {
+                            vm.Qmp = q;
+                            if (await q.VmStatusAsync() == "running")
+                            {
+                                var st = VmState.Load(pkg);
+                                st.SuspendedStatePath = null;
+                                st.SuspendFingerprint = null;
+                                st.Save(pkg);
+                                try { File.Delete(suspendFile); } catch { /* 空间回收失败不致命 */ }
+                                return;
+                            }
+                        }
+                        await Task.Delay(500);
+                    }
+                }
+                catch
+                {
+                    // 确认失败：保留挂起标记（宁可保守；下次正常关机后标记自然失效）
+                }
+            });
             return new { qemuPid = proc.Id, resumed = true };
         }
         catch
         {
-            new VmLock(pkg).Release();
+            // 失败回滚与 StartVm 同规则：不留幻影运行中（已拉起的进程一并终止）
+            _running.Remove(pkg.Path);
+            RollbackStart(pkg, proc);
             throw;
         }
     }
@@ -286,7 +362,10 @@ public sealed class GrassCoreService
                 if (!_running.Remove(vm.PackagePath, out var removed)) return; // 已被挂起/强制路径处理
                 removed.Qmp?.Dispose();
                 var pkg = new GrassVmPackage(vm.PackagePath);
-                TryDeleteExpiredUpgradeProtection(pkg);
+                // 正常关机 = 我们发出过 ACPI 电源按钮请求后的退出。
+                // 强制关机（quit）/崩溃/宿主断电都不算——升级保护快照只在真正正常关机后才开始 24h 计时。
+                if (vm.AcpiShutdownRequested)
+                    TryDeleteExpiredUpgradeProtection(pkg);
                 // 正常退出路径：清空 runtime/ 并删除 vm.lock
                 if (Directory.Exists(pkg.RuntimePath))
                     foreach (var f in Directory.EnumerateFiles(pkg.RuntimePath)) File.Delete(f);
@@ -315,6 +394,58 @@ public sealed class GrassCoreService
         }
     }
 
+    /// <summary>
+    /// Core 重启后的无损重接管（§6.3）：扫描可接管的 session（QEMU 仍在运行），
+    /// 重新连 QMP、按 PID 重新包进程句柄、重新挂退出监视。VM 本身不受影响。
+    /// </summary>
+    public object AdoptRunningVms()
+    {
+        var adopted = new List<string>();
+        var dead = new List<string>();
+        var scanner = new CoreCrashRecovery();
+        foreach (var result in scanner.ScanAdoptable(_db.LibraryRoot ?? string.Empty))
+        {
+            try
+            {
+                var pkg = result.Package;
+                var session = result.Session;
+                if (!result.QemuAlive)
+                {
+                    // QEMU 已不在（比如 Core 崩溃期间客户机内正常关机）：做干净收尾
+                    if (Directory.Exists(pkg.RuntimePath))
+                        foreach (var f in Directory.EnumerateFiles(pkg.RuntimePath)) File.Delete(f);
+                    new VmLock(pkg).Release();
+                    dead.Add(pkg.Path);
+                    continue;
+                }
+                var proc = Process.GetProcessById(session.QemuPid);
+                var vm = new RunningVm(pkg.Path, session, proc);
+                vm.Qmp = TryConnectQmp(session.QmpPipe);
+                _running[pkg.Path] = vm;
+                WatchQemuProcess(vm);
+                adopted.Add(pkg.Path);
+            }
+            catch
+            {
+                // 单台接管失败不影响其他；预检/手动解锁兜底
+            }
+        }
+        return new { adopted, cleanedUp = dead };
+    }
+
+    private static bool IsProcessAlive(int pid)
+    {
+        try
+        {
+            var p = Process.GetProcessById(pid);
+            return !p.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            return false;
+        }
+    }
+
     private string CurrentHostFingerprint() =>
         $"{Environment.ProcessorCount}cpus|{_bundledQemuMajor}|{Environment.OSVersion.Version}";
 
@@ -337,21 +468,36 @@ public sealed class GrassCoreService
 
     private QmpClient RequireQmp(string packagePath)
     {
-        if (!_running.TryGetValue(packagePath, out var vm) || vm.Qmp is null)
-            throw new GrassCoreException("此虚拟机没有在运行，或 QMP 控制通道不可用。");
-        return vm.Qmp;
+        if (!_running.TryGetValue(packagePath, out var vm))
+            throw new GrassCoreException("此虚拟机没有在运行。");
+        // QMP 可能在启动窗口内未就绪：后续操作在这里重试连接
+        vm.Qmp ??= TryConnectQmp(vm.Session.QmpPipe);
+        return vm.Qmp ?? throw new GrassCoreException("QMP 控制通道不可用（QEMU 可能仍在启动），请稍后重试。");
     }
 
-    public object PowerAction(string packagePath, string action) => action switch
+    public object PowerAction(string packagePath, string action)
     {
-        // 正常关机 = ACPI 电源按钮请求（QGA/ACPI）；不是 kill process
-        "shutdown" => QmpResult(RequireQmp(packagePath).AcpiShutdownAsync().GetAwaiter().GetResult()),
-        // 强制关机 = 电源菜单 + 二次确认后调用方才允许
-        "forceOff" => QmpResult(RequireQmp(packagePath).ForceQuitAsync().GetAwaiter().GetResult()),
-        // 挂起 = 保存完整运行状态后完全退出 QEMU（不是 pause；1.0 无"暂停"）
-        "suspend" => SuspendVm(packagePath),
-        _ => throw new GrassCoreException($"未知电源动作：{action}"),
-    };
+        switch (action)
+        {
+            // 正常关机 = ACPI 电源按钮请求（QGA/ACPI）；不是 kill process。
+            // 只有这条路径标记为"正常关机"信号（升级保护快照的 24h 计时以此为前提）。
+            case "shutdown":
+            {
+                var qmp = RequireQmp(packagePath);
+                var r = qmp.AcpiShutdownAsync().GetAwaiter().GetResult();
+                _running[packagePath].AcpiShutdownRequested = true;
+                return QmpResult(r);
+            }
+            // 强制关机 = 电源菜单 + 二次确认后调用方才允许（不算正常关机）
+            case "forceOff":
+                return QmpResult(RequireQmp(packagePath).ForceQuitAsync().GetAwaiter().GetResult());
+            // 挂起 = 保存完整运行状态后完全退出 QEMU（不是 pause；1.0 无"暂停"）
+            case "suspend":
+                return SuspendVm(packagePath);
+            default:
+                throw new GrassCoreException($"未知电源动作：{action}");
+        }
+    }
 
     private static object QmpResult(System.Text.Json.JsonElement e) => new { sent = true, result = e.ToString() };
 
@@ -359,13 +505,30 @@ public sealed class GrassCoreService
     {
         var pkg = new GrassVmPackage(packagePath);
         var qmp = RequireQmp(packagePath);
-        // 挂起序列：stop（稳定点）→ migrate file:（保存内存/CPU/设备状态）→ 等完成 → quit
+        // 挂起序列：stop（稳定点）→ migrate file:（保存内存/CPU/设备状态）→ 轮询至完成 → quit。
+        // migrate 命令在迁移【开始】时即返回；大内存 VM 需要真实等待。
         qmp.StopAsync().GetAwaiter().GetResult();
         var stateFile = Path.Combine(pkg.FirmwarePath, "..", "suspend.state");
         stateFile = Path.GetFullPath(stateFile);
         qmp.MigrateToFileAsync(stateFile).GetAwaiter().GetResult();
-        if (!qmp.MigrationFinishedAsync().GetAwaiter().GetResult())
-            throw new GrassCoreException("保存挂起状态未完成，虚拟机仍在运行；请稍后重试。");
+        var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(10);
+        while (true)
+        {
+            var status = qmp.MigrationStatusAsync().GetAwaiter().GetResult();
+            if (status == "completed") break;
+            if (status is "failed" or "cancelled")
+            {
+                // 保存失败：恢复运行而不是把 VM 冻在 stop 状态
+                qmp.ExecuteAsync("cont").GetAwaiter().GetResult();
+                throw new GrassCoreException($"保存挂起状态失败（{status}），虚拟机已恢复运行。");
+            }
+            if (DateTime.UtcNow > deadline)
+            {
+                qmp.ExecuteAsync("cont").GetAwaiter().GetResult();
+                throw new GrassCoreException("保存挂起状态超时，虚拟机已恢复运行。");
+            }
+            Thread.Sleep(500);
+        }
         qmp.ForceQuitAsync().GetAwaiter().GetResult();
 
         // 状态落盘：标记挂起 + 指纹（只保证相同宿主 CPU + 同一 QEMU major 下恢复）
@@ -407,7 +570,10 @@ public sealed class GrassCoreService
                  ?? throw new GrassCoreException("找不到这台虚拟机的 CD/DVD 设备。");
         var resolved = isoPath is null ? null : PathPolicy.Resolve(pkg, isoPath);
         var qmp = RequireQmp(packagePath);
-        qmp.ChangeMediumAsync("cd" + cd.CreatedOrder, resolved).GetAwaiter().GetResult();
+        if (resolved is null)
+            qmp.EjectMediumAsync("cd" + cd.CreatedOrder).GetAwaiter().GetResult();
+        else
+            qmp.InsertMediumAsync("cd" + cd.CreatedOrder, resolved).GetAwaiter().GetResult();
         // 界面展示必须等于当前事实：热插拔成功后立即写回 config
         cd.IsoPath = isoPath is null ? null : PathPolicy.NormalizeReference(pkg, resolved!);
         new ConfigStore(pkg).Save(config);
@@ -416,12 +582,31 @@ public sealed class GrassCoreService
 
     // ---------- 设置（界面展示 = 当前事实）----------
 
-    /// <summary>读取完整配置（设置页数据源）。</summary>
+    /// <summary>显示器窗口连接信息：-spice port=0 自动分配后的真实端口（经 QMP query-spice）。</summary>
+    public object GetDisplayInfo(string packagePath)
+    {
+        var qmp = RequireQmp(packagePath);
+        var port = qmp.QuerySpicePortAsync().GetAwaiter().GetResult();
+        return new { spicePort = port };
+    }
+
+    /// <summary>宿主资源信息（设置页滑杆上限用；内存上限 = 物理内存一半）。</summary>
+    public object GetHostInfo()
+    {
+        return new
+        {
+            cpuCores = Environment.ProcessorCount,
+            memoryMiB = GetTotalHostMemoryMiB(),
+        };
+    }
+
+    /// <summary>读取完整配置（设置页数据源；直接返回 JSON 对象而非字符串）。</summary>
     public object GetConfig(string packagePath)
     {
         var pkg = new GrassVmPackage(packagePath);
         var config = new ConfigStore(pkg).LoadAndUpgrade();
-        return ConfigJson.Serialize(config);
+        return System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(
+            ConfigJson.Serialize(config));
     }
 
     /// <summary>
@@ -435,6 +620,9 @@ public sealed class GrassCoreService
             throw new GrassCoreException("虚拟机正在运行，关机后才能修改设置。");
         if (File.Exists(pkg.LockPath))
             throw new GrassCoreException("虚拟机被锁定（可能异常退出残留）。请先在详情中解除锁定。");
+        // 挂起状态同样不可改：保存的内存/CPU/设备拓扑属于旧配置，-incoming 无法在更改后的硬件上回放
+        if (VmState.Load(pkg).SuspendedStatePath is not null)
+            throw new GrassCoreException("虚拟机已挂起。请先恢复并正常关机后再修改设置。");
 
         VmConfiguration config;
         try
@@ -484,6 +672,8 @@ public sealed class GrassCoreService
         var pkg = new GrassVmPackage(packagePath);
         if (_running.ContainsKey(pkg.Path))
             throw new GrassCoreException("虚拟机正在运行，关机后才能修改硬盘容量。");
+        if (VmState.Load(pkg).SuspendedStatePath is not null)
+            throw new GrassCoreException("虚拟机已挂起。请先恢复并正常关机后再修改硬盘容量。");
         var config = new ConfigStore(pkg).Load();
         var disk = config.Devices.OfType<DiskDevice>().SingleOrDefault(d => d.DeviceId == deviceId)
                    ?? throw new GrassCoreException("找不到这块硬盘。");

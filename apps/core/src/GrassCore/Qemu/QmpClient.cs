@@ -55,6 +55,9 @@ public sealed class QmpClient : IDisposable
     private readonly StreamReader _reader;
     private readonly StreamWriter _writer;
     private readonly Dictionary<string, Action<JsonElement>> _eventHandlers = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, TaskCompletionSource<JsonDocument>> _pending = new();
+    private Task? _readLoop;
+    private volatile bool _disposed;
     private int _nextId = 1;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
 
@@ -73,6 +76,8 @@ public sealed class QmpClient : IDisposable
         var greeting = await ReadMessageAsync(ct).ConfigureAwait(false);
         if (!greeting.RootElement.TryGetProperty("QMP", out _))
             throw new QmpException("对端不是 QMP 服务（缺少 greeting）。");
+        // 读循环从这里接管接收侧（greeting 之后的全部消息）
+        _readLoop = Task.Run(ReadLoopAsync);
         var resp = await ExecuteRawAsync(new { execute = "qmp_capabilities" }, ct).ConfigureAwait(false);
         if (resp.RootElement.TryGetProperty("error", out _))
             throw new QmpException("qmp_capabilities 被拒绝。");
@@ -95,26 +100,56 @@ public sealed class QmpClient : IDisposable
 
     private async Task<JsonDocument> ExecuteRawAsync(object payload, CancellationToken ct)
     {
+        int id;
+        var tcs = new TaskCompletionSource<JsonDocument>(TaskCreationOptions.RunContinuationsAsynchronously);
         await _sendLock.WaitAsync(ct).ConfigureAwait(false);
         try
         {
-            var id = _nextId++;
+            id = _nextId++;
+            _pending[id] = tcs;
             var json = JsonSerializer.Serialize(payload);
             // 注入 id（QMP 需要；事件没有 id）
             json = json.Insert(json.Length - 1, $",\"id\":{id}");
             await _writer.WriteLineAsync(json).ConfigureAwait(false);
-            while (true)
-            {
-                ct.ThrowIfCancellationRequested();
-                var msg = await ReadMessageAsync(ct).ConfigureAwait(false);
-                if (msg.RootElement.TryGetProperty("id", out var msgId) && msgId.GetInt32() == id)
-                    return msg;
-                DispatchEvent(msg);
-            }
         }
         finally
         {
             _sendLock.Release();
+        }
+        // 响应由常驻读循环匹配 id 后完成；ct 取消时清理 pending
+        using var reg = ct.Register(() => _pending.TryRemove(id, out _));
+        return await tcs.Task.ConfigureAwait(false);
+    }
+
+    /// <summary>常驻读循环：带 id 的响应完成对应命令；事件即时派发（无需命令在途）。</summary>
+    private async Task ReadLoopAsync()
+    {
+        while (!_disposed)
+        {
+            try
+            {
+                var msg = await ReadMessageAsync(CancellationToken.None).ConfigureAwait(false);
+                using (msg)
+                {
+                    if (msg.RootElement.TryGetProperty("id", out var msgId) &&
+                        _pending.TryRemove(msgId.GetInt32(), out var tcs))
+                    {
+                        // 文档所有权转移给等待方（重解析一份，原始文档在本作用域释放）
+                        tcs.TrySetResult(JsonDocument.Parse(msg.RootElement.GetRawText()));
+                    }
+                    else
+                    {
+                        DispatchEvent(msg);
+                    }
+                }
+            }
+            catch
+            {
+                // 连接关闭/损坏：让所有在途命令失败并停止循环
+                foreach (var kv in _pending) kv.Value.TrySetException(new QmpException("QMP 连接已关闭。"));
+                _pending.Clear();
+                return;
+            }
         }
     }
 
@@ -137,6 +172,7 @@ public sealed class QmpClient : IDisposable
 
     public void Dispose()
     {
+        _disposed = true;
         _writer.Dispose();
         _reader.Dispose();
         _transport.Dispose();
@@ -172,18 +208,32 @@ public static class QmpOps
     public static Task<JsonElement> MigrateToFileAsync(this QmpClient qmp, string stateFilePath, CancellationToken ct = default) =>
         qmp.ExecuteAsync("migrate", new { uri = $"file:{stateFilePath}" }, ct);
 
-    /// <summary>热插拔换盘：CD/DVD 运行中更换/取出镜像。</summary>
-    public static Task<JsonElement> ChangeMediumAsync(this QmpClient qmp, string deviceId, string? isoPath, CancellationToken ct = default) =>
+    /// <summary>热插拔换盘：CD/DVD 运行中更换镜像（blockdev-change-medium：filename + read-only-mode）。</summary>
+    public static Task<JsonElement> InsertMediumAsync(this QmpClient qmp, string deviceId, string isoPath, CancellationToken ct = default) =>
         qmp.ExecuteAsync("blockdev-change-medium",
-            isoPath is null
-                ? new Dictionary<string, object?> { ["device"] = deviceId }
-                : new Dictionary<string, object?> { ["device"] = deviceId, ["target"] = isoPath, ["format"] = "raw", ["read-only"] = true },
-            ct);
+            new Dictionary<string, object?>
+            {
+                ["device"] = deviceId,
+                ["filename"] = isoPath,
+                ["format"] = "raw",
+                ["read-only-mode"] = "read-only",
+            }, ct);
 
-    /// <summary>查询迁移状态（挂起第二步完成判定）。</summary>
-    public static async Task<bool> MigrationFinishedAsync(this QmpClient qmp, CancellationToken ct = default)
+    /// <summary>热插拔取出介质（eject 命令；等价于"空光驱"）。</summary>
+    public static Task<JsonElement> EjectMediumAsync(this QmpClient qmp, string deviceId, CancellationToken ct = default) =>
+        qmp.ExecuteAsync("eject", new Dictionary<string, object?> { ["device"] = deviceId }, ct);
+
+    /// <summary>查询迁移状态（active/completed/failed/cancelled…）。</summary>
+    public static async Task<string> MigrationStatusAsync(this QmpClient qmp, CancellationToken ct = default)
     {
         var ret = await qmp.ExecuteAsync("query-migrate", null, ct);
-        return ret.GetProperty("status").GetString() is "completed";
+        return ret.TryGetProperty("status", out var s) ? s.GetString() ?? "unknown" : "unknown";
+    }
+
+    /// <summary>查询虚拟机运行状态（running/paused/…；-incoming 恢复完成的判定）。</summary>
+    public static async Task<string> VmStatusAsync(this QmpClient qmp, CancellationToken ct = default)
+    {
+        var ret = await qmp.ExecuteAsync("query-status", null, ct);
+        return ret.TryGetProperty("status", out var s) ? s.GetString() ?? "unknown" : "unknown";
     }
 }

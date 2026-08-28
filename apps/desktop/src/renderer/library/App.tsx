@@ -13,11 +13,11 @@ import {
   vmSubtitle,
 } from './vm-state';
 import { CreateWizard } from './CreateWizard';
-import { VmSettings } from './VmSettings';
+import { ForceOffConfirm, VmSettings } from './VmSettings';
 
 interface GrassApi {
   coreCall<T = unknown>(method: string, params?: unknown): Promise<T>;
-  openDisplay(vmName: string, spicePort: number): Promise<boolean>;
+  openDisplay(vmName: string, spicePort: number, packagePath: string): Promise<boolean>;
   pickOpenFile(filterName: string, extensions: string[]): Promise<string | null>;
   pickSaveFile(defaultName: string, filterName: string, extensions: string[]): Promise<string | null>;
 }
@@ -29,6 +29,7 @@ export function App(): React.ReactElement {
   const [profiles, setProfiles] = useState<OsProfileDto[]>([]);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [settingsVm, setSettingsVm] = useState<VmSummary | null>(null);
+  const [forceOffVm, setForceOffVm] = useState<VmSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -56,43 +57,63 @@ export function App(): React.ReactElement {
     return () => clearInterval(t);
   }, [refresh]);
 
+  const fail = useCallback((e: unknown) => {
+    setError(e instanceof Error ? e.message : String(e));
+  }, []);
+
   const onStart = useCallback(
     async (vm: VmSummary) => {
       if (!api) return;
-      await api.coreCall('startVm', { packagePath: vm.path });
+      try {
+        await api.coreCall('startVm', { packagePath: vm.path });
+      } catch (e) {
+        fail(e);
+        return;
+      }
       await refresh();
     },
-    [refresh],
+    [refresh, fail],
   );
 
   // 挂起恢复：必须走 resumeVm（startVm 会拒绝已挂起的 VM——保存的状态只能用 -incoming 回到）
   const onResume = useCallback(
     async (vm: VmSummary) => {
       if (!api) return;
-      await api.coreCall('resumeVm', { packagePath: vm.path });
+      try {
+        await api.coreCall('resumeVm', { packagePath: vm.path });
+      } catch (e) {
+        fail(e);
+        return;
+      }
       await refresh();
     },
-    [refresh],
+    [refresh, fail],
   );
 
   const onPower = useCallback(
     async (vm: VmSummary, action: 'shutdown' | 'suspend' | 'forceOff') => {
       if (!api) return;
-      await api.coreCall('powerAction', { packagePath: vm.path, action });
+      try {
+        await api.coreCall('powerAction', { packagePath: vm.path, action });
+      } catch (e) {
+        fail(e);
+        return;
+      }
       await refresh();
     },
-    [refresh],
+    [refresh, fail],
   );
 
   const onOpenDisplay = useCallback(async (vm: VmSummary) => {
     if (!api) return;
-    // SPICE 端口由 Core 经 QMP query-spice 提供；这里走显示器打开协议
-    await api.openDisplay(vm.name, 0);
-  }, []);
-
-  const fail = useCallback((e: unknown) => {
-    setError(e instanceof Error ? e.message : String(e));
-  }, []);
+    try {
+      // -spice port=0 自动分配：真实端口由 Core 经 QMP query-spice 查询
+      const info = await api.coreCall<{ spicePort: number }>('getDisplayInfo', { packagePath: vm.path });
+      await api.openDisplay(vm.name, info.spicePort, vm.path);
+    } catch (e) {
+      fail(e);
+    }
+  }, [fail]);
 
   // 完整克隆：独立副本（无快照历史、无本机痕迹）
   const onFullClone = useCallback(
@@ -172,6 +193,7 @@ export function App(): React.ReactElement {
           onStart={onStart}
           onResume={onResume}
           onPower={onPower}
+          onRequestForceOff={setForceOffVm}
           onOpenDisplay={onOpenDisplay}
           onSettings={setSettingsVm}
           onFullClone={onFullClone}
@@ -228,6 +250,17 @@ export function App(): React.ReactElement {
         />
       )}
       {settingsVm && <VmSettings vm={settingsVm} onClose={() => setSettingsVm(null)} />}
+      {forceOffVm && (
+        <ForceOffConfirm
+          vmName={forceOffVm.name}
+          onCancel={() => setForceOffVm(null)}
+          onConfirm={() => {
+            const vm = forceOffVm;
+            setForceOffVm(null);
+            void onPower(vm, 'forceOff');
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -237,6 +270,7 @@ function VmCard(props: {
   onStart(vm: VmSummary): void;
   onResume(vm: VmSummary): void;
   onPower(vm: VmSummary, action: 'shutdown' | 'suspend' | 'forceOff'): void;
+  onRequestForceOff(vm: VmSummary): void;
   onOpenDisplay(vm: VmSummary): void;
   onSettings(vm: VmSummary): void;
   onFullClone(vm: VmSummary): void;
@@ -278,7 +312,9 @@ function VmCard(props: {
                 <button
                   key={item}
                   className={item === 'forceOff' ? 'menu-item-danger' : 'menu-item'}
-                  onClick={() => props.onPower(vm, item)}
+                  onClick={() =>
+                    item === 'forceOff' ? props.onRequestForceOff(vm) : props.onPower(vm, item)
+                  }
                 >
                   {item === 'shutdown' ? '关机' : item === 'suspend' ? '挂起' : '强制关机…'}
                 </button>
@@ -289,10 +325,20 @@ function VmCard(props: {
         <details className="power-menu">
           <summary>更多</summary>
           <div className="power-menu-items">
-            <button className="menu-item" disabled={busy} onClick={() => props.onFullClone(vm)}>
+            <button
+              className="menu-item"
+              disabled={busy || vm.state === 'suspended'}
+              title={vm.state === 'suspended' ? '已挂起的虚拟机需要先恢复并正常关机' : undefined}
+              onClick={() => props.onFullClone(vm)}
+            >
               克隆副本
             </button>
-            <button className="menu-item" disabled={busy} onClick={() => props.onExportZip(vm)}>
+            <button
+              className="menu-item"
+              disabled={busy || vm.state === 'suspended'}
+              title={vm.state === 'suspended' ? '已挂起的虚拟机需要先恢复并正常关机' : undefined}
+              onClick={() => props.onExportZip(vm)}
+            >
               导出档案…
             </button>
           </div>

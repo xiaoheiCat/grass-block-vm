@@ -119,7 +119,10 @@ public sealed class TransactionalDiskOps
     {
         // 取消 = Kill qemu-img（整棵进程树），等待退出后只清理临时产物，原文件不动
         using var reg = ct.Register(() => op.Cancel());
-        await op.Process!.WaitForExitAsync(CancellationToken.None);
+        // stderr 并行排水：等待退出期间子进程的输出不会塞满管道造成死锁
+        var errTask = op.Process!.StandardError.ReadToEndAsync(CancellationToken.None);
+        await op.Process.WaitForExitAsync(CancellationToken.None);
+        var err = (await errTask).Trim();
         if (ct.IsCancellationRequested)
         {
             CleanupTemp(op);
@@ -127,9 +130,8 @@ public sealed class TransactionalDiskOps
         }
         if (op.Process.ExitCode != 0)
         {
-            var err = await op.Process.StandardError.ReadToEndAsync(CancellationToken.None);
             CleanupTemp(op);
-            throw new QemuImgException($"qemu-img 失败（退出码 {op.Process.ExitCode}）：{err.Trim()}");
+            throw new QemuImgException($"qemu-img 失败（退出码 {op.Process.ExitCode}）：{err}");
         }
     }
 
@@ -138,15 +140,15 @@ public sealed class TransactionalDiskOps
         // 校验：产物头部魔数必须与目标格式一致。完整打开校验交给 QEMU 启动时的独占打开。
         var header = new byte[20];
         using var fs = File.OpenRead(path);
-        _ = fs.Read(header, 0, header.Length);
+        var read = fs.Read(header, 0, header.Length);
         var ok = format.ToLowerInvariant() switch
         {
-            "qcow2" or "qcow" => header[0] == 'Q' && header[1] == 'F' && header[2] == 'I' && header[3] == 0xfb,
+            "qcow2" or "qcow" => read >= 4 && header[0] == 'Q' && header[1] == 'F' && header[2] == 'I' && header[3] == 0xfb,
             // VMDK：稀疏头魔数 "KDMV"，或文本描述文件开头 "# Disk DescriptorFile"
-            "vmdk" => (header[0] == 'K' && header[1] == 'D' && header[2] == 'M' && header[3] == 'V')
-                      || Encoding.UTF8.GetString(header).StartsWith("# Disk Des", StringComparison.Ordinal),
-            // RAW 等无魔数格式：非空即视为已生成（qemu-img 退出码 0 已由 WaitForAsync 校验）
-            _ => header.Length > 0,
+            "vmdk" => read >= 4 && ((header[0] == 'K' && header[1] == 'D' && header[2] == 'M' && header[3] == 'V')
+                      || Encoding.UTF8.GetString(header, 0, read).StartsWith("# Disk Des", StringComparison.Ordinal)),
+            // RAW 等无魔数格式：至少有真实数据（读满 4 字节；空文件视为失败产物）
+            _ => read >= 4,
         };
         if (!ok)
             throw new QemuImgException($"校验失败：产物不是有效的 {format} 文件，已丢弃临时文件。");

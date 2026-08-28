@@ -53,6 +53,10 @@ public static class Program
                 Console.Error.WriteLine($"[grasscore] 重新接管运行中的虚拟机：{r.Package.Name} (pid {r.Session.QemuPid})");
         }
 
+        // Core 重启（或 UI 先于 Core 启动后 Core 崩溃重启）：先无损重接管运行中的 VM
+        try { service.AdoptRunningVms(); }
+        catch { /* 接管失败不阻塞服务启动；预检/手动解锁兜底 */ }
+
         await Transport.RunServerAsync(conn => HandleConnectionAsync(conn, service));
         return 0;
     }
@@ -88,6 +92,9 @@ public static class Program
         "ping" => new { pong = true, version = "0.1.0" },
         "scanLibrary" => s.ScanLibrary(),
         "getProfiles" => s.GetProfiles(),
+        "adoptRunningVms" => s.AdoptRunningVms(),
+        "getDisplayInfo" => s.GetDisplayInfo(p.GetProperty("packagePath").GetString()!),
+        "getHostInfo" => s.GetHostInfo(),
         "createVm" => s.CreateVm(p),
         "startVm" => s.StartVm(p.GetProperty("packagePath").GetString()!),
         "resumeVm" => s.ResumeVm(p.GetProperty("packagePath").GetString()!),

@@ -1,4 +1,7 @@
+using GrassCore.Config;
 using GrassCore.GrassVm;
+using GrassCore.Profiles;
+using GrassCore.Rpc;
 using GrassCore.Snapshots;
 using Xunit;
 
@@ -193,5 +196,25 @@ public class SnapshotServiceTests : IDisposable
         GrassCore.Rpc.SnapshotService.Restore(pkg, snap.Uuid);
         var restored = new GrassCore.Config.ConfigStore(pkg).Load();
         Assert.Equal(4, restored.CpuCores);
+    }
+
+    [Fact]
+    public void Create_AfterRestore_ParentsToRestoredPosition_NotLatestLeaf()
+    {
+        var pkg = GrassVmPackage.CreateNew(_dir, "位置机");
+        var config = OsProfileLibrary.CreateDefaultConfig("ubuntu", "位置机");
+        var s1 = SnapshotService.Create(pkg, config, "s1");
+        SnapshotService.Create(pkg, config, "s2");
+        SnapshotService.Create(pkg, config, "s3");
+
+        // 恢复到 s1 后继续工作 → 新快照必须是 s1 的孩子（不是"最新叶 s3"）
+        SnapshotService.Restore(pkg, s1.Uuid);
+        var s4 = SnapshotService.Create(pkg, config, "恢复后的工作");
+
+        var tree = SnapshotService.LoadTree(pkg);
+        Assert.Equal(s1.Uuid, tree.Get(s4.Uuid).ParentSnapshotUuid);
+        // 删除当前快照后位置回到其父
+        SnapshotService.Delete(pkg, s4.Uuid);
+        Assert.Equal(s1.Uuid, Config.VmState.Load(pkg).CurrentSnapshotUuid);
     }
 }

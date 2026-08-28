@@ -31,9 +31,13 @@ public static class SnapshotService
             UpgradeProtectionCreatedAt = isUpgradeProtection ? DateTimeOffset.UtcNow : null,
         };
         var tree = LoadTree(package);
-        var leaf = tree.All.Where(s => !tree.ChildrenOf(s.Uuid).Any())
-            .OrderByDescending(s => s.CreatedAt).FirstOrDefault();
-        snap.ParentSnapshotUuid = leaf?.Uuid;
+        var state = VmState.Load(package);
+        // 父 = 当前工作位置（恢复之后的位置）；没有位置记录时退回树上最新叶
+        var parent = state.CurrentSnapshotUuid is not null && tree.All.Any(s => s.Uuid == state.CurrentSnapshotUuid)
+            ? tree.Get(state.CurrentSnapshotUuid)
+            : tree.All.Where(s => !tree.ChildrenOf(s.Uuid).Any())
+                .OrderByDescending(s => s.CreatedAt).FirstOrDefault();
+        snap.ParentSnapshotUuid = parent?.Uuid;
 
         // 每个"包内"磁盘设备生成 overlay 引用（包外磁盘不参与数据回滚）
         foreach (var disk in config.DevicesOfType<DiskDevice>().Where(d => !d.IsExternal))
@@ -44,6 +48,9 @@ public static class SnapshotService
             // 这里登记引用，Windows 实机联调阶段与 QMP stop/commit 序列对齐。
         }
         WriteSnapshot(package, snap);
+        // 新快照成为当前工作位置
+        state.CurrentSnapshotUuid = snap.Uuid;
+        state.Save(package);
         return snap;
     }
 
@@ -52,8 +59,9 @@ public static class SnapshotService
         var dir = System.IO.Path.Combine(package.SnapshotsPath, snap.Uuid);
         Directory.CreateDirectory(dir);
         Directory.CreateDirectory(System.IO.Path.Combine(dir, "disks"));
-        File.WriteAllText(System.IO.Path.Combine(dir, "metadata.json"), JsonSerializer.Serialize(snap, Opts));
-        File.WriteAllText(System.IO.Path.Combine(dir, "config.json"), snap.FullConfigSnapshot);
+        // 原子写（torn write 会让快照从树上静默消失，孩子指向悬空父）
+        AtomicFile.WriteJsonValidated(System.IO.Path.Combine(dir, "metadata.json"), JsonSerializer.Serialize(snap, Opts));
+        AtomicFile.WriteJsonValidated(System.IO.Path.Combine(dir, "config.json"), snap.FullConfigSnapshot);
     }
 
     public static SnapshotTree LoadTree(GrassVmPackage package)
@@ -100,6 +108,10 @@ public static class SnapshotService
         var snap = tree.Get(uuid);
         var restored = ConfigJson.Deserialize(snap.FullConfigSnapshot);
         new ConfigStore(package).Save(restored);
+        // 恢复后工作位置 = 该快照（之后创建的快照是它的孩子）
+        var state = VmState.Load(package);
+        state.CurrentSnapshotUuid = uuid;
+        state.Save(package);
         // 磁盘 overlay 切换：当前工作 overlay 重定向到快照 overlay（qemu-img rebase / 事务重写），
         // 在 Windows 实机联调阶段与 qemu-img blockcommit 序列对齐。
     }
@@ -117,6 +129,14 @@ public static class SnapshotService
         }
         var dir = System.IO.Path.Combine(package.SnapshotsPath, uuid);
         if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
+        // 当前位置被删除 → 位置回到其父（保持"下一步快照挂哪"有确定答案）
+        var state = VmState.Load(package);
+        if (state.CurrentSnapshotUuid == uuid)
+        {
+            var deleted = tree.Get(uuid);
+            state.CurrentSnapshotUuid = deleted.ParentSnapshotUuid;
+            state.Save(package);
+        }
     }
 
     /// <summary>扫描 Library Root 找出以此包内快照为基线的链接克隆（子 VM 的 cloneInfo 引用）。</summary>

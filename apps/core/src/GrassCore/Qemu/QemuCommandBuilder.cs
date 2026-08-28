@@ -232,6 +232,9 @@ public sealed class QemuCommandBuilder
         args.AddRange(new[] { "-device", "qxl-vga" });
         // SPICE 只监听本机；端口自动分配（port=0），由 Core 经 QMP query-spice 获取后交给显示器窗口/桥
         args.AddRange(new[] { "-spice", "addr=127.0.0.1,port=0,disable-ticketing=on" });
+        // 不加 -display 时 QEMU 会打开自己编译的默认 UI（GTK/SDL）——用户绝不能看见 QEMU。
+        // SPICE 是唯一显示路径。
+        args.AddRange(new[] { "-display", "none" });
     }
 
     private static string DeriveMac(string deviceId)

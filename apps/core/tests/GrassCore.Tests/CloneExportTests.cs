@@ -272,7 +272,7 @@ public class CloneExportTests : IDisposable
         File.WriteAllBytes(diskFile, new byte[10 * 1024 * 1024]); // 10MB 物理
         var disks = new[] { new OvfImporter.DiskImport(diskFile, 80L * 1024 * 1024 * 1024, "disks/big.qcow2") };
         var estimate = OvfImporter.EstimateRequiredBytes(disks);
-        // 物理量 + 虚拟量取和（保守下限）
-        Assert.True(estimate >= 10 * 1024 * 1024);
+        // 物理量 + 虚拟量都要计入（只算物理量 = 空间不足时导入中途失败）
+        Assert.True(estimate >= 10 * 1024 * 1024 + 80L * 1024 * 1024 * 1024);
     }
 }

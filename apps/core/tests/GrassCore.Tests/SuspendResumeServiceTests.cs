@@ -55,6 +55,7 @@ public class SuspendResumeServiceTests : IDisposable
     public async Task Suspend_SavesStateAndFingerprint_ThenResumeUsesIncoming()
     {
         using var fakeQmp = new FakeQmpServer();
+        var migrateQueries = 0; // 闭包计数（真实时序：先 active 再 completed）
         fakeQmp.OnCommand = (cmd, doc) =>
         {
             // 真实 QEMU 的 migrate file: 会把完整状态写入目标文件；假服务模拟这一副作用
@@ -64,9 +65,14 @@ public class SuspendResumeServiceTests : IDisposable
                 if (uri?.StartsWith("file:") == true)
                     File.WriteAllBytes(uri["file:".Length..], "saved-state"u8);
             }
+            // 真实时序：migrate 命令返回时迁移才刚开始；第一次查询 active，之后 completed
             return Task.FromResult(cmd switch
             {
-                "query-migrate" => """{"return":{"status":"completed"}}""",
+                "query-migrate" => ++migrateQueries == 1
+                    ? """{"return":{"status":"active"}}"""
+                    : """{"return":{"status":"completed"}}""",
+                // -incoming 恢复完成的判定信号
+                "query-status" => """{"return":{"status":"running","running":true}}""",
                 _ => """{"return":{}}""",
             });
         };
@@ -127,7 +133,14 @@ public class SuspendResumeServiceTests : IDisposable
         Assert.True(i >= 0, "恢复命令必须带 -incoming");
         Assert.StartsWith("file:", resumeCmd.Args[i + 1]);
         Assert.Contains("suspend.state", resumeCmd.Args[i + 1]);
-        var after = Config.VmState.Load(pkg);
+        // 恢复确认在后台轮询（query-status=running）后清除标记并删除状态文件
+        var clearDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        Config.VmState after;
+        do
+        {
+            Thread.Sleep(100);
+            after = Config.VmState.Load(pkg);
+        } while (after.SuspendedStatePath is not null && DateTime.UtcNow < clearDeadline);
         Assert.Null(after.SuspendedStatePath);
         Assert.Null(after.SuspendFingerprint);
     }
@@ -231,7 +244,7 @@ public class SuspendResumeServiceTests : IDisposable
         var pkg = new GrassVm.GrassVmPackage(vmPath);
 
         // 超范围值被钳制到安全范围（消费级产品：宁钳制不拒绝）
-        var json = (string)service.GetConfig(vmPath)!;
+        var json = service.GetConfig(vmPath) is System.Text.Json.JsonElement el ? el.GetRawText() : null!;
         var node = System.Text.Json.Nodes.JsonNode.Parse(json)!.AsObject();
         node["cpuCores"] = 9999;
         node["memoryMiB"] = 16;

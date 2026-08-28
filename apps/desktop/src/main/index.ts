@@ -43,7 +43,7 @@ function createLibraryWindow(): void {
 }
 
 /** 显示器窗口：UI 崩溃窗口可消失，但 Guest 继续运行；重开 UI 后"打开显示器"重新接入。 */
-function createDisplayWindow(vmName: string, spicePort: number): BrowserWindow {
+function createDisplayWindow(vmName: string, spicePort: number, packagePath: string): BrowserWindow {
   const win = new BrowserWindow({
     width: 1024,
     height: 768,
@@ -59,7 +59,8 @@ function createDisplayWindow(vmName: string, spicePort: number): BrowserWindow {
   win.setMenuBarVisibility(false);
   // 显示器页面通过 URL query 拿到本机 SPICE 端口；实际画面由 spice-client 经 WS 桥接入
   win.loadFile(path.join(__dirname, '..', 'renderer', 'display', 'index.html'), {
-    query: { vm: vmName, port: String(spicePort) },
+    // 电源动作需要包路径（Core 按包路径寻址）；名称仅用于展示
+    query: { vm: vmName, port: String(spicePort), path: packagePath },
   });
   return win;
 }
@@ -75,6 +76,8 @@ function startSpiceBridge(spicePort: number): Promise<number> {
     const tcp = net.connect({ host: '127.0.0.1', port: spicePort });
     ws.on('message', (data: Buffer) => tcp.write(data));
     tcp.on('data', (chunk: Buffer) => ws.send(chunk));
+    // 连不上 SPICE 端口：断开 WS 让前端提示，而不是让主进程抛未处理错误
+    tcp.on('error', () => ws.close());
     const close = () => tcp.destroy();
     ws.on('close', close);
     tcp.on('close', () => ws.close());
@@ -92,9 +95,9 @@ ipcMain.handle('core:call', async (_e, method: string, params?: unknown) => {
   return b.call(method, params);
 });
 
-ipcMain.handle('display:open', async (_e, vmName: string, spicePort: number) => {
+ipcMain.handle('display:open', async (_e, vmName: string, spicePort: number, packagePath: string) => {
   await startSpiceBridge(spicePort);
-  createDisplayWindow(vmName, spicePort);
+  createDisplayWindow(vmName, spicePort, packagePath);
   return true;
 });
 

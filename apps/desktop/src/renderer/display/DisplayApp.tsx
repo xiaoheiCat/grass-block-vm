@@ -22,6 +22,7 @@ export function DisplayApp(): React.ReactElement {
   const [fullscreen, setFullscreen] = useState(false);
   const [helperConnected, setHelperConnected] = useState(false);
   const [closeDialog, setCloseDialog] = useState(false);
+  const [helperWarning, setHelperWarning] = useState<string | null>(null);
   const [media, setMedia] = useState<string | null>(null);
 
   useEffect(() => {
@@ -64,6 +65,7 @@ export function DisplayApp(): React.ReactElement {
           ✕
         </button>
       </footer>
+      {helperWarning && <div className="helper-hint">{helperWarning}</div>}
 
       {closeDialog && (
         <CloseDialog
@@ -72,7 +74,13 @@ export function DisplayApp(): React.ReactElement {
             setCloseDialog(false);
             if (choice === 'cancel') return;
             if (choice !== 'background' && api) {
-              await api.coreCall('powerAction', { packagePath: vmName, action: choice });
+              // 电源动作按包路径寻址（名称仅展示用）；失败要提示而不是静默挂掉窗口
+              try {
+                await api.coreCall('powerAction', { packagePath: query.path ?? vmName, action: choice });
+              } catch (e) {
+                setHelperWarning(e instanceof Error ? e.message : String(e));
+                return;
+              }
             }
             window.close();
           }}

@@ -24,6 +24,12 @@ public sealed class VmState
     public WindowState? LastDisplayWindow { get; set; }
 
     /// <summary>
+    /// 当前快照工作位置（恢复到某个快照后继续工作的位置）。新快照挂到它下面，
+    /// 而不是盲目挂到"最新叶子"——否则恢复 s1 后新建的快照会被记成 s3 的孩子，树会说谎。
+    /// </summary>
+    public string? CurrentSnapshotUuid { get; set; }
+
+    /// <summary>
     /// 挂起状态文件（包内）。存在即 VM 处于"已挂起"：直接 startVm 会被拒绝（必须 resume），
     /// 因为 QEMU 需要 -incoming 才能回到保存的瞬间。恢复完成或正常启动后清空。
     /// </summary>
