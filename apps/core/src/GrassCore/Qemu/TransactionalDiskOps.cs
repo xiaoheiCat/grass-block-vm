@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text;
 using GrassCore.GrassVm;
 
 namespace GrassCore.Qemu;
@@ -46,7 +47,7 @@ public sealed class TransactionalDiskOps
         DeleteIfExists(tmp);
         using var op = Run(["create", "-f", "qcow2", tmp, sizeBytes.ToString()], tmp);
         await WaitForAsync(op, ct);
-        VerifyQcow2(tmp);
+        VerifyImage(tmp, "qcow2");
         File.Move(tmp, targetPath, overwrite: false);
         op.Completed = true;
     }
@@ -61,20 +62,40 @@ public sealed class TransactionalDiskOps
         File.Copy(currentPath, tmp, overwrite: true);
         using var op = Run(["resize", tmp, newSizeBytes.ToString()], tmp);
         await WaitForAsync(op, ct);
-        VerifyQcow2(tmp);
+        VerifyImage(tmp, "qcow2");
         File.Move(tmp, currentPath, overwrite: true);
         op.Completed = true;
     }
 
     /// <summary>格式转换（导入 VMDK/RAW → QCOW2）。转换前调用方负责空间预估。</summary>
-    public async Task ConvertToQcow2Async(string sourcePath, string targetPath, CancellationToken ct = default)
+    public Task ConvertToQcow2Async(string sourcePath, string targetPath, CancellationToken ct = default) =>
+        ConvertAsync(sourcePath, targetPath, "qcow2", ct);
+
+    /// <summary>通用格式转换（导出 OVF 用 VMDK 流式格式等）。事务规则与 QCOW2 相同。</summary>
+    public async Task ConvertAsync(string sourcePath, string targetPath, string format, CancellationToken ct = default)
     {
         var tmp = targetPath + TempSuffix;
         DeleteIfExists(tmp);
-        using var op = Run(["convert", "-O", "qcow2", sourcePath, tmp], tmp);
+        using var op = Run(["convert", "-O", format, sourcePath, tmp], tmp);
         await WaitForAsync(op, ct);
-        VerifyQcow2(tmp);
+        VerifyImage(tmp, format);
         File.Move(tmp, targetPath, overwrite: false);
+        op.Completed = true;
+    }
+
+    /// <summary>
+    /// 创建指向 backing 文件的外部 overlay（链接克隆/快照链用）。
+    /// backing 使用绝对路径引用；失败的产物照旧走 .grass-tmp 清理。
+    /// </summary>
+    public void CreateOverlay(string backingFile, string overlayPath)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(overlayPath)!);
+        var tmp = overlayPath + TempSuffix;
+        DeleteIfExists(tmp);
+        using var op = Run(["create", "-f", "qcow2", "-b", backingFile, "-F", "qcow2", tmp], tmp);
+        WaitForAsync(op, CancellationToken.None).GetAwaiter().GetResult();
+        VerifyImage(tmp, "qcow2");
+        File.Move(tmp, overlayPath, overwrite: false);
         op.Completed = true;
     }
 
@@ -112,16 +133,23 @@ public sealed class TransactionalDiskOps
         }
     }
 
-    private static void VerifyQcow2(string path)
+    private static void VerifyImage(string path, string format)
     {
-        // 校验：产物必须带有 QCOW2 魔数（"QFI\xfb"）。完整打开校验交给 QEMU 启动时的独占打开。
-        var header = new byte[4];
-        using (var fs = File.OpenRead(path))
+        // 校验：产物头部魔数必须与目标格式一致。完整打开校验交给 QEMU 启动时的独占打开。
+        var header = new byte[20];
+        using var fs = File.OpenRead(path);
+        _ = fs.Read(header, 0, header.Length);
+        var ok = format.ToLowerInvariant() switch
         {
-            _ = fs.Read(header, 0, header.Length);
-        }
-        if (!(header[0] == 'Q' && header[1] == 'F' && header[2] == 'I' && header[3] == 0xfb))
-            throw new QemuImgException("校验失败：产物不是有效的 QCOW2 文件，已丢弃临时文件。");
+            "qcow2" or "qcow" => header[0] == 'Q' && header[1] == 'F' && header[2] == 'I' && header[3] == 0xfb,
+            // VMDK：稀疏头魔数 "KDMV"，或文本描述文件开头 "# Disk DescriptorFile"
+            "vmdk" => (header[0] == 'K' && header[1] == 'D' && header[2] == 'M' && header[3] == 'V')
+                      || Encoding.UTF8.GetString(header).StartsWith("# Disk Des", StringComparison.Ordinal),
+            // RAW 等无魔数格式：非空即视为已生成（qemu-img 退出码 0 已由 WaitForAsync 校验）
+            _ => header.Length > 0,
+        };
+        if (!ok)
+            throw new QemuImgException($"校验失败：产物不是有效的 {format} 文件，已丢弃临时文件。");
     }
 
     private static void CleanupTemp(Operation op)

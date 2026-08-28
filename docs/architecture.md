@@ -42,6 +42,8 @@ GrassCore.exe (C# / .NET, self-contained, 用户级进程, 按需启动)
 | WHPX/升级保护/脱敏 | `Qemu/WhpxCapability.cs` | 三层 WHPX 预检；QEMU major 升级保护快照；日志脱敏（§17/§22.9） |
 | 快照 | `Snapshots/SnapshotTree.cs` | 树、非叶删除重绑、链接克隆依赖、恢复警告、升级保护清理（§16） |
 | 快照落盘 | `Rpc/SnapshotService.cs` | snapshots/&lt;uuid&gt; 布局；完整 config 副本；包外磁盘不进链（§16） |
+| 克隆 | `Clone/CloneService.cs` | 完整克隆（独立副本/扁盘化/无快照历史）；链接克隆（必须基于快照/cloneInfo 同目录相对引用）（§16.5） |
+| 导入导出 | `ExportImport/GrassVmZip.cs`、`ExportImport/OvfImporter.cs`、`ExportImport/OvfExporter.cs` | 完整档案 zip（关机前置）；OVF/OVA 导入映射（Raw/阻止/仍然导入/空间预估）；OVF 导出当前状态（§15） |
 | 会话/接管 | `Rpc/RuntimeSession.cs` | runtime/session.json（包内）；Core 崩溃无损重接管（§6.3） |
 | 宿主库 | `Library/HostDb.cs` | SQLite：Library Root、自动启动（串行/10s/顺序）、Host-only 网络、索引缓存（§18/§19） |
 | API 表面 | `Rpc/GrassCoreService.cs`、`Rpc/JsonRpc.cs`、`Program.cs` | UI↔Core 全部写操作；Named Pipe（Win）/stdio（开发机） |
@@ -66,12 +68,12 @@ NSIS 骨架：一开始整体提权一次装齐（UI + Core + Helper + QEMU + TA
 | 阶段 | 状态 |
 | --- | --- |
 | P0 工程底座 | ✅ monorepo / 许可证 / CI / 测试基建 |
-| P1 GrassCore 核心域 | ✅ 配置迁移、原子写、vm.lock、路径规范（52 个单测覆盖） |
+| P1 GrassCore 核心域 | ✅ 配置迁移、原子写、vm.lock、路径规范（61 个单测覆盖） |
 | P2 磁盘/QEMU 命令 | ✅ qemu-img 事务、Profile→命令构建、启动预检（Windows 实机验证待做） |
 | P3 UI | ◐ Library/向导/设置/显示器骨架就绪；与 Core 真实数据流待 Windows 实机联调 |
-| P4 快照/克隆 | ◐ 树模型/落盘/删除重绑/恢复回滚已实现；QMP 在线快照与 overlay 重写在实机阶段落地 |
+| P4 快照/克隆 | ✅ 树模型/落盘/删除重绑/链接克隆依赖/恢复回滚/完整克隆/升级保护快照；QMP 在线快照与 overlay 重写在实机阶段落地 |
 | P5 网络 | ◐ 宿主级网络资源模型 + TAP 命令生成；驱动安装/实测在 Windows 阶段 |
-| P6 导入导出 | ☐ OVA/OVF/.grassvm.zip 流程（计划 §15.3 已定，待实现） |
+| P6 导入导出 | ✅ .grassvm.zip 完整档案（关机前置/痕迹排除/zip-slip 防护）、OVF/OVA 导入（Raw 设备/阻止与仍然导入/空间预估）、OVF/OVA 导出（当前状态/VMDK 转换）；OVA 打包实测在 Windows 阶段 |
 | P7 打包发布 | ◐ NSIS 骨架；签名/驱动细节在 Windows 构建机完成 |
 | P8 抛光 | ☐ |
 

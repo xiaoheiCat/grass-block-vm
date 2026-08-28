@@ -53,8 +53,35 @@ public sealed class GrassCoreService
     public object ScanLibrary()
     {
         var root = _db.LibraryRoot ?? throw new InvalidOperationException("尚未设置虚拟机存档位置。");
+        var autostart = _db.GetAutostartList().ToDictionary(a => a.VmPath, a => a.Enabled, StringComparer.OrdinalIgnoreCase);
         var vms = GrassVmPackage.ScanLibraryRoot(root)
-            .Select(p => new { path = p.Path, name = p.Name, locked = File.Exists(p.LockPath) })
+            .Select(p =>
+            {
+                string osProfile = "other";
+                int cpu = 0, mem = 0;
+                var state = "stopped";
+                try
+                {
+                    var config = new ConfigStore(p).Load();
+                    osProfile = config.OsProfileId;
+                    cpu = config.CpuCores;
+                    mem = config.MemoryMiB;
+                }
+                catch { /* 无法读取的包照常列出（发现≠已验证），打开时再给完整诊断 */ }
+                if (_running.ContainsKey(p.Path)) state = "running";
+                else if (File.Exists(p.LockPath)) state = File.Exists(p.SessionPath) && VmState.Load(p).LastStartedAt is null ? "stopped" : "running";
+                return new
+                {
+                    path = p.Path,
+                    name = p.Name,
+                    osProfileId = osProfile,
+                    state,
+                    cpuCores = cpu,
+                    memoryMiB = mem,
+                    locked = File.Exists(p.LockPath),
+                    hasAutostart = autostart.GetValueOrDefault(p.Path, false),
+                };
+            })
             .ToList();
         return new { libraryRoot = root, vms };
     }
@@ -206,6 +233,112 @@ public sealed class GrassCoreService
         var pkg = new GrassVmPackage(packagePath);
         new VmLock(pkg).ForceUnlockByUser();
         return new { unlocked = true };
+    }
+
+    // ---------- 克隆 ----------
+
+    public object FullClone(string packagePath, string newName)
+    {
+        var pkg = new GrassVmPackage(packagePath);
+        var cloner = new Clone.CloneService(new Qemu.TransactionalDiskOps(_qemuImgPath));
+        var target = cloner.FullCloneAsync(pkg, newName).GetAwaiter().GetResult();
+        _db.UpsertIndex(new HostDb.VmIndexEntry(target.Path, target.Name, null, DateTimeOffset.UtcNow.ToString("o"), null));
+        return new { path = target.Path, name = target.Name };
+    }
+
+    public object LinkedClone(string packagePath, string snapshotUuid, string newName)
+    {
+        var pkg = new GrassVmPackage(packagePath);
+        var cloner = new Clone.CloneService(new Qemu.TransactionalDiskOps(_qemuImgPath));
+        var target = cloner.LinkedClone(pkg, snapshotUuid, newName);
+        _db.UpsertIndex(new HostDb.VmIndexEntry(target.Path, target.Name, null, DateTimeOffset.UtcNow.ToString("o"), null));
+        return new { path = target.Path, name = target.Name };
+    }
+
+    // ---------- 导入导出（导出前必须关机）----------
+
+    public object ExportZip(string packagePath, string zipPath)
+    {
+        var pkg = new GrassVmPackage(packagePath);
+        ExportImport.GrassVmZip.EnsureExportable(pkg, _running.ContainsKey(pkg.Path));
+        ExportImport.GrassVmZip.Export(pkg, zipPath);
+        return new { exported = zipPath };
+    }
+
+    public object ImportZip(string zipPath)
+    {
+        var root = _db.LibraryRoot ?? throw new GrassCoreException("尚未设置虚拟机存档位置。");
+        var pkg = ExportImport.GrassVmZip.Import(zipPath, root);
+        _db.UpsertIndex(new HostDb.VmIndexEntry(pkg.Path, pkg.Name, null, DateTimeOffset.UtcNow.ToString("o"), null));
+        return new { path = pkg.Path, name = pkg.Name };
+    }
+
+    /// <summary>OVA/OVF 导入分析：配置预览 + 磁盘清单 + 警告 + 完全无法支持的设备 + 空间预估。</summary>
+    public object PlanImportOvf(string ovfOrOvaPath)
+    {
+        var tempRoot = Path.Combine(Path.GetTempPath(), "grassvm-import-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            string ovfPath;
+            if (ovfOrOvaPath.EndsWith(".ova", StringComparison.OrdinalIgnoreCase))
+            {
+                var dir = Path.Combine(tempRoot, "ova");
+                ovfPath = ExportImport.OvfImporter.ExtractOva(ovfOrOvaPath, dir);
+            }
+            else
+            {
+                ovfPath = ovfOrOvaPath;
+            }
+            var importer = new ExportImport.OvfImporter(new Qemu.TransactionalDiskOps(_qemuImgPath));
+            var plan = importer.PlanFromOvf(System.Xml.Linq.XDocument.Load(ovfPath), Path.GetDirectoryName(Path.GetFullPath(ovfPath))!);
+            var required = ExportImport.OvfImporter.EstimateRequiredBytes(plan.Disks);
+            return new
+            {
+                vmName = plan.Config.Name,
+                cpu = plan.Config.CpuCores,
+                memoryMiB = plan.Config.MemoryMiB,
+                disks = plan.Disks.Select(d => new { source = Path.GetFileName(d.SourceFile), capacityGiB = d.VirtualSizeBytes / 1024 / 1024 / 1024 }),
+                warnings = plan.Warnings,
+                unsupported = plan.UnsupportedDevices,
+                blocksImport = plan.BlocksImport,
+                requiredGiB = Math.Max(1, required / 1024 / 1024 / 1024),
+            };
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    public object ExecuteImportOvf(string ovfOrOvaPath, string vmName, bool allowUnsupported)
+    {
+        var root = _db.LibraryRoot ?? throw new GrassCoreException("尚未设置虚拟机存档位置。");
+        var tempRoot = Path.Combine(Path.GetTempPath(), "grassvm-import-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            string ovfPath = ovfOrOvaPath.EndsWith(".ova", StringComparison.OrdinalIgnoreCase)
+                ? ExportImport.OvfImporter.ExtractOva(ovfOrOvaPath, Path.Combine(tempRoot, "ova"))
+                : ovfOrOvaPath;
+            var importer = new ExportImport.OvfImporter(new Qemu.TransactionalDiskOps(_qemuImgPath));
+            var plan = importer.PlanFromOvf(System.Xml.Linq.XDocument.Load(ovfPath), Path.GetDirectoryName(Path.GetFullPath(ovfPath))!);
+            var pkg = importer.ExecuteAsync(plan, root, vmName, allowUnsupported).GetAwaiter().GetResult();
+            _db.UpsertIndex(new HostDb.VmIndexEntry(pkg.Path, pkg.Name, null, DateTimeOffset.UtcNow.ToString("o"), null));
+            return new { path = pkg.Path, name = pkg.Name, warnings = plan.Warnings };
+        }
+        finally
+        {
+            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
+        }
+    }
+
+    /// <summary>OVF 目录导出（当前有效状态；OVA 打包由导出器完成）。</summary>
+    public object ExportOvf(string packagePath, string destDir)
+    {
+        var pkg = new GrassVmPackage(packagePath);
+        ExportImport.GrassVmZip.EnsureExportable(pkg, _running.ContainsKey(pkg.Path));
+        var exporter = new ExportImport.OvfExporter(new Qemu.TransactionalDiskOps(_qemuImgPath));
+        var ovfPath = exporter.ExportAsync(pkg, destDir).GetAwaiter().GetResult();
+        return new { ovf = ovfPath };
     }
 
     // ---------- 快照 ----------

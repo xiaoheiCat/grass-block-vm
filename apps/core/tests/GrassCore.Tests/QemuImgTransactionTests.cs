@@ -40,13 +40,16 @@ public class QemuImgTransactionTests : IDisposable
         var sh = Path.Combine(_dir, "qemu-img");
         File.WriteAllText(sh, """
             #!/bin/sh
-            # 假 qemu-img：崩溃模式退出 1；慢模式 sleep；否则把最后一个 .qcow2 路径写成 QCOW2 魔数文件
+            # 假 qemu-img：崩溃退出 1；慢模式 sleep；否则把最后一个镜像路径写成带格式魔数的文件
             case "$*" in
               *crash-mode*) exit 1 ;;
               *slow-mode*) sleep 30 ;;
             esac
-            target=$(printf '%s\n' "$@" | grep '\.qcow2' | tail -1)
-            printf 'QFI\373' > "$target"
+            target=$(printf '%s\n' "$@" | grep -E '\.(qcow2|vmdk)' | tail -1)
+            case "$target" in
+              *vmdk*) printf '# Disk DescriptorFile\nfake-vmdk' > "$target" ;;
+              *)      printf 'QFI\373' > "$target" ;;
+            esac
             printf '%s\n' "$*" >> "$target"   # 把参数写进产物，让不同命令产出的字节不同
             """);
         Process.Start("chmod", $"+x {sh}")!.WaitForExit();
