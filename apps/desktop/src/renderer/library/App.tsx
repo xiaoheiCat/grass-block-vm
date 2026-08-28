@@ -13,13 +13,14 @@ import {
   vmSubtitle,
 } from './vm-state';
 import { CreateWizard } from './CreateWizard';
-import { ForceOffConfirm, VmSettings } from './VmSettings';
+import { ForceOffConfirm, UnlockConfirm, VmSettings } from './VmSettings';
 
 interface GrassApi {
   coreCall<T = unknown>(method: string, params?: unknown): Promise<T>;
   openDisplay(vmName: string, spicePort: number, packagePath: string): Promise<boolean>;
   pickOpenFile(filterName: string, extensions: string[]): Promise<string | null>;
   pickSaveFile(defaultName: string, filterName: string, extensions: string[]): Promise<string | null>;
+  pickDirectory(): Promise<string | null>;
 }
 
 const api: GrassApi | undefined = (window as unknown as { grassvm?: GrassApi }).grassvm;
@@ -30,7 +31,18 @@ export function App(): React.ReactElement {
   const [wizardOpen, setWizardOpen] = useState(false);
   const [settingsVm, setSettingsVm] = useState<VmSummary | null>(null);
   const [forceOffVm, setForceOffVm] = useState<VmSummary | null>(null);
+  const [unlockVm, setUnlockVm] = useState<VmSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [needsSetup, setNeedsSetup] = useState(false);
+  const [libraryDir, setLibraryDir] = useState<string>(
+    // 默认存档位置：用户 Documents 下的 Grass Block VM（UI 层负责默认值，Core 不猜）
+    (() => {
+      const docs = (window as unknown as { process?: { env: Record<string, string> } }).process?.env;
+      const home = docs?.HOME ?? 'C:\\Users\\Public';
+      return `${home}${home.endsWith('/') || home.endsWith('\\') ? '' : '/'}Documents/Grass Block VM`;
+    })(),
+  );
+  const [savingSetup, setSavingSetup] = useState(false);
 
   const refresh = useCallback(async () => {
     if (!api) return;
@@ -38,10 +50,31 @@ export function App(): React.ReactElement {
       const lib = await api.coreCall<{ vms: VmSummary[] }>('scanLibrary');
       setVms(lib.vms);
       setError(null);
+      setNeedsSetup(false);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      if (msg.includes('尚未设置')) {
+        setNeedsSetup(true); // 首次运行：引导选择存档位置（不是错误横幅）
+        setError(null);
+      } else {
+        setError(msg);
+      }
     }
   }, []);
+
+  const confirmLibraryDir = useCallback(async () => {
+    if (!api || savingSetup) return;
+    setSavingSetup(true);
+    try {
+      await api.coreCall('setLibraryRoot', { libraryRoot: libraryDir });
+      setNeedsSetup(false);
+      await refresh();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSavingSetup(false);
+    }
+  }, [api, libraryDir, savingSetup, refresh]);
 
   useEffect(() => {
     (async () => {
@@ -194,6 +227,7 @@ export function App(): React.ReactElement {
           onResume={onResume}
           onPower={onPower}
           onRequestForceOff={setForceOffVm}
+          onUnlock={setUnlockVm}
           onOpenDisplay={onOpenDisplay}
           onSettings={setSettingsVm}
           onFullClone={onFullClone}
@@ -207,6 +241,49 @@ export function App(): React.ReactElement {
     return (
       <div className="empty-state">
         <p>此页面需要在 Grass Block VM 桌面应用中运行（未检测到 preload 桥）。</p>
+      </div>
+    );
+  }
+
+  if (needsSetup) {
+    return (
+      <div className="app-shell">
+        <header className="topbar">
+          <div className="brand">
+            <span className="brand-mark">🟩</span>
+            <h1>欢迎使用 Grass Block VM</h1>
+          </div>
+        </header>
+        <main className="setup-card">
+          <h2>选择虚拟机存档位置</h2>
+          <p className="hint">
+            你的虚拟机会以文件夹形式保存在这里（每台一个 .grassvm 文件夹）。建议放在本地磁盘；
+            不要放在网络盘或同步盘里（虚拟机磁盘不适合同步）。
+          </p>
+          <label className="file-row">
+            <span>存档位置</span>
+            <input
+              type="text"
+              value={libraryDir}
+              onChange={(e) => setLibraryDir(e.target.value)}
+            />
+            <button
+              className="btn-ghost"
+              onClick={async () => {
+                const picked = await api?.pickDirectory();
+                if (picked) setLibraryDir(picked);
+              }}
+            >
+              浏览…
+            </button>
+          </label>
+          <div className="setup-actions">
+            <button className="btn-primary" onClick={confirmLibraryDir} disabled={savingSetup}>
+              {savingSetup ? '正在初始化…' : '使用此位置'}
+            </button>
+          </div>
+          {error && <div className="banner-error">{error}</div>}
+        </main>
       </div>
     );
   }
@@ -261,6 +338,24 @@ export function App(): React.ReactElement {
           }}
         />
       )}
+      {unlockVm && (
+        <UnlockConfirm
+          vmName={unlockVm.name}
+          onCancel={() => setUnlockVm(null)}
+          onConfirm={() => {
+            const vm = unlockVm;
+            setUnlockVm(null);
+            if (!api) return;
+            // 解锁后立即刷新（卡片状态从"已锁定"恢复；失败也刷新让用户看到真实状态）
+            void api
+              .coreCall('unlockVm', { packagePath: vm.path })
+              .then(refresh, (e: unknown) => {
+                fail(e);
+                void refresh();
+              });
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -271,6 +366,7 @@ function VmCard(props: {
   onResume(vm: VmSummary): void;
   onPower(vm: VmSummary, action: 'shutdown' | 'suspend' | 'forceOff'): void;
   onRequestForceOff(vm: VmSummary): void;
+  onUnlock(vm: VmSummary): void;
   onOpenDisplay(vm: VmSummary): void;
   onSettings(vm: VmSummary): void;
   onFullClone(vm: VmSummary): void;
@@ -325,6 +421,16 @@ function VmCard(props: {
         <details className="power-menu">
           <summary>更多</summary>
           <div className="power-menu-items">
+            {vm.locked && (
+              <button
+                className="menu-item-danger"
+                disabled={busy}
+                title="只在确认它没有在其他实例或其他电脑上运行时才解除；运行中强制解锁会导致磁盘损坏"
+                onClick={() => props.onUnlock(vm)}
+              >
+                解除锁定…
+              </button>
+            )}
             <button
               className="menu-item"
               disabled={busy || vm.state === 'suspended'}

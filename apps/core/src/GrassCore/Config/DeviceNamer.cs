@@ -109,17 +109,20 @@ public sealed class VmDeviceJsonConverter : JsonConverter<VmDevice>
         writer.WriteEndObject();
     }
 
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<JsonSerializerOptions, JsonSerializerOptions> _cache = new();
+
     private static JsonSerializerOptions WithoutDeviceConverter(JsonSerializerOptions options)
     {
-        if (_cache.TryGetValue(options, out var cached)) return cached;
-        var clone = new JsonSerializerOptions(options);
-        for (var i = clone.Converters.Count - 1; i >= 0; i--)
+        // 并发 RPC 分发下多个线程会同时走到这里：普通 Dictionary 的并发写会损坏内部状态
+        // （InvalidOperationException: concurrent update）——用 GetOrAdd 原子化。
+        return _cache.GetOrAdd(options, static o =>
         {
-            if (clone.Converters[i] is VmDeviceJsonConverter) clone.Converters.RemoveAt(i);
-        }
-        _cache[options] = clone;
-        return clone;
+            var clone = new JsonSerializerOptions(o);
+            for (var i = clone.Converters.Count - 1; i >= 0; i--)
+            {
+                if (clone.Converters[i] is VmDeviceJsonConverter) clone.Converters.RemoveAt(i);
+            }
+            return clone;
+        });
     }
-
-    private static readonly Dictionary<JsonSerializerOptions, JsonSerializerOptions> _cache = new();
 }

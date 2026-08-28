@@ -71,14 +71,22 @@ public static class SnapshotService
         foreach (var disk in config.DevicesOfType<DiskDevice>().Where(d => !d.IsExternal))
         {
             var frozenRel = $"disks/disk-{disk.DeviceId}.qcow2";
-            snap.DiskOverlayRefs[disk.DeviceId] = frozenRel;
-            if (diskOps is not null)
+            if (diskOps is null)
+            {
+                // 元数据模式（调用方明确关闭物理层）：引用照登记，Restore/Delete 对缺失
+                // 冻结文件有各自的保守处理（只回滚配置 / 保留物理文件）
+                snap.DiskOverlayRefs[disk.DeviceId] = frozenRel;
+            }
+            else
             {
                 var frozenAbs = System.IO.Path.Combine(package.SnapshotsPath, snap.Uuid,
                     frozenRel.Replace('/', System.IO.Path.DirectorySeparatorChar));
                 var activeAbs = GrassCore.GrassVm.PathPolicy.Resolve(package, disk.Path);
+                // 引用登记条件：物理层开启且冻结真实发生，或物理层整体关闭（元数据模式）。
+                // 只有"开了物理层但文件缺失"不登记——那是悬空引用（树里挂着不存在的检查点）。
                 if (File.Exists(activeAbs))
                 {
+                    snap.DiskOverlayRefs[disk.DeviceId] = frozenRel;
                     Directory.CreateDirectory(System.IO.Path.GetDirectoryName(frozenAbs)!);
                     // 顺序（崩溃安全）：① 在工作路径旁生成暂存 overlay（backing=冻结点的相对引用，
                     // 与最终位置的相对路径一致；qemu-img create -b 不要求 backing 已存在）；
@@ -213,7 +221,8 @@ public static class SnapshotService
                 var frozenAbs = System.IO.Path.Combine(package.SnapshotsPath, uuid,
                     frozenRel.Replace('/', System.IO.Path.DirectorySeparatorChar));
                 if (!File.Exists(frozenAbs)) continue;
-                var parentFrozen = parentUuid is null ? null : FrozenPath(package, tree.Get(parentUuid), deviceId);
+                var parentFrozen = parentUuid is null ? null : FrozenPathOrNull(package, tree.Get(parentUuid), deviceId);
+                // 父没有这张盘（配置分歧/旧元数据）→ 按链根处理：保留物理文件，只动元数据
 
                 // 直接依赖者 = 孩子快照的冻结文件 + （位置在被删快照时的）工作 overlay
                 var dependents = new List<string>();
@@ -225,9 +234,13 @@ public static class SnapshotService
                 if (positionWasHere)
                 {
                     var config = new ConfigStore(package).Load();
-                    var active = GrassCore.GrassVm.PathPolicy.Resolve(package,
-                        config.Devices.OfType<DiskDevice>().First(d => d.DeviceId == deviceId).Path);
-                    if (File.Exists(active)) dependents.Add(active);
+                    var diskNow = config.Devices.OfType<DiskDevice>().FirstOrDefault(d => d.DeviceId == deviceId);
+                    if (diskNow is not null)
+                    {
+                        var active = GrassCore.GrassVm.PathPolicy.Resolve(package, diskNow.Path);
+                        if (File.Exists(active)) dependents.Add(active);
+                    }
+                    // 当前配置已没有该设备（增删盘后的分歧）：没有工作 overlay 需要 rebase
                 }
 
                 if (parentFrozen is not null && File.Exists(parentFrozen))
@@ -262,7 +275,11 @@ public static class SnapshotService
             if (keepPhysical)
             {
                 foreach (var f in Directory.EnumerateFiles(dir))
-                    if (!f.Contains("disks")) File.Delete(f);
+                {
+                    var rel = System.IO.Path.GetRelativePath(dir, f);
+                    if (rel != "disks" && !rel.StartsWith("disks" + System.IO.Path.DirectorySeparatorChar, StringComparison.Ordinal))
+                        File.Delete(f);
+                }
             }
             else
             {
@@ -277,10 +294,6 @@ public static class SnapshotService
             state.Save(package);
         }
     }
-
-    private static string FrozenPath(GrassVmPackage package, Snapshot snap, string deviceId) =>
-        FrozenPathOrNull(package, snap, deviceId)
-        ?? throw new GrassCoreException($"快照 {snap.Uuid} 缺少磁盘 {deviceId} 的冻结文件记录。");
 
     private static string? FrozenPathOrNull(GrassVmPackage package, Snapshot snap, string deviceId) =>
         snap.DiskOverlayRefs.TryGetValue(deviceId, out var rel)

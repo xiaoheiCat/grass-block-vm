@@ -87,7 +87,7 @@ public sealed class QemuCommandBuilder
         {
             // Secure Boot 用 OVMF.secboot 变体；NVRAM 变量卷为每 VM 独立文件（firmware/ 下，随包移动）
             var code = Config.Firmware.SecureBoot ? "OVMF_CODE.secboot.fd" : "OVMF_CODE.fd";
-            args.AddRange(new[] { "-drive", $"if=pflash,format=raw,readonly=on,file={Combine(_ovmfDir, code)}" });
+            args.AddRange(new[] { "-drive", $"if=pflash,format=raw,readonly=on,file={Esc(Combine(_ovmfDir, code))}" });
             var nvram = Combine(packageRoot, GrassVmPackage.FirmwareDir, "VARS.fd");
             args.AddRange(new[] { "-drive", $"if=pflash,format=raw,file={Esc(nvram)}" });
         }

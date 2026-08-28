@@ -30,9 +30,12 @@ export class WebSocketServer extends EventEmitter {
     server.on('upgrade', (req, socket, head) => this.handleUpgrade(req, socket as net.Socket, head));
   }
 
+  /** 每桥一个随机 token：upgrade 请求路径必须精确匹配（SPICE 禁票运行，本地浏览器里的任意页面不得直连） */
+  readonly token = crypto.randomUUID();
+
   private handleUpgrade(req: http.IncomingMessage, socket: net.Socket, head: Buffer): void {
     const key = req.headers['sec-websocket-key'];
-    if (!key) {
+    if (!key || (req.url ?? '') !== `/${this.token}`) {
       socket.destroy();
       return;
     }

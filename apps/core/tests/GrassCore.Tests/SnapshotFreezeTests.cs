@@ -92,6 +92,22 @@ public class SnapshotFreezeTests : IDisposable
         // 链根基座 s1 与孙辈 s3 的冻结文件都还在
         Assert.True(File.Exists(FrozenDisk(_pkg, s1)));
         Assert.True(File.Exists(FrozenDisk(_pkg, s3)));
+
+        // 链维护真发生了：commit(s2 冻结) + rebase(依赖者 → s1 冻结)都记录在案，
+        // 且 rebase 的目标文件此刻真实存在（backing 可解析 = 链没断）
+        var log = File.ReadAllText(_fakeImg + ".chain-ops.log");
+        Assert.Contains("commit", log);
+        Assert.Contains(s1.Uuid, log);
+        foreach (var line in log.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+            if (line.Contains("rebase") && line.Contains("-b "))
+            {
+                // backing 是相对引用（相对 overlay 自身目录）；按 overlay 位置解析后必须真实存在
+                var parts = line.Split(' ');
+                var overlay = parts[^1];
+                var backing = line.Split("-b ")[1].Split(' ')[0];
+                var resolved = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(overlay))!, backing));
+                Assert.True(File.Exists(resolved), $"rebase 指向不存在的 backing：{backing}");
+            }
     }
 
     [Fact]

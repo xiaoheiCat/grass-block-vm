@@ -58,7 +58,17 @@ public sealed class VmLock
         if (IsLocked)
             throw new VmLockedException($"此虚拟机已被占用（存在 vm.lock）。只有在确认它没有在其他 Grass Block VM 实例或其他电脑上运行时，才能解除锁定。");
         Directory.CreateDirectory(_package.Path);
-        File.WriteAllText(_package.LockPath, string.Empty);
+        // 排他创建（原子）：检查-再-写入在并发双击下会让两个调用都通过检查——
+        // 两个 QEMU 同写一张盘正是 vm.lock 要防的事故。CreateNew 在文件已存在时抛 IOException。
+        try
+        {
+            using var fs = new FileStream(_package.LockPath, FileMode.CreateNew, FileAccess.Write, FileShare.None);
+            fs.WriteByte(0);
+        }
+        catch (IOException) when (File.Exists(_package.LockPath))
+        {
+            throw new VmLockedException($"此虚拟机已被占用（存在 vm.lock）。只有在确认它没有在其他 Grass Block VM 实例或其他电脑上运行时，才能解除锁定。");
+        }
     }
 
     /// <summary>正常释放 VM 时删除 vm.lock。仅当锁确实存在且由本次会话持有时调用。</summary>

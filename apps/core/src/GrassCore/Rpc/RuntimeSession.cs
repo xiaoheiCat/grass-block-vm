@@ -21,6 +21,10 @@ public sealed class RuntimeSession
     /// <summary>创建挂起状态时的宿主环境指纹（挂起只保证相同宿主 CPU 环境 + 同一 QEMU major 下恢复）。</summary>
     public HostEnvironmentFingerprint? SuspendEnvironment { get; set; }
     public string? QemuMajorAtStart { get; set; }
+    /// <summary>创建会话的机器标识：重接管/收尾只处理【本机】的会话——
+    /// 库可能在 NAS/同步盘上被另一台电脑持有，别机的 PID 在本机必然"不存在"，
+    /// 按"死了"清 runtime/放锁会把别人正在运行的 VM 解锁（双开=盘损坏）。</summary>
+    public string? MachineId { get; set; }
 
     private static readonly JsonSerializerOptions Opts = new()
     {

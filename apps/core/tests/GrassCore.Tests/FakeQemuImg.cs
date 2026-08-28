@@ -18,7 +18,10 @@ public static class FakeQemuImg
             var ps1 = Path.Combine(dir, "fake-qemu-img.ps1");
             File.WriteAllText(ps1, """
                 param([Parameter(ValueFromRemainingArguments=$true)]$Rest)
-                if ($Rest[0] -in @('commit','rebase')) { exit 0 }
+                if ($Rest[0] -in @('commit','rebase')) {
+                    Add-Content -Path (Join-Path $PSScriptRoot 'chain-ops.log') -Value ($Rest -join ' ')
+                    exit 0
+                }
                 $target = $Rest | Where-Object { "$_" -match '\.(qcow2|vmdk)' } | Select-Object -Last 1
                 if ($target) {
                     if ("$target" -match '\.vmdk') {
@@ -38,7 +41,7 @@ public static class FakeQemuImg
         var sh = Path.Combine(dir, $"fake-qemu-img-{Guid.NewGuid():N}");
         File.WriteAllText(sh, """
             #!/bin/sh
-            case "$1" in commit|rebase) exit 0;; esac
+            case "$1" in commit|rebase) printf '%s\n' "$*" >> "$0.chain-ops.log"; exit 0;; esac
             target=$(printf '%s\n' "$@" | grep -E '\.(qcow2|vmdk)' | tail -1)
             case "$target" in
               *vmdk*) printf '# Disk DescriptorFile\nfake-vmdk' > "$target" ;;

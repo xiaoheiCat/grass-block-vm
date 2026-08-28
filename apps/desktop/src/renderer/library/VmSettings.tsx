@@ -329,3 +329,25 @@ function forceOffText(): string {
     '可能导致未保存的数据丢失、文件系统损坏，甚至造成不可逆的问题。仅在虚拟机无响应时使用。'
   );
 }
+
+export function UnlockConfirm(props: { vmName: string; onConfirm(): void; onCancel(): void }): React.ReactElement {
+  return (
+    <div className="modal-backdrop">
+      <div className="dialog">
+        <h2>解除“{props.vmName}”的锁定？</h2>
+        <p className="danger-text">
+          锁定表示这台虚拟机可能正在另一台电脑或另一个实例上运行。只有在确认它没有在运行时才解除，
+          否则两个系统同时写入同一块磁盘会导致数据损坏。如果不确定，请先到另一台机器上正常关机。
+        </p>
+        <div className="dialog-actions">
+          <button className="btn-ghost" autoFocus onClick={props.onCancel}>
+            取消
+          </button>
+          <button className="btn-danger" onClick={props.onConfirm}>
+            确认没有在运行，解除锁定
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}

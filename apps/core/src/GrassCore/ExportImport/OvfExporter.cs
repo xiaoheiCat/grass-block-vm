@@ -23,16 +23,25 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
 
         var diskFiles = new List<(string Href, long Size, long Capacity)>();
         var idx = 0;
+        var missing = new List<string>();
         foreach (var disk in config.Devices.OfType<DiskDevice>())
         {
             idx++;
             var src = PathPolicy.Resolve(package, disk.Path);
-            if (!File.Exists(src)) continue; // 外部丢失：导出当前有效状态时跳过并在 ovf 里不引用
+            if (!File.Exists(src))
+            {
+                missing.Add(disk.Path); // 静默少盘的档案导入后少一块数据盘——明确失败
+                continue;
+            }
             var href = $"{vmId}-disk{idx}.vmdk";
             var dst = Path.Combine(destDir, href);
             await diskOps.ConvertAsync(src, dst, "vmdk", ct);
             diskFiles.Add((href, new FileInfo(dst).Length, disk.SizeBytes > 0 ? disk.SizeBytes : new FileInfo(dst).Length));
         }
+
+        if (missing.Count > 0)
+            throw new GrassCoreException(
+                $"以下磁盘文件缺失，无法导出 OVF：{string.Join("、", missing)}。请先在设置中重新定位这些文件。");
 
         var ovf = BuildOvfXml(config, vmId, diskFiles);
         var ovfPath = Path.Combine(destDir, vmId + ".ovf");

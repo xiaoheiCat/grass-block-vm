@@ -94,6 +94,10 @@ public static class Transport
 {
     public const string DefaultPipeName = "grassvm-core";
 
+    /// <summary>当前活跃连接数（空闲退出判定用）。</summary>
+    public static int ActiveConnections => _activeConnections;
+    private static int _activeConnections;
+
     public static async Task RunServerAsync(Func<JsonRpcConnection, Task> handler, string? pipeName = null, CancellationToken ct = default)
     {
         if (OperatingSystem.IsWindows())
@@ -106,13 +110,20 @@ public static class Transport
                     PipeOptions.Asynchronous);
                 await server.WaitForConnectionAsync(ct);
                 var conn = new JsonRpcConnection(server);
-                _ = Task.Run(() => handler(conn), ct);
+                Interlocked.Increment(ref _activeConnections);
+                _ = Task.Run(async () =>
+                {
+                    try { await handler(conn); }
+                    finally { Interlocked.Decrement(ref _activeConnections); }
+                }, ct);
             }
         }
         else
         {
             var conn = new JsonRpcConnection(Console.OpenStandardInput() is { } i && Console.IsInputRedirected ? new DualStream(i, Console.OpenStandardOutput()) : new DualStream(Console.OpenStandardInput(), Console.OpenStandardOutput()));
-            await handler(conn);
+            Interlocked.Increment(ref _activeConnections);
+            try { await handler(conn); }
+            finally { Interlocked.Decrement(ref _activeConnections); }
         }
     }
 

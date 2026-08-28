@@ -120,3 +120,11 @@
 .tool:hover { background: #2a3322; }
 .tool.close:hover { background: #5c1f1f; }
 .vm-title { color: #9fb28c; font-size: 12px; margin-right: 4px; }
+
+/* 首次运行：存档位置引导 */
+.setup-card { max-width: 620px; margin: 64px auto; padding: 32px 36px; background: #fff;
+  border-radius: 14px; box-shadow: 0 8px 30px rgba(0, 0, 0, 0.08); }
+.setup-card h2 { margin: 0 0 8px; font-size: 20px; }
+.setup-card .hint { color: #5f6b7a; font-size: 13px; line-height: 1.6; margin: 0 0 20px; }
+.setup-card .setup-actions { margin-top: 20px; display: flex; justify-content: flex-end; }
+.setup-card .banner-error { margin-top: 16px; border-radius: 8px; }

@@ -25,6 +25,45 @@ public sealed class GrassCoreService
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, RunningVm> _running =
         new(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>是否有运行中的 VM（Core 空闲退出判定用）。</summary>
+    public bool HasRunningVms => !_running.IsEmpty;
+
+    /// <summary>本机标识（宿主级持久，首次生成）：会话归属判定，防别机会话被本机"收尾"。</summary>
+    private string MachineId
+    {
+        get
+        {
+            var id = _db.GetPreference("machineId");
+            if (id is null)
+            {
+                id = Guid.NewGuid().ToString("N");
+                _db.SetPreference("machineId", id);
+            }
+            return id;
+        }
+    }
+
+    /// <summary>每包一把信号量：生命周期操作（启动/恢复/挂起/电源）按包串行——并发 RPC 分发下双击 start 不会再赛跑。</summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> _pkgGates =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private T WithPackageGate<T>(string packagePath, Func<T> action)
+    {
+        var gate = _pkgGates.GetOrAdd(packagePath,
+            _ => new SemaphoreSlim(1, 1));
+        gate.Wait();
+        try { return action(); }
+        finally { gate.Release(); }
+    }
+
+    private void WithPackageGate(string packagePath, Action action)
+    {
+        var gate = _pkgGates.GetOrAdd(packagePath, _ => new SemaphoreSlim(1, 1));
+        gate.Wait();
+        try { action(); }
+        finally { gate.Release(); }
+    }
+
     public GrassCoreService(HostDb db, string qemuSystemPath, string qemuImgPath, string ovmfDir,
         string bundledQemuMajor, IQemuProcessLauncher? launcher = null,
         Func<string, IQmpTransport?>? qmpTransportFactory = null)
@@ -177,7 +216,9 @@ public sealed class GrassCoreService
 
     // ---------- 启动 / 电源 ----------
 
-    public object StartVm(string packagePath)
+    public object StartVm(string packagePath) => WithPackageGate(packagePath, () => StartVmCore(packagePath));
+
+    private object StartVmCore(string packagePath)
     {
         var pkg = new GrassVmPackage(packagePath);
         var config = new ConfigStore(pkg).LoadAndUpgrade();
@@ -233,6 +274,7 @@ public sealed class GrassCoreService
                 QmpPipe = cmd.QmpPipeName,
                 StartedAt = DateTimeOffset.UtcNow,
                 QemuMajorAtStart = _bundledQemuMajor,
+                MachineId = MachineId,
             };
             Directory.CreateDirectory(pkg.RuntimePath);
             AtomicFile.WriteJsonValidated(pkg.SessionPath, session.Serialize());
@@ -241,10 +283,14 @@ public sealed class GrassCoreService
             session.QemuPid = proc.Id;
             AtomicFile.WriteJsonValidated(pkg.SessionPath, session.Serialize());
 
-            state.LastQemuMajor = _bundledQemuMajor;
-            state.LastStartedAt = DateTimeOffset.UtcNow;
-            state.SuspendedStatePath = null;
-            state.Save(pkg);
+            // 注意：升级保护快照已在磁盘上推进了 CurrentSnapshotUuid——必须重读，
+            // 不能用过期实例覆盖（否则位置标记回退，后续自动删除会误判"位置不在这"，
+            // 跳过工作 overlay 的 rebase → 链断）。只 patch 本函数拥有的字段。
+            var fresh = VmState.Load(pkg);
+            fresh.LastQemuMajor = _bundledQemuMajor;
+            fresh.LastStartedAt = DateTimeOffset.UtcNow;
+            fresh.SuspendedStatePath = null;
+            fresh.Save(pkg);
 
             var vm = new RunningVm(pkg.Path, session, proc);
             vm.Qmp = TryConnectQmp(session.QmpPipe);
@@ -283,7 +329,9 @@ public sealed class GrassCoreService
     }
 
     /// <summary>挂起恢复：-incoming 从保存状态回到挂起瞬间。只保证相同宿主 CPU + 同一 QEMU major。</summary>
-    public object ResumeVm(string packagePath)
+    public object ResumeVm(string packagePath) => WithPackageGate(packagePath, () => ResumeVmCore(packagePath));
+
+    private object ResumeVmCore(string packagePath)
     {
         var pkg = new GrassVmPackage(packagePath);
         var config = new ConfigStore(pkg).LoadAndUpgrade();
@@ -332,6 +380,7 @@ public sealed class GrassCoreService
                 QmpPipe = cmd.QmpPipeName,
                 StartedAt = DateTimeOffset.UtcNow,
                 QemuMajorAtStart = _bundledQemuMajor,
+                MachineId = MachineId,
             };
             Directory.CreateDirectory(pkg.RuntimePath);
             AtomicFile.WriteJsonValidated(pkg.SessionPath, session.Serialize());
@@ -459,6 +508,10 @@ public sealed class GrassCoreService
             {
                 var pkg = result.Package;
                 var session = result.Session;
+                // 归属判定：别机的会话一概不动（库可能在 NAS/同步盘上；别机 PID 在本机
+                // 必然"不存在"，按死了处理会解锁别人正在运行的 VM）
+                if (session.MachineId is not null && session.MachineId != MachineId)
+                    continue;
                 if (!result.QemuAlive)
                 {
                     // QEMU 已不在（比如 Core 崩溃期间客户机内正常关机）：做干净收尾
@@ -558,7 +611,10 @@ public sealed class GrassCoreService
         return vm.Qmp ?? throw new GrassCoreException("QMP 控制通道不可用（QEMU 可能仍在启动），请稍后重试。");
     }
 
-    public object PowerAction(string packagePath, string action)
+    public object PowerAction(string packagePath, string action) =>
+        WithPackageGate(packagePath, () => PowerActionCore(packagePath, action));
+
+    private object PowerActionCore(string packagePath, string action)
     {
         switch (action)
         {
@@ -574,9 +630,10 @@ public sealed class GrassCoreService
             // 强制关机 = 电源菜单 + 二次确认后调用方才允许（不算正常关机）
             case "forceOff":
                 return QmpResult(RequireQmp(packagePath).ForceQuitAsync().GetAwaiter().GetResult());
-            // 挂起 = 保存完整运行状态后完全退出 QEMU（不是 pause；1.0 无"暂停"）
+            // 挂起 = 保存完整运行状态后完全退出 QEMU（不是 pause；1.0 无"暂停"）。
+            // 直接调内部实现：PowerAction 已持有该包的门，再进公共 SuspendVm 会同线程重入死锁。
             case "suspend":
-                return SuspendVm(packagePath);
+                return SuspendVmCore(packagePath);
             default:
                 throw new GrassCoreException($"未知电源动作：{action}");
         }
@@ -584,7 +641,10 @@ public sealed class GrassCoreService
 
     private static object QmpResult(System.Text.Json.JsonElement e) => new { sent = true, result = e.ToString() };
 
-    private object SuspendVm(string packagePath)
+    private object SuspendVm(string packagePath) =>
+        WithPackageGate(packagePath, () => SuspendVmCore(packagePath));
+
+    private object SuspendVmCore(string packagePath)
     {
         var pkg = new GrassVmPackage(packagePath);
         var qmp = RequireQmp(packagePath);
@@ -791,6 +851,8 @@ public sealed class GrassCoreService
     /// <summary>克隆/快照等重操作的关机状态守卫：运行/锁定/挂起都不允许（Core 是唯一守门人）。</summary>
     private void EnsureStoppedForMutation(GrassVmPackage pkg)
     {
+        // 换入中断修复（幂等）：残留暂存 overlay 不清掉，CreateOverlay 会因 overwrite:false 失败
+        SnapshotService.RepairStagedOverlays(pkg);
         if (_running.ContainsKey(pkg.Path))
             throw new GrassCoreException("虚拟机正在运行，关机后才能执行此操作。");
         if (File.Exists(pkg.LockPath))

@@ -57,6 +57,26 @@ public static class Program
         try { service.AdoptRunningVms(); }
         catch { /* 接管失败不阻塞服务启动；预检/手动解锁兜底 */ }
 
+        // 空闲自动退出：无连接 + 无运行中的 VM 持续 2 分钟 → 进程结束。
+        // （契约：最后一台 VM 结束且 UI 已退出时 Core 自动退出。UI 侧重开时按需重生 Core；
+        // 重生会重新执行上面的重接管——收尾失败残留的锁因此有机会被重扫。）
+        _ = Task.Run(async () =>
+        {
+            var idleSince = (DateTimeOffset?)null;
+            while (true)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(15));
+                if (Transport.ActiveConnections > 0 || service.HasRunningVms)
+                {
+                    idleSince = null;
+                    continue;
+                }
+                idleSince ??= DateTimeOffset.UtcNow;
+                if (DateTimeOffset.UtcNow - idleSince > TimeSpan.FromMinutes(2))
+                    Environment.Exit(0);
+            }
+        });
+
         await Transport.RunServerAsync(conn => HandleConnectionAsync(conn, service));
         return 0;
     }

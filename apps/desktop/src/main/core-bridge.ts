@@ -43,6 +43,8 @@ export class CoreBridge extends EventEmitter {
     } else {
       // 开发机：stdio 直连
       this.proc = spawn(this.coreExe, [], { stdio: ['pipe', 'pipe', 'inherit'] });
+      this.proc.on('error', () => this.teardownChannel(new Error('无法启动 GrassCore。')));
+      this.proc.on('exit', () => this.teardownChannel(new Error('GrassCore 已退出。')));
       this.wire(this.proc.stdin!, this.proc.stdout!);
       await this.call('ping');
     }
@@ -75,6 +77,21 @@ export class CoreBridge extends EventEmitter {
         this.onMessage(json);
       }
     });
+    // Core 死亡契约：在途请求立即失败（否则 spinner 转到天荒地老），通道拆除，
+    // 下次 call() 重新拉起 Core 并重接管运行中的 VM（QEMU 由 Core 重接管，不受影响）
+    const onDown = () => this.teardownChannel(new Error('GrassCore 已退出。正在尝试恢复…'));
+    readable.once('close', onDown);
+    readable.once('end', onDown);
+    readable.once('error', onDown);
+    (writable as NodeJS.WritableStream & { once?: unknown }).once?.('close', onDown);
+  }
+
+  /** 拆除通道：失败所有在途请求；下次 call 自动重生 Core。 */
+  private teardownChannel(reason: Error): void {
+    this.channel = null;
+    for (const [, p] of this.pending) p.reject(reason);
+    this.pending.clear();
+    this.emit('core-exit');
   }
 
   private channel: { writable: NodeJS.WritableStream; readable: NodeJS.ReadableStream } | null = null;
@@ -90,6 +107,15 @@ export class CoreBridge extends EventEmitter {
   }
 
   async call<T = unknown>(method: string, params?: unknown): Promise<T> {
+    // Core 崩溃后自动重生（对上层透明；重接管由 Core 启动时的 AdoptRunningVms 完成）
+    if (!this.channel) {
+      this.proc?.removeAllListeners?.('exit');
+      await this.ensureRunning().catch(() => {
+        throw new Error('GrassCore 未连接且无法重新启动。');
+      });
+      // 重生后触发重接管（Core 启动时也会自动执行；此处兜底连接到既有 Core 的场景）
+      if (this.channel) void this.call('adoptRunningVms').catch(() => undefined);
+    }
     if (!this.channel) throw new Error('GrassCore 未连接。');
     const id = this.nextId++;
     const frame = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id, method, params }), 'utf8');

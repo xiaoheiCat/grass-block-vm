@@ -21,4 +21,6 @@ contextBridge.exposeInMainWorld('grassvm', {
   /** 原生保存位置选择（导出档案） */
   pickSaveFile: (defaultName: string, filterName: string, extensions: string[]) =>
     ipcRenderer.invoke('dialog:pickSave', defaultName, filterName, extensions) as Promise<string | null>,
+  /** 原生目录选择（首次运行设置虚拟机存档位置） */
+  pickDirectory: () => ipcRenderer.invoke('dialog:pickDirectory') as Promise<string | null>,
 });

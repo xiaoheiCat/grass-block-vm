@@ -43,7 +43,7 @@ function createLibraryWindow(): void {
 }
 
 /** 显示器窗口：UI 崩溃窗口可消失，但 Guest 继续运行；重开 UI 后"打开显示器"重新接入。 */
-function createDisplayWindow(vmName: string, spicePort: number, packagePath: string): BrowserWindow {
+function createDisplayWindow(vmName: string, spicePort: number, packagePath: string, token: string): BrowserWindow {
   const win = new BrowserWindow({
     width: 1024,
     height: 768,
@@ -60,7 +60,7 @@ function createDisplayWindow(vmName: string, spicePort: number, packagePath: str
   // 显示器页面通过 URL query 拿到本机 SPICE 端口；实际画面由 spice-client 经 WS 桥接入
   win.loadFile(path.join(__dirname, '..', 'renderer', 'display', 'index.html'), {
     // 电源动作需要包路径（Core 按包路径寻址）；名称仅用于展示
-    query: { vm: vmName, port: String(spicePort), path: packagePath },
+    query: { vm: vmName, port: String(spicePort), path: packagePath, token },
   });
   return win;
 }
@@ -101,7 +101,7 @@ const displayBridges = new Map<number, { server: http.Server; wss: WebSocketServ
 
 ipcMain.handle('display:open', async (_e, vmName: string, spicePort: number, packagePath: string) => {
   const bridge = await startSpiceBridge(spicePort);
-  const win = createDisplayWindow(vmName, spicePort, packagePath);
+  const win = createDisplayWindow(vmName, spicePort, packagePath, bridge.wss.token);
   displayBridges.set(win.id, bridge);
   win.on('closed', () => {
     const b = displayBridges.get(win.id);
@@ -120,6 +120,10 @@ ipcMain.handle('dialog:pickOpen', async (_e, filterName: string, extensions: str
   return r.canceled ? null : r.filePaths[0];
 });
 
+ipcMain.handle('dialog:pickDirectory', async () => {
+  const r = await dialog.showOpenDialog({ properties: ['openDirectory', 'createDirectory'] });
+  return r.canceled ? null : r.filePaths[0];
+});
 ipcMain.handle('dialog:pickSave', async (_e, defaultName: string, filterName: string, extensions: string[]) => {
   const r = await dialog.showSaveDialog({ defaultPath: defaultName, filters: [{ name: filterName, extensions }] });
   return r.canceled ? null : r.filePath;

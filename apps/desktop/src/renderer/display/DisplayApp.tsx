@@ -36,7 +36,15 @@ export function DisplayApp(): React.ReactElement {
   return (
     <div className={`display-app ${fullscreen ? 'fullscreen' : ''}`}>
       <div className="screen-area">
-        <canvas id="spice-canvas" width={1024} height={768} />
+        {/* spice-client 适配层接入点：连接 ws://127.0.0.1:{port}/{token}
+            （token 是桥的一次性通行证——SPICE 禁票运行，路径不符的连接会被桥拒绝） */}
+        <canvas
+          id="spice-canvas"
+          width={1024}
+          height={768}
+          data-spice-port={query.port}
+          data-spice-token={query.token}
+        />
         {showHelperWarning && (
           <div className="helper-hint" title={helperTooltip(helperConnected) ?? undefined}>
             <span className="helper-warn">⚠</span> 客户机帮助程序未安装
