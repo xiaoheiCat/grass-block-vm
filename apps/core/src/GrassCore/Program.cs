@@ -97,6 +97,7 @@ public static class Program
             p.GetProperty("deviceId").GetString()!,
             p.GetProperty("isoPath").ValueKind == JsonValueKind.Null ? null : p.GetProperty("isoPath").GetString()),
         "getConfig" => s.GetConfig(p.GetProperty("packagePath").GetString()!),
+        "runAutostart" => s.RunAutostartAsync().GetAwaiter().GetResult(),
         "updateConfig" => s.UpdateConfig(p.GetProperty("packagePath").GetString()!, p.GetProperty("configJson").GetString()!),
         "resizeDisk" => s.ResizeDisk(
             p.GetProperty("packagePath").GetString()!,
@@ -115,7 +116,6 @@ public static class Program
         "restoreSnapshot" => s.RestoreSnapshot(p.GetProperty("packagePath").GetString()!, p.GetProperty("uuid").GetString()!),
         "planDeleteSnapshot" => s.PlanDeleteSnapshot(p.GetProperty("packagePath").GetString()!, p.GetProperty("uuid").GetString()!),
         "deleteSnapshot" => s.DeleteSnapshot(p.GetProperty("packagePath").GetString()!, p.GetProperty("uuid").GetString()!),
-        "runAutostart" => s.RunAutostartAsync().GetAwaiter().GetResult(),
         "getPreferences" => new
         {
             libraryRoot = s.LibraryRoot,

@@ -119,4 +119,11 @@ app.whenReady().then(async () => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createLibraryWindow();
   });
+  // 自启动：应用启动时按宿主级清单串行拉起（间隔 10s 由 Core 钳制），失败项由 Core 通知
+  try {
+    const b = await createBridge();
+    b.call('runAutostart', {}).catch((e: unknown) => console.error('[autostart]', e));
+  } catch (e) {
+    console.error('[autostart] bridge unavailable:', e);
+  }
 });
