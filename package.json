@@ -1,0 +1,28 @@
+{
+  "name": "grass-block-vm",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Grass Block VM — Simple on the surface. Powerful underneath.",
+  "license": "GPL-3.0",
+  "packageManager": "pnpm@11.8.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @grassvm/desktop dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r lint",
+    "core:test": "sh -c 'cd apps/core && dotnet test'"
+  },
+  "devDependencies": {
+    "prettier": "^3.4.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "esbuild"
+    ]
+  }
+}

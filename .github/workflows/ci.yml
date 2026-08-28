@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    name: GrassCore (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # 产品只支持 Windows 宿主；但核心逻辑（配置/快照/事务/库）保持跨平台可测试，
+        # macOS/Linux runner 验证纯逻辑测试，Windows runner 验证完整链路。
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Build
+        run: dotnet build apps/core/GrassCore.sln -c Release
+      - name: Test
+        run: dotnet test apps/core/GrassCore.sln -c Release --no-build
+
+  desktop:
+    name: Desktop UI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+        env:
+          # CI 上允许 electron 下载二进制
+          ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      - run: pnpm --filter @grassvm/desktop typecheck
+      - run: pnpm --filter @grassvm/desktop build
+      - run: pnpm --filter @grassvm/desktop test

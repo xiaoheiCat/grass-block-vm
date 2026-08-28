@@ -1,0 +1,107 @@
+/**
+ * GrassCore 进程桥：
+ * - 按需启动 GrassCore.exe（打开 UI 时拉起；UI 退出但仍有 VM 运行时 Core 继续存活）
+ * - Windows Named Pipe + JSON-RPC（不占 TCP 端口；权限交给 Windows ACL）
+ * - 非 Windows 开发机：GrassCore 以 stdio 承载同一协议（便于本机联调）
+ * - UI 崩溃不杀 Core；Core 崩溃不杀 QEMU（Core 侧负责无损重接管）
+ */
+import { spawn, type ChildProcess } from 'node:child_process';
+import net from 'node:net';
+import { EventEmitter } from 'node:events';
+
+const PIPE_NAME = '\\\\.\\pipe\\grassvm-core';
+
+export class CoreBridge extends EventEmitter {
+  private proc: ChildProcess | null = null;
+  private nextId = 1;
+  private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+
+  constructor(private coreExe: string) {
+    super();
+  }
+
+  /** 连接（必要时先拉起 GrassCore 进程）。 */
+  async ensureRunning(): Promise<void> {
+    if (process.platform === 'win32') {
+      // Windows：先试连接既有 Core（UI 重开时复用），失败再拉起
+      try {
+        await this.connectNamedPipe(PIPE_NAME);
+        return;
+      } catch {
+        this.spawnCore();
+        for (let i = 0; i < 50; i++) {
+          await sleep(200);
+          try {
+            await this.connectNamedPipe(PIPE_NAME);
+            return;
+          } catch {
+            /* 重试 */
+          }
+        }
+        throw new Error('无法连接 GrassCore。');
+      }
+    } else {
+      // 开发机：stdio 直连
+      this.proc = spawn(this.coreExe, [], { stdio: ['pipe', 'pipe', 'inherit'] });
+      this.wire(this.proc.stdin!, this.proc.stdout!);
+      await this.call('ping');
+    }
+  }
+
+  private spawnCore() {
+    this.proc = spawn(this.coreExe, [], { stdio: 'ignore' });
+    this.proc.on('exit', (code) => this.emit('core-exit', code));
+  }
+
+  private async connectNamedPipe(name: string): Promise<void> {
+    const socket = net.connect({ path: name });
+    await new Promise<void>((resolve, reject) => {
+      socket.once('connect', () => resolve());
+      socket.once('error', reject);
+    });
+    this.wire(socket, socket);
+  }
+
+  private wire(writable: NodeJS.WritableStream, readable: NodeJS.ReadableStream): void {
+    this.channel = { writable, readable };
+    let buf = Buffer.alloc(0);
+    readable.on('data', (chunk: Buffer) => {
+      buf = Buffer.concat([buf, chunk]);
+      while (buf.length >= 4) {
+        const len = buf.readInt32LE(0);
+        if (buf.length < 4 + len) break;
+        const json = buf.subarray(4, 4 + len).toString('utf8');
+        buf = buf.subarray(4 + len);
+        this.onMessage(json);
+      }
+    });
+  }
+
+  private channel: { writable: NodeJS.WritableStream; readable: NodeJS.ReadableStream } | null = null;
+
+  private onMessage(json: string): void {
+    const msg = JSON.parse(json) as { id?: number; result?: unknown; error?: { message: string } };
+    if (msg.id != null && this.pending.has(msg.id)) {
+      const p = this.pending.get(msg.id)!;
+      this.pending.delete(msg.id);
+      if (msg.error) p.reject(new Error(msg.error.message));
+      else p.resolve(msg.result);
+    }
+  }
+
+  async call<T = unknown>(method: string, params?: unknown): Promise<T> {
+    if (!this.channel) throw new Error('GrassCore 未连接。');
+    const id = this.nextId++;
+    const frame = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id, method, params }), 'utf8');
+    const len = Buffer.alloc(4);
+    len.writeInt32LE(frame.length, 0);
+    this.channel.writable.write(Buffer.concat([len, frame]));
+    return new Promise<T>((resolve, reject) => {
+      this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+    });
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
