@@ -75,9 +75,21 @@ public sealed class QemuCommandBuilder
         if (incomingStateFile is not null)
             args.AddRange(new[] { "-incoming", $"file:{incomingStateFile}" });
 
+        // 全部网卡"断开"（或没有网卡）：显式 -nic none。否则 QEMU 会静默补一张默认
+        // 用户态 NAT 网卡——用户以为断网了，实际上网照样通（消费级产品的安全性不能靠默认值）。
+        var hasNetworkArgs = args.Any(a => a.StartsWith("-netdev", StringComparison.Ordinal) || a.StartsWith("-nic", StringComparison.Ordinal) || a.StartsWith("-device e1000", StringComparison.Ordinal) || a.StartsWith("-device virtio-net", StringComparison.Ordinal));
+        if (!hasNetworkArgs)
+            args.AddRange(new[] { "-nic", "none" });
+
         // QMP：Windows Named Pipe（-mon mode=control）。Core 崩溃后凭 session.json + 此管道无损接管。
+        // pipe 后端只认 path= 选项（name= 会让 QEMU 参数解析即退出）；且 QEMU 自己在
+        // Windows 上补 \\.\pipe\ 前缀——这里传裸名。客户端仍用全限定名连接。
         var qmpPipe = $@"\\.\pipe\grassvm-qmp-{sessionId}";
-        args.AddRange(new[] { "-chardev", $"pipe,id=qmpchar,name={qmpPipe}", "-mon", "chardev=qmpchar,mode=control" });
+        args.AddRange(new[]
+        {
+            "-chardev", $"pipe,id=qmpchar,path=grassvm-qmp-{sessionId}",
+            "-mon", "chardev=qmpchar,mode=control",
+        });
         return new QemuCommandLine { Args = args, QmpPipeName = qmpPipe, PackageRoot = packageRoot };
     }
 
@@ -98,7 +110,7 @@ public sealed class QemuCommandBuilder
         // （配置里的用户意图保留，将来宿主可用即恢复），否则 QEMU 初始化即失败。
         if (Config.Firmware.Tpm && Config.DevicesOfType<TpmDevice>().Any(t => t.Enabled) && TpmHostReady)
         {
-            args.AddRange(new[] { "-chardev", "pipe,id=chrtpm,name=\\\\.\\pipe\\grassvm-tpm-emulator" });
+            args.AddRange(new[] { "-chardev", "pipe,id=chrtpm,path=grassvm-tpm-emulator" });
             args.AddRange(new[] { "-tpmdev", "emulator,id=tpm0,chardev=chrtpm" });
             args.AddRange(new[] { "-device", "tpm-tis,tpmdev=tpm0" });
         }
@@ -217,10 +229,16 @@ public sealed class QemuCommandBuilder
         return $"GrassVM-Tap-{BitConverter.ToString(hash, 0, 2).Replace("-", "")}";
     }
 
+    /// <summary>同类设备内递增序号（每设备 bootindex 必须唯一：QEMU 在 realize 时拒绝重复值）。</summary>
+    private readonly Dictionary<BootClass, int> _bootSeq = new();
+
     private int BootIndex(BootClass @class)
     {
         var i = Config.BootOrder.IndexOf(@class);
-        return i < 0 ? int.MaxValue / 2 : i + 1;
+        var baseIndex = i < 0 ? int.MaxValue / 2 : i + 1;
+        var n = _bootSeq.TryGetValue(@class, out var v) ? v : 0;
+        _bootSeq[@class] = n + 1;
+        return n == 0 ? baseIndex : baseIndex * 100 + n; // 同类第 2+ 台排在本类末尾之后
     }
 
     private void AddRawDevices(List<string> args)

@@ -22,6 +22,7 @@ public static class GrassVmZip
         GrassVmPackage.LockFile,    // vm.lock
         GrassVmPackage.RuntimeDir + "/", // runtime/（session 等瞬态）
         GrassVmPackage.LogsDir + "/",    // logs/（本机日志）
+        GrassVmPackage.TempDir + "/",   // temp/（升级备份等本机产物——档案不该带着旧配置旅行）
     };
 
     private static bool IsExcluded(string relativeEntryName)

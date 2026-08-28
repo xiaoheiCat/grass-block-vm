@@ -267,7 +267,8 @@ public sealed class GrassCoreService
                 var plan = UpgradeProtection.CreatePlan(pkg, state.LastQemuMajor!, _bundledQemuMajor);
                 UpgradeProtection.BackupMetadata(pkg, plan.MetadataBackupDir);
                 SnapshotService.Create(pkg, config, name: "升级保护快照", isUpgradeProtection: true,
-                    diskOps: new Qemu.TransactionalDiskOps(_qemuImgPath));
+                    diskOps: new Qemu.TransactionalDiskOps(_qemuImgPath),
+                    upgradeProtectionBackupDir: plan.MetadataBackupDir);
             }
 
             var sessionId = Guid.NewGuid().ToString("N")[..12];
@@ -489,6 +490,12 @@ public sealed class GrassCoreService
                 var plan = SnapshotPlanner.PlanDelete(tree, s.Uuid, SnapshotService.FindLinkedCloneReferences(pkg));
                 if (plan.AffectedLinkedClones.Count > 0) continue;
                 SnapshotService.Delete(pkg, s.Uuid, new Qemu.TransactionalDiskOps(_qemuImgPath));
+                // 对应的元数据备份一并回收（temp/upgrade-backup-* 不再无限累积）
+                var backupDir = s.UpgradeProtectionBackupDir;
+                if (backupDir is not null
+                    && Path.GetFullPath(backupDir).StartsWith(Path.GetFullPath(pkg.TempPath) + Path.DirectorySeparatorChar, StringComparison.Ordinal)
+                    && Directory.Exists(backupDir))
+                    Directory.Delete(backupDir, recursive: true);
             }
         }
         catch
@@ -632,8 +639,9 @@ public sealed class GrassCoreService
             case "shutdown":
             {
                 var qmp = RequireQmp(packagePath);
-                var r = qmp.AcpiShutdownAsync().GetAwaiter().GetResult();
+                // 标志先于发送：客户机可能在响应到达前就完成关机退出（监视器会读它）
                 _running[packagePath].AcpiShutdownRequested = true;
+                var r = qmp.AcpiShutdownAsync().GetAwaiter().GetResult();
                 return QmpResult(r);
             }
             // 强制关机 = 电源菜单 + 二次确认后调用方才允许（不算正常关机）
@@ -662,7 +670,16 @@ public sealed class GrassCoreService
         qmp.StopAsync().GetAwaiter().GetResult();
         var stateFile = Path.Combine(pkg.FirmwarePath, "..", "suspend.state");
         stateFile = Path.GetFullPath(stateFile);
-        qmp.MigrateToFileAsync(stateFile).GetAwaiter().GetResult();
+        try
+        {
+            qmp.MigrateToFileAsync(stateFile).GetAwaiter().GetResult();
+        }
+        catch
+        {
+            // migrate 命令本身失败（QMP 错误/连接死）：VM 还冻在 stop 状态——尽力恢复运行
+            try { qmp.ExecuteAsync("cont").GetAwaiter().GetResult(); } catch { /* 连接已死则无法恢复 */ }
+            throw;
+        }
         var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(10);
         while (true)
         {
@@ -727,7 +744,10 @@ public sealed class GrassCoreService
     }
 
     /// <summary>CD/DVD 热插拔（唯一允许运行中修改的设备）：换镜像 / 弹出。</summary>
-    public object ChangeMedium(string packagePath, string deviceId, string? isoPath)
+    public object ChangeMedium(string packagePath, string deviceId, string? isoPath) =>
+        WithPackageGate(packagePath, () => ChangeMediumCore(packagePath, deviceId, isoPath));
+
+    private object ChangeMediumCore(string packagePath, string deviceId, string? isoPath)
     {
         var pkg = new GrassVmPackage(packagePath);
         var config = new ConfigStore(pkg).Load();

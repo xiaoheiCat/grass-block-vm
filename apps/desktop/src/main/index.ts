@@ -98,12 +98,30 @@ ipcMain.handle('core:call', async (_e, method: string, params?: unknown) => {
 
 // 每个显示器窗口一个 SPICE 桥；窗口关闭时拆除（否则每次开窗泄漏一个 HTTP 服务器）
 const displayBridges = new Map<number, { server: http.Server; wss: WebSocketServer }>();
+/** 已打开的显示器窗口（包路径 → 窗口）：一台 VM 只允许一个显示器 */
+const openDisplays = new Map<number, string>();
+
+// 默认存档位置：用户 Documents 下 Grass Block VM（渲染层沙箱拿不到 USERPROFILE，
+// 只能由主进程解析后交给首运行引导卡片）
+ipcMain.handle('paths:defaultLibraryDir', () =>
+  path.join(app.getPath('documents'), 'Grass Block VM'),
+);
 
 ipcMain.handle('display:open', async (_e, vmName: string, spicePort: number, packagePath: string) => {
+  // 一台 VM 同时只允许一个显示器窗口：已开则聚焦（重复桥也会堆叠资源）
+  const existing = [...BrowserWindow.getAllWindows()].find(
+    (w) => (w.getTitle() === vmName || openDisplays.get(w.id) === packagePath) && !w.isDestroyed(),
+  );
+  if (existing) {
+    existing.focus();
+    return true;
+  }
   const bridge = await startSpiceBridge(spicePort);
   const win = createDisplayWindow(vmName, spicePort, packagePath, bridge.wss.token);
+  openDisplays.set(win.id, packagePath);
   displayBridges.set(win.id, bridge);
   win.on('closed', () => {
+    openDisplays.delete(win.id);
     const b = displayBridges.get(win.id);
     if (b) {
       displayBridges.delete(win.id);

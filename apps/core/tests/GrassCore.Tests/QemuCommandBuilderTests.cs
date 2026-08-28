@@ -114,7 +114,7 @@ public class QemuCommandBuilderTests : IDisposable
         var j = string.Join(" ", cmd.Args);
 
         Assert.Equal(@"\\.\pipe\grassvm-qmp-session99", cmd.QmpPipeName);
-        Assert.Contains(@"-chardev pipe,id=qmpchar,name=\\.\pipe\grassvm-qmp-session99", j);
+        Assert.Contains("-chardev pipe,id=qmpchar,path=grassvm-qmp-session99", j); // path=（name= 会让 QEMU 解析即退出）
         Assert.Contains("-mon chardev=qmpchar,mode=control", j);
         Assert.Contains("addr=127.0.0.1,port=0,disable-ticketing=on", j); // SPICE 只监听本机
     }
@@ -194,5 +194,45 @@ public class QemuCommandBuilderTests : IDisposable
         var idx = 0;
         while ((idx = haystack.IndexOf(needle, idx, StringComparison.Ordinal)) >= 0) { count++; idx += needle.Length; }
         return count;
+    }
+
+    [Fact]
+    public void GoldenInvariants_QemuParseable()
+    {
+        // 多盘 + 多网卡（OVF 导入的常见形态）：QEMU 会在 realize 时拒绝重复 bootindex
+        var config = OsProfileLibrary.CreateDefaultConfig("ubuntu", "Golden");
+        config.Devices.Add(new DiskDevice { Path = "disks/system.qcow2", SizeBytes = 8, CreatedOrder = 10 });
+        config.Devices.Add(new DiskDevice { Path = "disks/data.qcow2", SizeBytes = 8, CreatedOrder = 11 });
+        config.Devices.Add(new CdromDevice { IsoPath = null, CreatedOrder = 12 });
+        config.Devices.Add(new NetworkDevice { Mode = NetworkMode.Nat, CreatedOrder = 13 });
+        config.Devices.Add(new NetworkDevice { Mode = NetworkMode.Nat, CreatedOrder = 14 });
+        var args = Build(config, _pkg.Path);
+
+        // 1) bootindex 每设备唯一
+        var indices = args.Where(a => a.Contains("bootindex=", StringComparison.Ordinal))
+            .Select(a => a.Split("bootindex=")[1].Split(',')[0]).ToList();
+        Assert.Equal(indices.Count, indices.Distinct().Count());
+
+        // 2) 网卡 MAC 派生自 DeviceId：两块卡必须不同
+        var macs = args.Where(a => a.Contains("mac=", StringComparison.Ordinal))
+            .Select(a => a.Split("mac=")[1].Split(',')[0]).ToList();
+        Assert.Equal(macs.Count, macs.Distinct().Count());
+    }
+
+    [Fact]
+    public void AllNicsDisconnected_EmitsExplicitNicNone()
+    {
+        // 全部网卡"断开"：必须显式 -nic none——QEMU 默认会静默补一张用户态 NAT 网卡，
+        // 用户以为断网了实际照样能上网（安全性不能靠默认值）
+        var config = OsProfileLibrary.CreateDefaultConfig("ubuntu", "断网机");
+        config.Devices.Add(new DiskDevice { Path = "disks/system.qcow2", SizeBytes = 8, CreatedOrder = 10 });
+        // Profile 默认带一块 NAT 网卡——换成一块"断开"的（不是再加一块）
+        config.Devices.RemoveAll(d => d is NetworkDevice);
+        config.Devices.Add(new NetworkDevice { Mode = NetworkMode.Disconnected, CreatedOrder = 20 });
+        var args = Build(config, _pkg.Path);
+
+        Assert.Contains("-nic", args);
+        var i = Array.IndexOf(args, "-nic");
+        Assert.Equal("none", args[i + 1]);
     }
 }

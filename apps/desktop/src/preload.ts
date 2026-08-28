@@ -23,4 +23,6 @@ contextBridge.exposeInMainWorld('grassvm', {
     ipcRenderer.invoke('dialog:pickSave', defaultName, filterName, extensions) as Promise<string | null>,
   /** 原生目录选择（首次运行设置虚拟机存档位置） */
   pickDirectory: () => ipcRenderer.invoke('dialog:pickDirectory') as Promise<string | null>,
+  /** 默认存档位置（主进程解析：Documents/Grass Block VM） */
+  defaultLibraryDir: () => ipcRenderer.invoke('paths:defaultLibraryDir') as Promise<string>,
 });

@@ -21,6 +21,7 @@ interface GrassApi {
   pickOpenFile(filterName: string, extensions: string[]): Promise<string | null>;
   pickSaveFile(defaultName: string, filterName: string, extensions: string[]): Promise<string | null>;
   pickDirectory(): Promise<string | null>;
+  defaultLibraryDir(): Promise<string>;
 }
 
 const api: GrassApi | undefined = (window as unknown as { grassvm?: GrassApi }).grassvm;
@@ -34,14 +35,11 @@ export function App(): React.ReactElement {
   const [unlockVm, setUnlockVm] = useState<VmSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [needsSetup, setNeedsSetup] = useState(false);
-  const [libraryDir, setLibraryDir] = useState<string>(
-    // 默认存档位置：用户 Documents 下的 Grass Block VM（UI 层负责默认值，Core 不猜）
-    (() => {
-      const docs = (window as unknown as { process?: { env: Record<string, string> } }).process?.env;
-      const home = docs?.HOME ?? 'C:\\Users\\Public';
-      return `${home}${home.endsWith('/') || home.endsWith('\\') ? '' : '/'}Documents/Grass Block VM`;
-    })(),
-  );
+  const [libraryDir, setLibraryDir] = useState<string>('');
+  // 默认存档位置由主进程解析（渲染层沙箱读不到 USERPROFILE）
+  useEffect(() => {
+    void api?.defaultLibraryDir().then(setLibraryDir);
+  }, []);
   const [savingSetup, setSavingSetup] = useState(false);
 
   const refresh = useCallback(async () => {

@@ -69,6 +69,19 @@ public sealed class CloneService(TransactionalDiskOps diskOps)
         {
             var config = ConfigJson.Deserialize(snap.FullConfigSnapshot);
             config.Name = newName;
+            // 设备 ID 全部换新：与完整克隆一致。DeviceId 决定派生 MAC/TAP 名——沿用父包 ID
+            // 会让克隆与父 VM 同 MAC（"同时运行父与克隆"正是链接克隆的存在意义）。
+            var idRemap = new Dictionary<string, string>();
+            foreach (var dev in config.Devices)
+            {
+                var oldId = dev.DeviceId;
+                dev.DeviceId = Guid.NewGuid().ToString();
+                idRemap[oldId] = dev.DeviceId;
+            }
+            // 快照的冻结文件引用按旧 ID 记录：换算后再用
+            var overlayRefs = snap.DiskOverlayRefs.ToDictionary(
+                kv => idRemap.TryGetValue(kv.Key, out var nid) ? nid : kv.Key,
+                kv => kv.Value);
             config.CloneInfo = new CloneInfo
             {
                 // 同一目录树下的父包保存相对引用（../Name.grassvm），移动整个 Library 后仍然有效；
@@ -79,7 +92,7 @@ public sealed class CloneService(TransactionalDiskOps diskOps)
 
             foreach (var disk in config.Devices.OfType<DiskDevice>().ToList())
             {
-                if (disk.IsExternal || !snap.DiskOverlayRefs.TryGetValue(disk.DeviceId, out var overlayRef)) continue;
+                if (disk.IsExternal || !overlayRefs.TryGetValue(disk.DeviceId, out var overlayRef)) continue;
                 var backingFile = Path.Combine(source.SnapshotsPath, snapshotUuid, overlayRef.Replace('/', Path.DirectorySeparatorChar));
                 var overlayPath = Path.Combine(target.DisksPath, Path.GetFileName(disk.Path));
                 // QCOW2 overlay：backing 指向父快照的 overlay（外部链）

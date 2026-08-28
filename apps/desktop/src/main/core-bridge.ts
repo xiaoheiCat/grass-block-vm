@@ -62,6 +62,8 @@ export class CoreBridge extends EventEmitter {
 
   private spawnCore() {
     this.proc = spawn(this.coreExe, [], { stdio: 'ignore' });
+    // spawn 失败（路径错误/ENOENT）走 error 事件——没有监听器会变成主进程未捕获异常
+    this.proc.on('error', () => this.teardownChannel(new Error('无法启动 GrassCore。')));
     this.proc.on('exit', (code) => this.emit('core-exit', code));
   }
 

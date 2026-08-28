@@ -108,11 +108,26 @@ public static class Transport
                 var server = new NamedPipeServerStream(name, PipeDirection.InOut,
                     NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Byte,
                     PipeOptions.Asynchronous);
-                await server.WaitForConnectionAsync(ct);
+                try
+                {
+                    await server.WaitForConnectionAsync(ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    server.Dispose();
+                    break;
+                }
+                catch (IOException)
+                {
+                    server.Dispose(); // 单次瞬时失败不杀整个服务
+                    await Task.Delay(200, CancellationToken.None);
+                    continue;
+                }
                 var conn = new JsonRpcConnection(server);
                 Interlocked.Increment(ref _activeConnections);
                 // 释放归连接处理器所有：循环体的 await using 会在【每次迭代末】就把刚接上的
                 // 管道关掉（作用域是迭代而不是外层函数）——Core 在 Windows 上完全不可达。
+                // 任务不绑 ct：取消时应照样释放管道并递减计数（否则空闲退出计数永久虚高）。
                 _ = Task.Run(async () =>
                 {
                     try { await handler(conn); }
@@ -121,7 +136,7 @@ public static class Transport
                         Interlocked.Decrement(ref _activeConnections);
                         server.Dispose();
                     }
-                }, ct);
+                });
             }
         }
         else

@@ -22,6 +22,8 @@ public sealed class Snapshot
     /// <summary>升级保护快照：隐藏保留，24 小时后的第一次正常关机才自动删除；用户普通快照不影响它。</summary>
     public bool IsUpgradeProtection { get; init; }
     public DateTimeOffset? UpgradeProtectionCreatedAt { get; init; }
+    /// <summary>升级保护时的元数据备份目录（temp/upgrade-backup-*；快照删除时一并回收）。</summary>
+    public string? UpgradeProtectionBackupDir { get; init; }
 }
 
 /// <summary>

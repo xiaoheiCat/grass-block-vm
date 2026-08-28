@@ -39,7 +39,8 @@ public static class SnapshotService
 
     public static Snapshot Create(GrassVmPackage package, VmConfiguration config, string name,
         string? description = null, bool isUpgradeProtection = false,
-        GrassCore.Qemu.TransactionalDiskOps? diskOps = null)
+        GrassCore.Qemu.TransactionalDiskOps? diskOps = null,
+        string? upgradeProtectionBackupDir = null)
     {
         var snap = new Snapshot
         {
@@ -52,6 +53,7 @@ public static class SnapshotService
             FullConfigSnapshot = ConfigJson.Serialize(config),
             IsUpgradeProtection = isUpgradeProtection,
             UpgradeProtectionCreatedAt = isUpgradeProtection ? DateTimeOffset.UtcNow : null,
+            UpgradeProtectionBackupDir = upgradeProtectionBackupDir,
         };
         var tree = LoadTree(package);
         var state = VmState.Load(package);
