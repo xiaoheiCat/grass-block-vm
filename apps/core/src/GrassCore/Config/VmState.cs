@@ -23,6 +23,14 @@ public sealed class VmState
     /// <summary>最近一次窗口尺寸等本机展示状态（.grassvm.zip 导出时不带走这些痕迹）。</summary>
     public WindowState? LastDisplayWindow { get; set; }
 
+    /// <summary>
+    /// 挂起状态文件（包内）。存在即 VM 处于"已挂起"：直接 startVm 会被拒绝（必须 resume），
+    /// 因为 QEMU 需要 -incoming 才能回到保存的瞬间。恢复完成或正常启动后清空。
+    /// </summary>
+    public string? SuspendedStatePath { get; set; }
+    /// <summary>挂起时的宿主环境指纹：只保证相同宿主 CPU 环境 + 同一 QEMU major 下恢复。</summary>
+    public string? SuspendFingerprint { get; set; }
+
     public sealed record WindowState(int Width, int Height);
 
     public static VmState Load(GrassVmPackage package)

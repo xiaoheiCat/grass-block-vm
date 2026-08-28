@@ -90,7 +90,12 @@ public static class Program
         "getProfiles" => s.GetProfiles(),
         "createVm" => s.CreateVm(p),
         "startVm" => s.StartVm(p.GetProperty("packagePath").GetString()!),
+        "resumeVm" => s.ResumeVm(p.GetProperty("packagePath").GetString()!),
         "powerAction" => s.PowerAction(p.GetProperty("packagePath").GetString()!, p.GetProperty("action").GetString()!),
+        "changeMedium" => s.ChangeMedium(
+            p.GetProperty("packagePath").GetString()!,
+            p.GetProperty("deviceId").GetString()!,
+            p.GetProperty("isoPath").ValueKind == JsonValueKind.Null ? null : p.GetProperty("isoPath").GetString()),
         "unlockVm" => s.UnlockVm(p.GetProperty("packagePath").GetString()!),
         "fullClone" => s.FullClone(p.GetProperty("packagePath").GetString()!, p.GetProperty("newName").GetString()!),
         "linkedClone" => s.LinkedClone(p.GetProperty("packagePath").GetString()!, p.GetProperty("snapshotUuid").GetString()!, p.GetProperty("newName").GetString()!),

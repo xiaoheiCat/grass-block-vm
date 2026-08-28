@@ -14,4 +14,10 @@ contextBridge.exposeInMainWorld('grassvm', {
     typeof window !== 'undefined'
       ? Object.fromEntries(new URLSearchParams(window.location.search))
       : {},
+  /** 原生文件选择（导入档案 / 安装镜像等；QEMU 不可见原则不受影响） */
+  pickOpenFile: (filterName: string, extensions: string[]) =>
+    ipcRenderer.invoke('dialog:pickOpen', filterName, extensions) as Promise<string | null>,
+  /** 原生保存位置选择（导出档案） */
+  pickSaveFile: (defaultName: string, filterName: string, extensions: string[]) =>
+    ipcRenderer.invoke('dialog:pickSave', defaultName, filterName, extensions) as Promise<string | null>,
 });

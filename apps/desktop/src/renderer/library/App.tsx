@@ -18,6 +18,8 @@ import { VmSettings } from './VmSettings';
 interface GrassApi {
   coreCall<T = unknown>(method: string, params?: unknown): Promise<T>;
   openDisplay(vmName: string, spicePort: number): Promise<boolean>;
+  pickOpenFile(filterName: string, extensions: string[]): Promise<string | null>;
+  pickSaveFile(defaultName: string, filterName: string, extensions: string[]): Promise<string | null>;
 }
 
 const api: GrassApi | undefined = (window as unknown as { grassvm?: GrassApi }).grassvm;
@@ -63,6 +65,16 @@ export function App(): React.ReactElement {
     [refresh],
   );
 
+  // 挂起恢复：必须走 resumeVm（startVm 会拒绝已挂起的 VM——保存的状态只能用 -incoming 回到）
+  const onResume = useCallback(
+    async (vm: VmSummary) => {
+      if (!api) return;
+      await api.coreCall('resumeVm', { packagePath: vm.path });
+      await refresh();
+    },
+    [refresh],
+  );
+
   const onPower = useCallback(
     async (vm: VmSummary, action: 'shutdown' | 'suspend' | 'forceOff') => {
       if (!api) return;
@@ -78,6 +90,79 @@ export function App(): React.ReactElement {
     await api.openDisplay(vm.name, 0);
   }, []);
 
+  const fail = useCallback((e: unknown) => {
+    setError(e instanceof Error ? e.message : String(e));
+  }, []);
+
+  // 完整克隆：独立副本（无快照历史、无本机痕迹）
+  const onFullClone = useCallback(
+    async (vm: VmSummary) => {
+      if (!api) return;
+      const name = window.prompt('新虚拟机的名称（完整克隆：独立副本，不含快照历史）', `${vm.name} 副本`);
+      if (!name?.trim()) return;
+      try {
+        await api.coreCall('fullClone', { packagePath: vm.path, newName: name.trim() });
+        await refresh();
+      } catch (e) {
+        fail(e);
+      }
+    },
+    [refresh, fail],
+  );
+
+  // 导出完整档案（必须已关机；Core 校验后导出）
+  const onExportZip = useCallback(
+    async (vm: VmSummary) => {
+      if (!api) return;
+      const target = await api.pickSaveFile(`${vm.name}.grassvm.zip`, 'Grass Block VM 档案', ['zip']);
+      if (!target) return;
+      try {
+        await api.coreCall('exportZip', { packagePath: vm.path, zipPath: target });
+        await refresh();
+      } catch (e) {
+        fail(e);
+      }
+    },
+    [refresh, fail],
+  );
+
+  // 导入：.grassvm.zip 完整档案 或 .ova/.ovf（计划→[仍然导入]→执行）
+  const onImport = useCallback(async () => {
+    if (!api) return;
+    const src = await api.pickOpenFile('虚拟机档案', ['zip', 'ova', 'ovf']);
+    if (!src) return;
+    try {
+      if (src.toLowerCase().endsWith('.zip')) {
+        await api.coreCall('importZip', { zipPath: src });
+      } else {
+        const plan = await api.coreCall<{
+          vmName: string;
+          requiredGiB: number;
+          warnings: string[];
+          unsupported: string[];
+          blocksImport: boolean;
+        }>('planImportOvf', { path: src });
+        if (plan.blocksImport && !window.confirm(
+          `这份档案包含 ${plan.unsupported.length} 个无法支持的设备（${plan.unsupported.join('、')}）。\n` +
+          '仍要导入吗？这些设备会保留为占位（标记不可用），其余设备正常工作。',
+        )) {
+          return;
+        }
+        if (plan.warnings.length > 0 && !window.confirm(plan.warnings.join('\n'))) return;
+        const name = window.prompt('虚拟机名称', plan.vmName);
+        if (!name?.trim()) return;
+        await api.coreCall('executeImportOvf', {
+          path: src,
+          vmName: name.trim(),
+          allowUnsupported: plan.blocksImport,
+        });
+      }
+      await refresh();
+    } catch (e) {
+      fail(e);
+    }
+  }, [refresh, fail]);
+
   const memoCards = useMemo(
     () =>
       vms.map((vm) => (
@@ -85,12 +170,15 @@ export function App(): React.ReactElement {
           key={vm.path}
           vm={vm}
           onStart={onStart}
+          onResume={onResume}
           onPower={onPower}
           onOpenDisplay={onOpenDisplay}
           onSettings={setSettingsVm}
+          onFullClone={onFullClone}
+          onExportZip={onExportZip}
         />
       )),
-    [vms, onStart, onPower, onOpenDisplay],
+    [vms, onStart, onResume, onPower, onOpenDisplay, onFullClone, onExportZip],
   );
 
   if (!api) {
@@ -108,9 +196,14 @@ export function App(): React.ReactElement {
           <span className="brand-mark">🟩</span>
           <h1>我的虚拟机</h1>
         </div>
-        <button className="btn-primary" onClick={() => setWizardOpen(true)} disabled={profiles.length === 0}>
-          ＋ 新建虚拟机
-        </button>
+        <div className="topbar-actions">
+          <button className="btn-ghost" onClick={onImport}>
+            导入…
+          </button>
+          <button className="btn-primary" onClick={() => setWizardOpen(true)} disabled={profiles.length === 0}>
+            ＋ 新建虚拟机
+          </button>
+        </div>
       </header>
 
       {error && <div className="banner-error">{error}</div>}
@@ -142,13 +235,17 @@ export function App(): React.ReactElement {
 function VmCard(props: {
   vm: VmSummary;
   onStart(vm: VmSummary): void;
+  onResume(vm: VmSummary): void;
   onPower(vm: VmSummary, action: 'shutdown' | 'suspend' | 'forceOff'): void;
   onOpenDisplay(vm: VmSummary): void;
   onSettings(vm: VmSummary): void;
+  onFullClone(vm: VmSummary): void;
+  onExportZip(vm: VmSummary): void;
 }): React.ReactElement {
   const { vm } = props;
   const action = primaryAction(vm.state);
   const badge = osBadge(vm.osProfileId);
+  const busy = vm.state === 'running' || vm.state === 'suspending' || vm.state === 'starting';
   return (
     <article className={`vm-card state-${vm.state}`}>
       <div className="vm-cover">
@@ -166,7 +263,7 @@ function VmCard(props: {
               action === 'start'
                 ? props.onStart(vm)
                 : action === 'resume'
-                  ? props.onStart(vm)
+                  ? props.onResume(vm)
                   : props.onOpenDisplay(vm)
             }
           >
@@ -189,6 +286,17 @@ function VmCard(props: {
             </div>
           </details>
         )}
+        <details className="power-menu">
+          <summary>更多</summary>
+          <div className="power-menu-items">
+            <button className="menu-item" disabled={busy} onClick={() => props.onFullClone(vm)}>
+              克隆副本
+            </button>
+            <button className="menu-item" disabled={busy} onClick={() => props.onExportZip(vm)}>
+              导出档案…
+            </button>
+          </div>
+        </details>
         <button className="btn-ghost" onClick={() => props.onSettings(vm)}>
           设置
         </button>

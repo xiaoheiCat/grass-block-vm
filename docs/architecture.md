@@ -41,6 +41,7 @@ GrassCore.exe (C# / .NET, self-contained, 用户级进程, 按需启动)
 | 启动预检 | `Qemu/TransactionalDiskOps.cs`（StartupPreflight） | 资源存在性/vm.lock/显示设备（§22.1） |
 | WHPX/升级保护/脱敏 | `Qemu/WhpxCapability.cs` | 三层 WHPX 预检；QEMU major 升级保护快照；日志脱敏（§17/§22.9） |
 | 快照 | `Snapshots/SnapshotTree.cs` | 树、非叶删除重绑、链接克隆依赖、恢复警告、升级保护清理（§16） |
+| QMP 客户端 | `Qemu/QmpClient.cs` | JSON 行协议 + 传输抽象（Windows Named Pipe / TCP / 内存）；ACPI 关机、quit、挂起 migrate file:、恢复 -incoming、CD 热插拔（§22） |
 | 快照落盘 | `Rpc/SnapshotService.cs` | snapshots/&lt;uuid&gt; 布局；完整 config 副本；包外磁盘不进链（§16） |
 | 克隆 | `Clone/CloneService.cs` | 完整克隆（独立副本/扁盘化/无快照历史）；链接克隆（必须基于快照/cloneInfo 同目录相对引用）（§16.5） |
 | 导入导出 | `ExportImport/GrassVmZip.cs`、`ExportImport/OvfImporter.cs`、`ExportImport/OvfExporter.cs` | 完整档案 zip（关机前置）；OVF/OVA 导入映射（Raw/阻止/仍然导入/空间预估）；OVF 导出当前状态（§15） |
@@ -72,6 +73,7 @@ NSIS 骨架：一开始整体提权一次装齐（UI + Core + Helper + QEMU + TA
 | P2 磁盘/QEMU 命令 | ✅ qemu-img 事务、Profile→命令构建、启动预检（Windows 实机验证待做） |
 | P3 UI | ◐ Library/向导/设置/显示器骨架就绪；与 Core 真实数据流待 Windows 实机联调 |
 | P4 快照/克隆 | ✅ 树模型/落盘/删除重绑/链接克隆依赖/恢复回滚/完整克隆/升级保护快照；QMP 在线快照与 overlay 重写在实机阶段落地 |
+| P4b 电源/挂起 | ✅ QmpClient（greeting→capabilities→命令/事件；Windows Named Pipe/TCP/内存传输）+ ACPI 关机/强制退出/挂起（stop→migrate file:→quit）/-incoming 恢复 + 宿主指纹校验；实机联调待做 |
 | P5 网络 | ◐ 宿主级网络资源模型 + TAP 命令生成；驱动安装/实测在 Windows 阶段 |
 | P6 导入导出 | ✅ .grassvm.zip 完整档案（关机前置/痕迹排除/zip-slip 防护）、OVF/OVA 导入（Raw 设备/阻止与仍然导入/空间预估）、OVF/OVA 导出（当前状态/VMDK 转换）；OVA 打包实测在 Windows 阶段 |
 | P7 打包发布 | ◐ NSIS 骨架；签名/驱动细节在 Windows 构建机完成 |

@@ -10,6 +10,7 @@
 .brand { display: flex; align-items: center; gap: 10px; }
 .brand h1 { font-size: 18px; margin: 0; color: #2c3b24; }
 .brand-mark { font-size: 22px; }
+.topbar-actions { display: flex; align-items: center; gap: 10px; }
 
 .library { flex: 1; overflow-y: auto; padding: 22px; }
 .card-grid {

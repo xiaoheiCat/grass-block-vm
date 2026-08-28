@@ -36,7 +36,7 @@ public sealed class QemuCommandBuilder
 
     public VmConfiguration Config { get; }
 
-    public QemuCommandLine Build(string packageRoot, string? runtimeSessionId = null)
+    public QemuCommandLine Build(string packageRoot, string? runtimeSessionId = null, string? incomingStateFile = null)
     {
         var sessionId = runtimeSessionId ?? RandomHex(12);
         var args = new List<string>
@@ -65,6 +65,10 @@ public sealed class QemuCommandBuilder
         }
         AddRawDevices(args);
         AddDisplayAndSpice(args);
+
+        // 挂起恢复：从保存的完整运行状态（内存/CPU/设备）回到挂起瞬间的唯一方式
+        if (incomingStateFile is not null)
+            args.AddRange(new[] { "-incoming", $"file:{incomingStateFile}" });
 
         // QMP：Windows Named Pipe（-mon mode=control）。Core 崩溃后凭 session.json + 此管道无损接管。
         var qmpPipe = $@"\\.\pipe\grassvm-qmp-{sessionId}";

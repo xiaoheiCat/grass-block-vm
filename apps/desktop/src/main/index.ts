@@ -4,7 +4,7 @@
  * - 显示器窗口：每台运行中的 VM 一个独立窗口（关闭 ≠ 关机）
  * - SPICE 桥：Chromium(WebSocket) ↔ Electron Main(Node TCP) ↔ QEMU SPICE(127.0.0.1)
  */
-import { app, BrowserWindow, ipcMain } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain } from 'electron';
 import path from 'node:path';
 import net from 'node:net';
 import http from 'node:http';
@@ -96,6 +96,17 @@ ipcMain.handle('display:open', async (_e, vmName: string, spicePort: number) => 
   await startSpiceBridge(spicePort);
   createDisplayWindow(vmName, spicePort);
   return true;
+});
+
+// 文件选择对话框：导入（.zip/.ova/.ovf）、导出保存位置、安装镜像选择共用。
+ipcMain.handle('dialog:pickOpen', async (_e, filterName: string, extensions: string[]) => {
+  const r = await dialog.showOpenDialog({ properties: ['openFile'], filters: [{ name: filterName, extensions }] });
+  return r.canceled ? null : r.filePaths[0];
+});
+
+ipcMain.handle('dialog:pickSave', async (_e, defaultName: string, filterName: string, extensions: string[]) => {
+  const r = await dialog.showSaveDialog({ defaultPath: defaultName, filters: [{ name: filterName, extensions }] });
+  return r.canceled ? null : r.filePath;
 });
 
 // 退出策略：UI 退出不杀 GrassCore；Core 在"最后一台 VM 结束且 UI 已退出"时自动退出。
