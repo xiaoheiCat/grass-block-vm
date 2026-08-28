@@ -96,6 +96,9 @@
 .nav-item.active { background: #edf8e4; color: #2f7a1f; font-weight: 600; }
 .settings-pane { flex: 1; padding: 20px; font-size: 14px; color: #4b5c40; overflow-y: auto; }
 .lock-note { color: #9a7b16; }
+.field { display: block; margin: 14px 0; font-size: 14px; color: #2c3b24; }
+.field input[type='range'] { display: block; width: 100%; margin-top: 6px; accent-color: #58a618; }
+.hint { color: #66755b; font-size: 12px; }
 
 .dialog { padding: 22px; width: min(420px, 92vw); }
 .dialog h2 { margin: 0 0 10px; font-size: 17px; }

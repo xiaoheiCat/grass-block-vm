@@ -96,6 +96,12 @@ public static class Program
             p.GetProperty("packagePath").GetString()!,
             p.GetProperty("deviceId").GetString()!,
             p.GetProperty("isoPath").ValueKind == JsonValueKind.Null ? null : p.GetProperty("isoPath").GetString()),
+        "getConfig" => s.GetConfig(p.GetProperty("packagePath").GetString()!),
+        "updateConfig" => s.UpdateConfig(p.GetProperty("packagePath").GetString()!, p.GetProperty("configJson").GetString()!),
+        "resizeDisk" => s.ResizeDisk(
+            p.GetProperty("packagePath").GetString()!,
+            p.GetProperty("deviceId").GetString()!,
+            p.GetProperty("newGiB").GetInt64()),
         "unlockVm" => s.UnlockVm(p.GetProperty("packagePath").GetString()!),
         "fullClone" => s.FullClone(p.GetProperty("packagePath").GetString()!, p.GetProperty("newName").GetString()!),
         "linkedClone" => s.LinkedClone(p.GetProperty("packagePath").GetString()!, p.GetProperty("snapshotUuid").GetString()!, p.GetProperty("newName").GetString()!),

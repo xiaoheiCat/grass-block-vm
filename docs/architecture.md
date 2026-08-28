@@ -71,9 +71,9 @@ NSIS 骨架：一开始整体提权一次装齐（UI + Core + Helper + QEMU + TA
 | P0 工程底座 | ✅ monorepo / 许可证 / CI / 测试基建 |
 | P1 GrassCore 核心域 | ✅ 配置迁移、原子写、vm.lock、路径规范（61 个单测覆盖） |
 | P2 磁盘/QEMU 命令 | ✅ qemu-img 事务、Profile→命令构建、启动预检（Windows 实机验证待做） |
-| P3 UI | ◐ Library/向导/设置/显示器骨架就绪；与 Core 真实数据流待 Windows 实机联调 |
+| P3 UI | ◐ Library/向导/设置/显示器骨架就绪；设置页 CPU/内存/硬盘/CD/网卡展示真实配置并可保存（关机锁定）；克隆/导出/导入入口接通；与 Core 真实数据流待 Windows 实机联调 |
 | P4 快照/克隆 | ✅ 树模型/落盘/删除重绑/链接克隆依赖/恢复回滚/完整克隆/升级保护快照；QMP 在线快照与 overlay 重写在实机阶段落地 |
-| P4b 电源/挂起 | ✅ QmpClient（greeting→capabilities→命令/事件；Windows Named Pipe/TCP/内存传输）+ ACPI 关机/强制退出/挂起（stop→migrate file:→quit）/-incoming 恢复 + 宿主指纹校验；实机联调待做 |
+| P4b 电源/挂起 | ✅ QmpClient（greeting→capabilities→命令/事件；Windows Named Pipe/TCP/内存传输）+ ACPI 关机/强制退出/挂起（stop→migrate file:→quit）/-incoming 恢复 + 宿主指纹校验 + QEMU 退出监视（清 runtime/释放锁/升级保护快照 24h 自动删除）；实机联调待做 |
 | P5 网络 | ◐ 宿主级网络资源模型 + TAP 命令生成；驱动安装/实测在 Windows 阶段 |
 | P6 导入导出 | ✅ .grassvm.zip 完整档案（关机前置/痕迹排除/zip-slip 防护）、OVF/OVA 导入（Raw 设备/阻止与仍然导入/空间预估）、OVF/OVA 导出（当前状态/VMDK 转换）；OVA 打包实测在 Windows 阶段 |
 | P7 打包发布 | ◐ NSIS 骨架；签名/驱动细节在 Windows 构建机完成 |

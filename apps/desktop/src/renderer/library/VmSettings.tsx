@@ -1,10 +1,10 @@
 /**
  * 设置页（设备化）：处理器与内存 / 硬盘 / CD/DVD / 网络 / 显示器 / 声音 / USB /
  * 共享文件夹 / 摄像头 / 麦克风 / 安全芯片。
- * 原则：界面展示 = 当前事实。运行中不可修改的设备直接锁定；不存在"待应用"。
- * 设备按添加时间稳定排序显示（磁盘 #1 / 网络 #2…编号不漂移）。
+ * 原则：界面展示 = 当前事实（getConfig 实时读取）。运行中不可修改的设备直接锁定；
+ * 不存在"待应用"。设备按添加时间稳定排序显示（磁盘 #1 / 网络 #2…编号不漂移）。
  */
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import type { VmSummary } from '../../shared/contract';
 
 const DEVICE_ORDER = [
@@ -21,9 +21,72 @@ const DEVICE_ORDER = [
   'tpm',
 ] as const;
 
+/** getConfig 返回的配置里 UI 关心的字段（C# VmConfiguration 的子集） */
+interface VmConfigView {
+  name: string;
+  osProfileId: string;
+  cpuCores: number;
+  memoryMiB: number;
+  devices: Array<{
+    deviceId: string;
+    deviceType: string;
+    path?: string;
+    sizeBytes?: number;
+    isoPath?: string | null;
+    mode?: string;
+    enabled?: boolean;
+  }>;
+}
+
+interface GrassApi {
+  coreCall<T = unknown>(method: string, params?: unknown): Promise<T>;
+}
+
+const api: GrassApi | undefined = (window as unknown as { grassvm?: GrassApi }).grassvm;
+
 export function VmSettings(props: { vm: VmSummary; onClose(): void }): React.ReactElement {
   const [selected, setSelected] = useState<(typeof DEVICE_ORDER)[number]>('cpu-memory');
   const running = props.vm.state === 'running' || props.vm.state === 'suspending';
+  const [config, setConfig] = useState<VmConfigView | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [dirty, setDirty] = useState(false);
+  const [cpu, setCpu] = useState(0);
+  const [mem, setMem] = useState(0);
+
+  useEffect(() => {
+    (async () => {
+      if (!api) return;
+      try {
+        const c = await api.coreCall<VmConfigView>('getConfig', { packagePath: props.vm.path });
+        setConfig(c);
+        setCpu(c.cpuCores);
+        setMem(c.memoryMiB);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    })();
+  }, [props.vm.path]);
+
+  const onSave = useCallback(async () => {
+    if (!api || !config) return;
+    try {
+      const next = { ...config, cpuCores: cpu, memoryMiB: mem };
+      await api.coreCall('updateConfig', {
+        packagePath: props.vm.path,
+        configJson: JSON.stringify(next),
+      });
+      setDirty(false);
+      setError(null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  }, [api, config, cpu, mem, props.vm.path]);
+
+  const hostCores = navigator.hardwareConcurrency || 8;
+  const edit = (setter: (v: number) => void) => (v: number) => {
+    setter(v);
+    setDirty(true);
+  };
 
   return (
     <div className="modal-backdrop">
@@ -39,6 +102,7 @@ export function VmSettings(props: { vm: VmSummary; onClose(): void }): React.Rea
             这台虚拟机正在运行。运行期间无法修改的设置已锁定，正常关机后即可更改。
           </div>
         )}
+        {error && <div className="banner-error">{error}</div>}
         <div className="settings-body">
           <nav className="settings-nav">
             {DEVICE_ORDER.map((d) => (
@@ -51,11 +115,33 @@ export function VmSettings(props: { vm: VmSummary; onClose(): void }): React.Rea
               </button>
             ))}
           </nav>
-          <section className="settings-pane">{renderPane(selected, running)}</section>
+          <section className="settings-pane">
+            {renderPane(selected, running, {
+              config,
+              cpu,
+              mem,
+              hostCores,
+              dirty,
+              setCpu: edit(setCpu),
+              setMem: edit(setMem),
+              onSave,
+            })}
+          </section>
         </div>
       </div>
     </div>
   );
+}
+
+interface PaneProps {
+  config: VmConfigView | null;
+  cpu: number;
+  mem: number;
+  hostCores: number;
+  dirty: boolean;
+  setCpu(v: number): void;
+  setMem(v: number): void;
+  onSave(): void;
 }
 
 function navLabel(d: (typeof DEVICE_ORDER)[number]): string {
@@ -85,29 +171,81 @@ function navLabel(d: (typeof DEVICE_ORDER)[number]): string {
   }
 }
 
-function renderPane(d: (typeof DEVICE_ORDER)[number], locked: boolean): React.ReactNode {
+function renderPane(d: (typeof DEVICE_ORDER)[number], locked: boolean, p: PaneProps): React.ReactNode {
   const lock = locked ? <p className="lock-note">🔒 运行中无法修改，正常关机后可调整。</p> : null;
   switch (d) {
     case 'cpu-memory':
       return (
         <>
           {lock}
-          <p>处理器与内存在虚拟机关机后可调整。调整后立即生效，无需重装系统。</p>
+          <label className="field">
+            处理器核心数：{p.cpu} 核（宿主共 {p.hostCores} 核）
+            <input
+              type="range"
+              min={1}
+              max={p.hostCores}
+              step={1}
+              value={p.cpu}
+              disabled={locked}
+              onChange={(e) => p.setCpu(Number(e.target.value))}
+            />
+          </label>
+          <label className="field">
+            内存：{(p.mem / 1024).toFixed(p.mem % 1024 === 0 ? 0 : 1)} GB
+            <input
+              type="range"
+              min={512}
+              max={Math.max(512, Math.floor((p.hostCores * 1024) / 2 / 512) * 512)}
+              step={512}
+              value={p.mem}
+              disabled={locked}
+              onChange={(e) => p.setMem(Number(e.target.value))}
+            />
+          </label>
+          <p className="hint">调整后立即生效，无需重装系统。</p>
+          <button className="btn-primary" disabled={locked || !p.dirty} onClick={p.onSave}>
+            保存
+          </button>
         </>
       );
     case 'disk':
       return (
         <>
           {lock}
+          {(p.config?.devices ?? [])
+            .filter((dev) => dev.deviceType === 'disk')
+            .map((dev, i) => (
+              <p key={dev.deviceId}>
+                硬盘 #{i + 1}：{((dev.sizeBytes ?? 0) / 1024 / 1024 / 1024).toFixed(0)} GB
+              </p>
+            ))}
           <p>硬盘容量只能扩大，不能缩小。扩大后需要在客户机内自行扩展分区。</p>
         </>
       );
     case 'cdrom':
-      return <p>CD/DVD 可以在运行中更换或取出镜像（即插即用）。</p>;
+      return (
+        <>
+          {(p.config?.devices ?? [])
+            .filter((dev) => dev.deviceType === 'cdrom')
+            .map((dev, i) => (
+              <p key={dev.deviceId}>
+                CD/DVD #{i + 1}：{dev.isoPath ? dev.isoPath.split(/[\\/]/).pop() : '空（无介质）'}
+              </p>
+            ))}
+          <p>CD/DVD 可以在运行中更换或取出镜像（即插即用）。</p>
+        </>
+      );
     case 'network':
       return (
         <>
           {lock}
+          {(p.config?.devices ?? [])
+            .filter((dev) => dev.deviceType === 'network')
+            .map((dev, i) => (
+              <p key={dev.deviceId}>
+                网卡 #{i + 1}：{networkModeLabel(dev.mode)}
+              </p>
+            ))}
           <p>每张网卡可独立选择：NAT（默认，开箱即用）/ 桥接 / Host-only / 断开。</p>
         </>
       );
@@ -116,7 +254,7 @@ function renderPane(d: (typeof DEVICE_ORDER)[number], locked: boolean): React.Re
     case 'audio':
       return <p>声音默认开启，底层输出自动选择。</p>;
     case 'usb':
-      return <p>宿主 USB 设备从显示器窗口的设备栏"连接到此虚拟机"，运行中即可操作。</p>;
+      return <p>宿主 USB 设备从显示器窗口的设备栏“连接到此虚拟机”，运行中即可操作。</p>;
     case 'sharedFolder':
       return (
         <>
@@ -130,6 +268,21 @@ function renderPane(d: (typeof DEVICE_ORDER)[number], locked: boolean): React.Re
       return <p>麦克风默认关闭；启用后由这台虚拟机独占使用。</p>;
     case 'tpm':
       return <p>安全芯片（TPM 2.0）：Windows 11 虚拟机默认开启。</p>;
+  }
+}
+
+function networkModeLabel(mode?: string): string {
+  switch (mode) {
+    case 'nat':
+      return 'NAT（默认）';
+    case 'bridged':
+      return '桥接';
+    case 'hostOnly':
+      return 'Host-only';
+    case 'none':
+      return '断开';
+    default:
+      return mode ?? '未知';
   }
 }
 

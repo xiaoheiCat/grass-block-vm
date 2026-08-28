@@ -164,4 +164,88 @@ public class SuspendResumeServiceTests : IDisposable
         Assert.Throws<GrassCoreException>(() => service.StartVm(vmPath));
         Assert.False(File.Exists(pkg.LockPath)); // 拒绝发生在获取锁之前，不留残留锁
     }
+
+    [Fact]
+    public void QemuProcessExit_ReleasesLockAndClearsRuntime()
+    {
+        using var fakeQmp = new FakeQmpServer();
+        fakeQmp.OnCommand = (_, _) => Task.FromResult("""{"return":{}}""");
+        var acceptTask = fakeQmp.AcceptAsync();
+        var launcher = new RecordingLauncher();
+        using var db = new HostDb(Path.Combine(_dir, "grass.db"));
+        var root = Path.Combine(_dir, "root3");
+        Directory.CreateDirectory(root);
+        db.SetPreference("libraryRoot", root);
+        Directory.CreateDirectory(Path.Combine(_dir, "fw"));
+
+        var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(),
+            Path.Combine(_dir, "fw"), "11", launcher,
+            qmpTransportFactory: _ => new TcpTransport("127.0.0.1", fakeQmp.Port));
+
+        var vmPath = ((GrassCoreService.CreateVmResult)service.CreateVm(System.Text.Json.JsonSerializer.SerializeToElement(new
+        {
+            name = "退出监视", profileId = "ubuntu", diskGiB = 8, isoPath = (string?)null,
+            cpuCores = 1, memoryMiB = 1024, startAfterCreate = false,
+        }))).Path;
+        var pkg = new GrassVm.GrassVmPackage(vmPath);
+        service.StartVm(vmPath);
+        Assert.True(File.Exists(pkg.LockPath));
+        Assert.True(File.Exists(pkg.SessionPath));
+
+        // 客户机内关机 / ACPI 关机最终都表现为 QEMU 进程退出：这里直接结束假进程
+        var session = RuntimeSession.Deserialize(File.ReadAllText(pkg.SessionPath));
+        Process.GetProcessById(session.QemuPid).Kill();
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (File.Exists(pkg.LockPath) && DateTime.UtcNow < deadline)
+            Thread.Sleep(50);
+
+        // 干净关机记账：vm.lock 释放、runtime/ 清空、不再显示运行中
+        Assert.False(File.Exists(pkg.LockPath));
+        Assert.Empty(Directory.EnumerateFiles(pkg.RuntimePath));
+        Assert.Equal("stopped", service.ScanLibrary().Vms.Single(v => v.Path == vmPath).State);
+    }
+
+    [Fact]
+    public void UpdateConfig_ClampsValuesAndRejectsWhileRunning()
+    {
+        using var fakeQmp = new FakeQmpServer();
+        fakeQmp.OnCommand = (_, _) => Task.FromResult("""{"return":{}}""");
+        var acceptTask = fakeQmp.AcceptAsync();
+        var launcher = new RecordingLauncher();
+        using var db = new HostDb(Path.Combine(_dir, "grass.db"));
+        var root = Path.Combine(_dir, "root4");
+        Directory.CreateDirectory(root);
+        db.SetPreference("libraryRoot", root);
+        Directory.CreateDirectory(Path.Combine(_dir, "fw"));
+
+        var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(),
+            Path.Combine(_dir, "fw"), "11", launcher,
+            qmpTransportFactory: _ => new TcpTransport("127.0.0.1", fakeQmp.Port));
+
+        var vmPath = ((GrassCoreService.CreateVmResult)service.CreateVm(System.Text.Json.JsonSerializer.SerializeToElement(new
+        {
+            name = "设置钳制", profileId = "ubuntu", diskGiB = 8, isoPath = (string?)null,
+            cpuCores = 1, memoryMiB = 1024, startAfterCreate = false,
+        }))).Path;
+        var pkg = new GrassVm.GrassVmPackage(vmPath);
+
+        // 超范围值被钳制到安全范围（消费级产品：宁钳制不拒绝）
+        var json = (string)service.GetConfig(vmPath)!;
+        var node = System.Text.Json.Nodes.JsonNode.Parse(json)!.AsObject();
+        node["cpuCores"] = 9999;
+        node["memoryMiB"] = 16;
+        service.UpdateConfig(vmPath, node.ToJsonString());
+        var after = new Config.ConfigStore(pkg).Load();
+        Assert.Equal(Math.Min(9999, Environment.ProcessorCount), after.CpuCores);
+        Assert.True(after.MemoryMiB >= 512);
+
+        // 非法名称拒绝
+        node["name"] = "";
+        Assert.Throws<GrassCoreException>(() => service.UpdateConfig(vmPath, node.ToJsonString()));
+
+        // 运行中拒绝修改（唯一例外 CD/DVD 走 changeMedium）
+        service.StartVm(vmPath);
+        Assert.Throws<GrassCoreException>(() => service.UpdateConfig(vmPath, json));
+    }
 }

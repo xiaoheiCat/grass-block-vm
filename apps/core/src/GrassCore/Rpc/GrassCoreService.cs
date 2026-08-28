@@ -212,6 +212,7 @@ public sealed class GrassCoreService
         var vm = new RunningVm(pkg.Path, session, proc);
         vm.Qmp = TryConnectQmp(session.QmpPipe);
         _running[pkg.Path] = vm;
+        WatchQemuProcess(vm);
         return new { qemuPid = proc.Id, qmpPipe = cmd.QmpPipeName, sessionId };
     }
 
@@ -260,12 +261,57 @@ public sealed class GrassCoreService
             var vm = new RunningVm(pkg.Path, session, proc);
             vm.Qmp = TryConnectQmp(session.QmpPipe);
             _running[pkg.Path] = vm;
+            WatchQemuProcess(vm);
             return new { qemuPid = proc.Id, resumed = true };
         }
         catch
         {
             new VmLock(pkg).Release();
             throw;
+        }
+    }
+
+    /// <summary>
+    /// QEMU 进程退出监视：ACPI 关机/quit/客户机内关机最终都表现为进程退出。
+    /// 在这里做干净关机记账：清空 runtime/、释放 vm.lock、
+    /// 升级保护快照满 24 小时后自动删除（§22.3）。
+    /// </summary>
+    private void WatchQemuProcess(RunningVm vm)
+    {
+        vm.Process.EnableRaisingEvents = true;
+        vm.Process.Exited += (_, _) =>
+        {
+            try
+            {
+                if (!_running.Remove(vm.PackagePath, out var removed)) return; // 已被挂起/强制路径处理
+                removed.Qmp?.Dispose();
+                var pkg = new GrassVmPackage(vm.PackagePath);
+                TryDeleteExpiredUpgradeProtection(pkg);
+                // 正常退出路径：清空 runtime/ 并删除 vm.lock
+                if (Directory.Exists(pkg.RuntimePath))
+                    foreach (var f in Directory.EnumerateFiles(pkg.RuntimePath)) File.Delete(f);
+                new VmLock(pkg).Release();
+            }
+            catch
+            {
+                // 监视失败不影响 QEMU 已退出的事实；下次启动预检会给出残留锁诊断
+            }
+        };
+    }
+
+    /// <summary>升级保护快照：跨版本首次正常关机后保留至少 24 小时，之后自动删除。</summary>
+    private static void TryDeleteExpiredUpgradeProtection(GrassVmPackage pkg)
+    {
+        try
+        {
+            var tree = SnapshotService.LoadTree(pkg);
+            var expired = tree.All.Where(s =>
+                SnapshotPlanner.ShouldDeleteUpgradeProtection(s, DateTimeOffset.Now, cleanShutdown: true));
+            foreach (var s in expired) SnapshotService.Delete(pkg, s.Uuid);
+        }
+        catch
+        {
+            // 快照树异常时保守保留（宁可多占空间不可丢用户数据）
         }
     }
 
@@ -366,6 +412,92 @@ public sealed class GrassCoreService
         cd.IsoPath = isoPath is null ? null : PathPolicy.NormalizeReference(pkg, resolved!);
         new ConfigStore(pkg).Save(config);
         return new { changed = true };
+    }
+
+    // ---------- 设置（界面展示 = 当前事实）----------
+
+    /// <summary>读取完整配置（设置页数据源）。</summary>
+    public object GetConfig(string packagePath)
+    {
+        var pkg = new GrassVmPackage(packagePath);
+        var config = new ConfigStore(pkg).LoadAndUpgrade();
+        return ConfigJson.Serialize(config);
+    }
+
+    /// <summary>
+    /// 保存配置：仅关机状态允许（运行中唯一可改的是 CD/DVD，走 changeMedium）。
+    /// 值域钳制：CPU 1..宿主核数，内存 512MB..宿主一半，磁盘/设备数量上限。
+    /// </summary>
+    public object UpdateConfig(string packagePath, string configJson)
+    {
+        var pkg = new GrassVmPackage(packagePath);
+        if (_running.ContainsKey(pkg.Path))
+            throw new GrassCoreException("虚拟机正在运行，关机后才能修改设置。");
+        if (File.Exists(pkg.LockPath))
+            throw new GrassCoreException("虚拟机被锁定（可能异常退出残留）。请先在详情中解除锁定。");
+
+        VmConfiguration config;
+        try
+        {
+            config = ConfigJson.Deserialize(configJson);
+        }
+        catch (Exception e)
+        {
+            throw new GrassCoreException("配置格式不正确：" + e.Message);
+        }
+        if (config.SchemaVersion != VmConfiguration.CurrentSchemaVersion)
+            throw new GrassCoreException($"配置版本不受支持（{config.SchemaVersion}），请用新版应用打开。");
+
+        // 钳制到安全范围（宁可钳制不可拒绝——消费级产品原则）
+        config.CpuCores = Math.Clamp(config.CpuCores, 1, Math.Max(1, Environment.ProcessorCount));
+        var maxMem = Math.Max(512, (int)(GetTotalHostMemoryMiB() / 2));
+        config.MemoryMiB = Math.Clamp(config.MemoryMiB, 512, maxMem);
+        if (string.IsNullOrWhiteSpace(config.Name)) throw new GrassCoreException("虚拟机名称不能为空。");
+        if (config.Name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+            throw new GrassCoreException("名称包含文件系统不允许的字符。");
+        if (config.Devices.Count > 16)
+            throw new GrassCoreException("设备数量超出上限（16）。");
+
+        new ConfigStore(pkg).Save(config);
+        return new { saved = true, cpuCores = config.CpuCores, memoryMiB = config.MemoryMiB };
+    }
+
+    private static long GetTotalHostMemoryMiB()
+    {
+        try
+        {
+            if (OperatingSystem.IsWindows())
+            {
+                using var searcher = new System.Management.ManagementObjectSearcher(
+                    "SELECT TotalVisibleMemorySize FROM Win32_OperatingSystem");
+                var row = searcher.Get().Cast<System.Management.ManagementBaseObject>().First();
+                return Convert.ToInt64(row["TotalVisibleMemorySize"]) / 1024;
+            }
+        }
+        catch { /* WMI 不可用时退回保守默认 */ }
+        return 8 * 1024; // 8 GB 保守值
+    }
+
+    /// <summary>扩容硬盘（只能扩大；qemu-img resize 事务化执行 + 魔数校验保持链完整）。</summary>
+    public object ResizeDisk(string packagePath, string deviceId, long newGiB)
+    {
+        var pkg = new GrassVmPackage(packagePath);
+        if (_running.ContainsKey(pkg.Path))
+            throw new GrassCoreException("虚拟机正在运行，关机后才能修改硬盘容量。");
+        var config = new ConfigStore(pkg).Load();
+        var disk = config.Devices.OfType<DiskDevice>().SingleOrDefault(d => d.DeviceId == deviceId)
+                   ?? throw new GrassCoreException("找不到这块硬盘。");
+        var newSize = newGiB * 1024L * 1024 * 1024;
+        if (newSize <= disk.SizeBytes)
+            throw new GrassCoreException("硬盘容量只能扩大，不能缩小。");
+        if (disk.IsExternal)
+            throw new GrassCoreException("这块硬盘在虚拟机包外部，请先在文件管理器中处理。");
+
+        var diskOps = new TransactionalDiskOps(_qemuImgPath);
+        diskOps.ResizeQcow2Async(PathPolicy.Resolve(pkg, disk.Path), newSize).GetAwaiter().GetResult();
+        disk.SizeBytes = newSize;
+        new ConfigStore(pkg).Save(config);
+        return new { resized = true, sizeGiB = newGiB };
     }
 
     // ---------- 克隆 ----------
