@@ -56,6 +56,7 @@ pnpm install
 pnpm build          # 全部构建（UI typecheck+build、Core build）
 pnpm test           # 全部测试（Core: dotnet test；UI: vitest）
 pnpm dev            # 一键开发启动（Electron + Vite）
+pnpm core:test      # 仅 Core 测试
 ```
 
 `.NET SDK` 如未安装，可装到仓库本地（不入库）：
@@ -64,7 +65,11 @@ pnpm dev            # 一键开发启动（Electron + Vite）
 curl -fsSL https://dot.net/v1/dotnet-install.sh -o dotnet-install.sh
 ./dotnet-install.sh --channel LTS --install-dir "$PWD/.dotnet"
 export PATH="$PWD/.dotnet:$PATH"
+# dotnet CLI 写 ~/.dotnet 受限时：
+export DOTNET_CLI_HOME="$PWD/.dotnet-home" NUGET_PACKAGES="$PWD/.nuget"
 ```
+
+开发机（非 Windows）调试 GrassCore：`dotnet run --project apps/core/src/GrassCore` 走 stdio JSON-RPC（4 字节小端长度前缀 + JSON），用 `GRASSCORE_QEMU_DIR` / `GRASSCORE_OVMF_DIR` / `GRASSCORE_QEMU_MAJOR` 环境变量指向假 QEMU 目录即可全链路驱动（创建/快照/克隆/导入导出/挂起恢复均有单测与假件覆盖）。
 
 ## 平台边界（1.0）
 
