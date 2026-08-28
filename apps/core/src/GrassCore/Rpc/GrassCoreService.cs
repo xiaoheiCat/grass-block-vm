@@ -218,7 +218,8 @@ public sealed class GrassCoreService
             {
                 var plan = UpgradeProtection.CreatePlan(pkg, state.LastQemuMajor!, _bundledQemuMajor);
                 UpgradeProtection.BackupMetadata(pkg, plan.MetadataBackupDir);
-                SnapshotService.Create(pkg, config, name: "升级保护快照", isUpgradeProtection: true);
+                SnapshotService.Create(pkg, config, name: "升级保护快照", isUpgradeProtection: true,
+                    diskOps: new Qemu.TransactionalDiskOps(_qemuImgPath));
             }
 
             var sessionId = Guid.NewGuid().ToString("N")[..12];
@@ -298,6 +299,19 @@ public sealed class GrassCoreService
 
         if (_running.ContainsKey(pkg.Path))
             throw new GrassCoreException("此虚拟机已经在运行。");
+
+        // 与 StartVm 同一套预检：挂起恢复同样要磁盘/固件在位，否则 QEMU 秒退、
+        // 用户只看到"恢复没反应"（标记被保守保留，卡片永远停在已挂起）
+        var view = ToConfigView(config);
+        var problems = StartupPreflight.Check(pkg, view);
+        if (problems.Any(p => p.Fatal))
+            throw new GrassCoreException(string.Join("\n", problems.Where(p => p.Fatal).Select(p => p.UserMessage)));
+        if (OperatingSystem.IsWindows())
+        {
+            var whpx = WhpxCapability.CheckWindows();
+            if (!whpx.Available)
+                throw new GrassCoreException($"此电脑无法使用硬件虚拟化（WHPX）：{whpx.UserGuidance}");
+        }
 
         var @lock = new VmLock(pkg);
         @lock.Acquire();
@@ -444,6 +458,26 @@ public sealed class GrassCoreService
                 var proc = Process.GetProcessById(session.QemuPid);
                 var vm = new RunningVm(pkg.Path, session, proc);
                 vm.Qmp = TryConnectQmp(session.QmpPipe);
+                // 挂起标记 + 活着的 QEMU = 上次 Core 在"标记已落盘、quit 未送达"窗口崩溃。
+                // 原进程仍握有完整状态：直接 cont 让它继续跑，清掉标记并回收 suspend.state
+                // （否则库列表显示"已挂起"，之后"恢复"会把旧内存重放到已前进的磁盘上）。
+                var staleState = VmState.Load(pkg);
+                if (staleState.SuspendedStatePath is not null)
+                {
+                    try
+                    {
+                        vm.Qmp?.ExecuteAsync("cont").GetAwaiter().GetResult();
+                        var suspendFile = PathPolicy.Resolve(pkg, staleState.SuspendedStatePath);
+                        staleState.SuspendedStatePath = null;
+                        staleState.SuspendFingerprint = null;
+                        staleState.Save(pkg);
+                        if (File.Exists(suspendFile)) File.Delete(suspendFile);
+                    }
+                    catch
+                    {
+                        // cont 不可达：保守保留标记（用户仍可从 suspend.state 恢复）
+                    }
+                }
                 _running[pkg.Path] = vm;
                 WatchQemuProcess(vm);
                 adopted.Add(pkg.Path);
@@ -867,7 +901,7 @@ public sealed class GrassCoreService
         var pkg = new GrassVmPackage(packagePath);
         EnsureStoppedForMutation(pkg);
         var plan = SnapshotPlanner.PlanRestore(SnapshotService.LoadTree(pkg), uuid);
-        SnapshotService.Restore(pkg, uuid);
+        SnapshotService.Restore(pkg, uuid, new Qemu.TransactionalDiskOps(_qemuImgPath));
         return new { restored = uuid, warnings = plan.Warnings };
     }
 
@@ -888,7 +922,7 @@ public sealed class GrassCoreService
     {
         var pkg = new GrassVmPackage(packagePath);
         EnsureStoppedForMutation(pkg);
-        SnapshotService.Delete(pkg, uuid);
+        SnapshotService.Delete(pkg, uuid, new Qemu.TransactionalDiskOps(_qemuImgPath));
         return new { deleted = uuid };
     }
 
@@ -949,6 +983,23 @@ public sealed class QemuProcessLauncher(string qemuSystemPath) : IQemuProcessLau
             RedirectStandardError = true,
         };
         foreach (var a in cmd.Args) psi.ArgumentList.Add(a);
-        return Process.Start(psi) ?? throw new GrassCoreException("无法启动 QEMU。");
+        var proc = Process.Start(psi) ?? throw new GrassCoreException("无法启动 QEMU。");
+        // QEMU stderr → logs/qemu.log：诊断早期退出（WHPX 初始化失败/固件缺失等）的唯一线索；
+        // 同时持续排水，避免输出塞满管道把 QEMU 卡死
+        try
+        {
+            var logDir = System.IO.Path.Combine(cmd.PackageRoot ?? ".", GrassVmPackage.LogsDir);
+            Directory.CreateDirectory(logDir);
+            var logPath = System.IO.Path.Combine(logDir, "qemu.log");
+            proc.OutputDataReceived += (_, e) => { if (e.Data is not null) File.AppendAllText(logPath, e.Data + "\n"); };
+            proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) File.AppendAllText(logPath, e.Data + "\n"); };
+            proc.BeginOutputReadLine();
+            proc.BeginErrorReadLine();
+        }
+        catch
+        {
+            // 日志失败不影响 QEMU 运行
+        }
+        return proc;
     }
 }

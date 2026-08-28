@@ -34,6 +34,7 @@ public class CloneExportTests : IDisposable
         var sh = Path.Combine(Path.GetTempPath(), "fake-qemu-img-" + Guid.NewGuid().ToString("N"));
         File.WriteAllText(sh, """
             #!/bin/sh
+            case "$1" in commit|rebase) exit 0;; esac
             target=$(printf '%s\n' "$@" | grep -E '\.(qcow2|vmdk)' | tail -1)
             case "$target" in
               *vmdk*) printf '# Disk DescriptorFile\nfake-vmdk' > "$target" ;;

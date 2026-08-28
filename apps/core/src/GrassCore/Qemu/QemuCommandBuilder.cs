@@ -9,6 +9,8 @@ namespace GrassCore.Qemu;
 public sealed record QemuCommandLine
 {
     public required IReadOnlyList<string> Args { get; init; }
+    /// <summary>包根目录（日志/会话产物定位用；可为空以兼容单测）。</summary>
+    public string? PackageRoot { get; init; }
     /// <summary>本次会话的 QMP Windows Named Pipe（\\.\pipe\grassvm-qmp-&lt;sessionId&gt;）。</summary>
     public required string QmpPipeName { get; init; }
     /// <summary>SPICE 服务绑定 127.0.0.1，端口由 QEMU 自动分配（port=0），经 QMP query-spice 查询。</summary>
@@ -76,7 +78,7 @@ public sealed class QemuCommandBuilder
         // QMP：Windows Named Pipe（-mon mode=control）。Core 崩溃后凭 session.json + 此管道无损接管。
         var qmpPipe = $@"\\.\pipe\grassvm-qmp-{sessionId}";
         args.AddRange(new[] { "-chardev", $"pipe,id=qmpchar,name={qmpPipe}", "-mon", "chardev=qmpchar,mode=control" });
-        return new QemuCommandLine { Args = args, QmpPipeName = qmpPipe };
+        return new QemuCommandLine { Args = args, QmpPipeName = qmpPipe, PackageRoot = packageRoot };
     }
 
     private void AddFirmware(List<string> args, string packageRoot)
@@ -160,23 +162,20 @@ public sealed class QemuCommandBuilder
             {
                 var id = "net" + net.CreatedOrder;
                 var mac = string.IsNullOrEmpty(net.MacAddress) ? DeriveMac(net.DeviceId) : net.MacAddress;
+                // "断开"= 不生成任何网络参数（QEMU 没有 none 后端；-netdev none 是非法参数，
+                // 会让 QEMU 初始化即退出）。设备保留在配置里，用户随时可以再接上。
                 if (net.Mode == NetworkMode.Disconnected)
+                    break;
+                var netdev = net.Mode switch
                 {
-                    args.AddRange(new[] { "-netdev", $"none,id={id}" });
-                }
-                else
-                {
-                    var netdev = net.Mode switch
-                    {
-                        NetworkMode.Nat => $"user,id={id}",
-                        // 桥接 / Host-only：TAP-Windows6 适配器（安装器已部署 Grass Block VM Virtual Ethernet Adapter）
-                        // 桥接目标宿主网卡默认"自动选择"，用户可手动指定；该选择保存在宿主级配置中
-                        NetworkMode.Bridged => $"tap,id={id},ifname={TapName(net)},script=no,downscript=no",
-                        NetworkMode.HostOnly => $"tap,id={id},ifname={TapName(net)},script=no,downscript=no",
-                        _ => throw new InvalidOperationException(),
-                    };
-                    args.AddRange(new[] { "-netdev", netdev });
-                }
+                    NetworkMode.Nat => $"user,id={id}",
+                    // 桥接 / Host-only：TAP-Windows6 适配器（安装器已部署 Grass Block VM Virtual Ethernet Adapter）
+                    // 桥接目标宿主网卡默认"自动选择"，用户可手动指定；该选择保存在宿主级配置中
+                    NetworkMode.Bridged => $"tap,id={id},ifname={TapName(net)},script=no,downscript=no",
+                    NetworkMode.HostOnly => $"tap,id={id},ifname={TapName(net)},script=no,downscript=no",
+                    _ => throw new InvalidOperationException(),
+                };
+                args.AddRange(new[] { "-netdev", netdev });
                 var model = _profile.Nic switch
                 {
                     NicModel.E1000 => "e1000",       // Windows 安装程序原生可识别

@@ -40,22 +40,34 @@ public static class SnapshotService
                 .OrderByDescending(s => s.CreatedAt).FirstOrDefault();
         snap.ParentSnapshotUuid = parent?.Uuid;
 
-        // 每个"包内"磁盘设备生成 overlay（包外磁盘不参与数据回滚）。
-        // overlay 落在 snapshots/<uuid>/disks/，backing = 当前工作盘文件；
-        // 链接克隆与恢复都以它为锚点，所以必须在创建快照时真实生成（不是只登记引用）。
+        // 冻结语义（外部 QCOW2 overlay 链，与 config 里的稳定工作路径配合）：
+        //   1. 把【当前工作盘文件】移动进 snapshots/<uuid>/disks/ —— 它成为冻结点；
+        //   2. 在原路径创建指向冻结点的全新 overlay —— 客户机继续写这个新文件，
+        //      冻结点从此只读、永不再变；
+        //   3. config 的 disk.Path 不变（恢复/克隆/启动都引用稳定路径）。
+        // 这样每个快照都是真实的"时间点"：读取走 overlay 链，写到链头。
         foreach (var disk in config.DevicesOfType<DiskDevice>().Where(d => !d.IsExternal))
         {
-            var overlayRel = $"disks/disk-{disk.DeviceId}.qcow2";
-            snap.DiskOverlayRefs[disk.DeviceId] = overlayRel;
+            var frozenRel = $"disks/disk-{disk.DeviceId}.qcow2";
+            snap.DiskOverlayRefs[disk.DeviceId] = frozenRel;
             if (diskOps is not null)
             {
-                var overlayAbs = System.IO.Path.Combine(package.SnapshotsPath, snap.Uuid, overlayRel.Replace('/', System.IO.Path.DirectorySeparatorChar));
-                Directory.CreateDirectory(System.IO.Path.GetDirectoryName(overlayAbs)!);
-                var backingAbs = GrassCore.GrassVm.PathPolicy.Resolve(package, disk.Path);
-                if (File.Exists(backingAbs))
-                    diskOps.CreateOverlay(backingAbs, overlayAbs);
+                var frozenAbs = System.IO.Path.Combine(package.SnapshotsPath, snap.Uuid,
+                    frozenRel.Replace('/', System.IO.Path.DirectorySeparatorChar));
+                var activeAbs = GrassCore.GrassVm.PathPolicy.Resolve(package, disk.Path);
+                if (File.Exists(activeAbs))
+                {
+                    Directory.CreateDirectory(System.IO.Path.GetDirectoryName(frozenAbs)!);
+                    File.Move(activeAbs, frozenAbs);
+                    // 相对引用：包整体迁移（导出/导入/复制）后链依然完整
+                    diskOps.CreateOverlay(frozenAbs, activeAbs, relativeBacking: true); // 原路径的新工作 overlay
+                }
             }
         }
+        // UEFI 变量也是"时间点"的一部分（启动顺序、安全启动密钥状态）——一并冻结
+        var activeVars = System.IO.Path.Combine(package.FirmwarePath, "VARS.fd");
+        if (File.Exists(activeVars))
+            File.Copy(activeVars, System.IO.Path.Combine(package.SnapshotsPath, snap.Uuid, "VARS.fd"));
         WriteSnapshot(package, snap);
         // 新快照成为当前工作位置
         state.CurrentSnapshotUuid = snap.Uuid;
@@ -111,42 +123,135 @@ public static class SnapshotService
     /// <summary>
     /// 恢复：硬件配置 + 外部资源路径引用一起回滚；当前未快照工作状态丢弃（调用方已警告）。
     /// </summary>
-    public static void Restore(GrassVmPackage package, string uuid)
+    public static void Restore(GrassVmPackage package, string uuid,
+        GrassCore.Qemu.TransactionalDiskOps? diskOps = null)
     {
         var tree = LoadTree(package);
         var snap = tree.Get(uuid);
         var restored = ConfigJson.Deserialize(snap.FullConfigSnapshot);
+        // 磁盘先行（物理操作成功后再改元数据——失败时树仍是旧世界的诚实描述）：
+        // 丢弃当前工作 overlay（未快照的更改，调用方已警告），在快照冻结点上开全新 overlay。
+        if (diskOps is not null)
+        {
+            foreach (var (deviceId, frozenRel) in snap.DiskOverlayRefs)
+            {
+                var frozenAbs = System.IO.Path.Combine(package.SnapshotsPath, uuid,
+                    frozenRel.Replace('/', System.IO.Path.DirectorySeparatorChar));
+                if (!File.Exists(frozenAbs)) continue; // 元数据先行时代的快照：保留只回滚配置
+                var activeAbs = GrassCore.GrassVm.PathPolicy.Resolve(package, restoredDiskPath(restored, deviceId));
+                if (string.Equals(activeAbs, frozenAbs, StringComparison.OrdinalIgnoreCase)) continue;
+                File.Delete(activeAbs); // 工作链头（其内容属于"未快照的更改"）
+                diskOps.CreateOverlay(frozenAbs, activeAbs, relativeBacking: true);
+            }
+            var frozenVars = System.IO.Path.Combine(package.SnapshotsPath, uuid, "VARS.fd");
+            if (File.Exists(frozenVars))
+                File.Copy(frozenVars, System.IO.Path.Combine(package.FirmwarePath, "VARS.fd"), overwrite: true);
+        }
         new ConfigStore(package).Save(restored);
         // 恢复后工作位置 = 该快照（之后创建的快照是它的孩子）
         var state = VmState.Load(package);
         state.CurrentSnapshotUuid = uuid;
         state.Save(package);
-        // 磁盘 overlay 切换：当前工作 overlay 重定向到快照 overlay（qemu-img rebase / 事务重写），
-        // 在 Windows 实机联调阶段与 qemu-img blockcommit 序列对齐。
     }
 
-    /// <summary>删除快照。无链接克隆依赖 → 重绑后代；有依赖 → 已由调用方列出受影响链接克隆并获用户确认。</summary>
-    public static void Delete(GrassVmPackage package, string uuid)
+    private static string restoredDiskPath(VmConfiguration config, string deviceId) =>
+        config.Devices.OfType<DiskDevice>().FirstOrDefault(d => d.DeviceId == deviceId)?.Path
+        ?? throw new GrassCoreException($"快照引用了未知的磁盘设备（{deviceId}）。");
+
+    /// <summary>
+    /// 删除快照。物理链维护（磁盘先行、元数据最后）：
+    ///   有父：被删层 commit 并入父冻结点，其后代（孩子冻结文件 + 当前工作 overlay）rebase 到父；
+    ///   无父（链根基座）：冻结文件是所有后代的物理基座——只删元数据，物理文件保留
+    ///   （"删除链根"= 忘掉这个检查点，磁盘内容当然还在）。
+    /// 有链接克隆依赖时由调用方列出并获用户确认。
+    /// </summary>
+    public static void Delete(GrassVmPackage package, string uuid,
+        GrassCore.Qemu.TransactionalDiskOps? diskOps = null)
     {
         var tree = LoadTree(package);
+        var deleted = tree.Get(uuid);
         var plan = SnapshotPlanner.PlanDelete(tree, uuid, FindLinkedCloneReferences(package));
+        var state = VmState.Load(package);
+        var positionWasHere = state.CurrentSnapshotUuid == uuid;
+        var parentUuid = deleted.ParentSnapshotUuid;
+        var dir = System.IO.Path.Combine(package.SnapshotsPath, uuid);
+
+        if (diskOps is not null)
+        {
+            foreach (var (deviceId, frozenRel) in deleted.DiskOverlayRefs)
+            {
+                var frozenAbs = System.IO.Path.Combine(package.SnapshotsPath, uuid,
+                    frozenRel.Replace('/', System.IO.Path.DirectorySeparatorChar));
+                if (!File.Exists(frozenAbs)) continue;
+                var parentFrozen = parentUuid is null ? null : FrozenPath(package, tree.Get(parentUuid), deviceId);
+
+                // 直接依赖者 = 孩子快照的冻结文件 + （位置在被删快照时的）工作 overlay
+                var dependents = new List<string>();
+                foreach (var childUuid in tree.ChildrenOf(uuid).Select(c => c.Uuid))
+                {
+                    var p = FrozenPathOrNull(package, tree.Get(childUuid), deviceId);
+                    if (p is not null && File.Exists(p)) dependents.Add(p);
+                }
+                if (positionWasHere)
+                {
+                    var config = new ConfigStore(package).Load();
+                    var active = GrassCore.GrassVm.PathPolicy.Resolve(package,
+                        config.Devices.OfType<DiskDevice>().First(d => d.DeviceId == deviceId).Path);
+                    if (File.Exists(active)) dependents.Add(active);
+                }
+
+                if (parentFrozen is not null && File.Exists(parentFrozen))
+                {
+                    // 被删层先并入父（客户机可见内容不变），后代改挂父
+                    diskOps.CommitOverlay(frozenAbs);
+                    foreach (var dep in dependents)
+                        if (!string.Equals(dep, frozenAbs, StringComparison.OrdinalIgnoreCase))
+                            diskOps.RebaseOverlay(dep, parentFrozen, relativeBacking: true);
+                }
+                else
+                {
+                    // 链根基座：物理文件必须保留（后代 overlay 的 backing），只做元数据删除
+                }
+            }
+        }
+
         foreach (var (childUuid, newParent) in plan.Rebindings)
         {
             var child = tree.Get(childUuid);
             child.ParentSnapshotUuid = newParent == "__root__" ? null : newParent;
             WriteSnapshot(package, child);
         }
-        var dir = System.IO.Path.Combine(package.SnapshotsPath, uuid);
-        if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true);
-        // 当前位置被删除 → 位置回到其父（保持"下一步快照挂哪"有确定答案）
-        var state = VmState.Load(package);
-        if (state.CurrentSnapshotUuid == uuid)
+
+        // 物理目录：链根保留 disks/（仍是后代的基座），其余整目录删除
+        if (Directory.Exists(dir))
         {
-            var deleted = tree.Get(uuid);
-            state.CurrentSnapshotUuid = deleted.ParentSnapshotUuid;
+            if (parentUuid is null)
+            {
+                foreach (var f in Directory.EnumerateFiles(dir))
+                    if (!f.Contains("disks")) File.Delete(f);
+            }
+            else
+            {
+                Directory.Delete(dir, recursive: true);
+            }
+        }
+
+        // 当前位置被删除 → 位置回到其父（保持"下一步快照挂哪"有确定答案）
+        if (positionWasHere)
+        {
+            state.CurrentSnapshotUuid = parentUuid;
             state.Save(package);
         }
     }
+
+    private static string FrozenPath(GrassVmPackage package, Snapshot snap, string deviceId) =>
+        FrozenPathOrNull(package, snap, deviceId)
+        ?? throw new GrassCoreException($"快照 {snap.Uuid} 缺少磁盘 {deviceId} 的冻结文件记录。");
+
+    private static string? FrozenPathOrNull(GrassVmPackage package, Snapshot snap, string deviceId) =>
+        snap.DiskOverlayRefs.TryGetValue(deviceId, out var rel)
+            ? System.IO.Path.Combine(package.SnapshotsPath, snap.Uuid, rel.Replace('/', System.IO.Path.DirectorySeparatorChar))
+            : null;
 
     /// <summary>扫描 Library Root 找出以此包内快照为基线的链接克隆（子 VM 的 cloneInfo 引用）。</summary>
     public static List<LinkedCloneReference> FindLinkedCloneReferences(GrassVmPackage parentPackage)

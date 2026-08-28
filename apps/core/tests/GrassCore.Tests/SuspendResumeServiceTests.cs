@@ -44,6 +44,7 @@ public class SuspendResumeServiceTests : IDisposable
         var sh = Path.Combine(_dir, "qemu-img");
         File.WriteAllText(sh, """
             #!/bin/sh
+            case "$1" in commit|rebase) exit 0;; esac
             target=$(printf '%s\n' "$@" | grep -E '\.(qcow2|vmdk)' | tail -1)
             printf 'QFI\373' > "$target"
             """);

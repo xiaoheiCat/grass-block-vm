@@ -45,6 +45,7 @@ public class QemuImgTransactionTests : IDisposable
               *crash-mode*) exit 1 ;;
               *slow-mode*) sleep 30 ;;
             esac
+            case "$1" in commit|rebase) exit 0;; esac
             target=$(printf '%s\n' "$@" | grep -E '\.(qcow2|vmdk)' | tail -1)
             case "$target" in
               *vmdk*) printf '# Disk DescriptorFile\nfake-vmdk' > "$target" ;;

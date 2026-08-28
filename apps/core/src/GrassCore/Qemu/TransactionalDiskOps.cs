@@ -88,14 +88,60 @@ public sealed class TransactionalDiskOps
     /// backing 使用绝对路径引用；失败的产物照旧走 .grass-tmp 清理。
     /// </summary>
     public void CreateOverlay(string backingFile, string overlayPath)
+        => CreateOverlay(backingFile, overlayPath, relativeBacking: false);
+
+    /// <param name="relativeBacking">
+    /// true = backing 以 overlay 自身位置的相对路径写入（QEMU 按此解析）。
+    /// 快照链必须用相对引用：包整体复制/导出导入到别的机器后链依然完整。
+    /// 链接克隆保持绝对引用（backing 在另一个包里，本就不可迁移）。
+    /// </param>
+    public void CreateOverlay(string backingFile, string overlayPath, bool relativeBacking)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(overlayPath)!);
+        var backing = relativeBacking
+            ? Path.GetRelativePath(Path.GetDirectoryName(Path.GetFullPath(overlayPath))!, Path.GetFullPath(backingFile))
+            : backingFile;
         var tmp = overlayPath + TempSuffix;
         DeleteIfExists(tmp);
-        using var op = Run(["create", "-f", "qcow2", "-b", backingFile, "-F", "qcow2", tmp], tmp);
+        using var op = Run(["create", "-f", "qcow2", "-b", backing, "-F", "qcow2", tmp], tmp);
         WaitForAsync(op, CancellationToken.None).GetAwaiter().GetResult();
         VerifyImage(tmp, "qcow2");
         File.Move(tmp, overlayPath, overwrite: false);
+        op.Completed = true;
+    }
+
+    /// <summary>
+    /// 把 overlay 的数据合并进它的 backing（qemu-img commit；用于删除链中快照：
+    /// 被删层先并入其 backing，其后代 overlay 才能安全 rebase 到祖先）。
+    /// </summary>
+    public void CommitOverlay(string overlayFile)
+    {
+        // tempTarget 只在失败清理时使用：commit/rebase 的目标就是真文件，绝不能被删，
+        // 传一个不会被创建的哨兵路径（失败清理 File.Delete 对不存在的文件是 no-op）
+        using var op = Run(["commit", "-f", "qcow2", overlayFile], overlayFile + ".commit-sentinel");
+        WaitForAsync(op, CancellationToken.None).GetAwaiter().GetResult();
+        op.Completed = true;
+    }
+
+    /// <summary>
+    /// 把 overlay 的 backing 指针改到新的 backing（qemu-img rebase；不迁移数据，
+    /// 只改指针——数据已在 commit 阶段归并）。backing 为 null 表示断开引用。
+    /// </summary>
+    public void RebaseOverlay(string overlayFile, string? newBackingFile, bool relativeBacking = false)
+    {
+        var args = new List<string> { "rebase", "-f", "qcow2" };
+        if (newBackingFile is null)
+            args.Add("-u");
+        else
+        {
+            var backing = relativeBacking
+                ? Path.GetRelativePath(Path.GetDirectoryName(Path.GetFullPath(overlayFile))!, Path.GetFullPath(newBackingFile))
+                : newBackingFile;
+            args.AddRange(["-F", "qcow2", "-b", backing]);
+        }
+        args.Add(overlayFile);
+        using var op = Run([.. args], overlayFile + ".rebase-sentinel");
+        WaitForAsync(op, CancellationToken.None).GetAwaiter().GetResult();
         op.Completed = true;
     }
 

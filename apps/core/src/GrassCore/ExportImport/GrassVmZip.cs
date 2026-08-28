@@ -40,6 +40,9 @@ public static class GrassVmZip
         // 挂起的 VM 没有 vm.lock 也不在运行，但挂起状态绑定宿主指纹，导出的档案无法在别处恢复
         if (Config.VmState.Load(package).SuspendedStatePath is not null)
             throw new GrassCoreException("此虚拟机已挂起。请先恢复并正常关机后再导出。");
+        // 链接克隆的磁盘 backing 指向父 VM 包：档案离开这台机器的库就断链，导出没有意义
+        if (new Config.ConfigStore(package).Load().CloneInfo is not null)
+            throw new GrassCoreException("链接克隆的磁盘依赖父虚拟机，无法导出为独立档案。请先转换为完整克隆。");
     }
 
     /// <summary>导出 .grassvm.zip（完整档案）。条目以 &lt;包名&gt;.grassvm/ 为前缀，导入时保持同名。</summary>

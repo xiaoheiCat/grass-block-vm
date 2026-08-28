@@ -137,8 +137,9 @@ public class QemuCommandBuilderTests : IDisposable
 
         Assert.Contains("-netdev user,id=net", j);      // 默认 NAT
         Assert.Contains("-netdev tap,id=net20", j);     // Host-only 走 TAP
-        Assert.Contains("-netdev none,id=net21", j);    // 断开
-        Assert.Equal(3, CountOccurrences(j, "-device virtio-net-pci"));
+        // "断开"= 完全不生成网络参数（QEMU 没有 none 后端，-netdev none 会启动失败）
+        Assert.DoesNotContain("net21", j);
+        Assert.Equal(2, CountOccurrences(j, "-device virtio-net-pci"));
     }
 
     [Fact]
