@@ -137,7 +137,7 @@ public static class FakeQemuImg
                 exit 0
                 """);
             var bat = Path.Combine(dir, "qemu-img.bat");
-            File.WriteAllText(bat, $"@powershell -NoProfile -ExecutionPolicy Bypass -File \"{ps1}\" %*\r\n");
+            File.WriteAllText(bat, $"@chcp 65001 >nul\r\n@powershell -NoProfile -ExecutionPolicy Bypass -File \"{ps1}\" %*\r\n");
             return bat;
         }
 

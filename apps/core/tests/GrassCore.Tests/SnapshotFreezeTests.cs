@@ -26,8 +26,8 @@ public class SnapshotFreezeTests : IDisposable
         _dir = Path.Combine(Path.GetTempPath(), "grassvm-snapfreeze-" + Guid.NewGuid().ToString("N"));
         Directory.CreateDirectory(_dir);
         _fakeImg = WriteFakeQemuImg();
-        _pkg = GrassVmPackage.CreateNew(_dir, "冻结机");
-        var config = OsProfileLibrary.CreateDefaultConfig("ubuntu", "冻结机");
+        _pkg = GrassVmPackage.CreateNew(_dir, "freeze-vm");
+        var config = OsProfileLibrary.CreateDefaultConfig("ubuntu", "freeze-vm");
         config.Devices.Add(new DiskDevice { Path = "disks/system.qcow2", SizeBytes = 1024 * 1024, CreatedOrder = 10 });
         new ConfigStore(_pkg).Save(config);
         Directory.CreateDirectory(Path.Combine(_pkg.Path, "disks"));
