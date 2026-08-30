@@ -53,8 +53,8 @@ export class CoreBridge extends EventEmitter {
     } else {
       // 开发机：stdio 直连
       this.proc = spawn(this.coreExe, [], { stdio: ['pipe', 'pipe', 'inherit'] });
-      this.proc.on('error', () => this.teardownChannel(new Error('无法启动 GrassCore。')));
-      this.proc.on('exit', () => this.teardownChannel(new Error('GrassCore 已退出。')));
+      this.proc.on('error', () => this.teardownChannel(null, new Error('无法启动 GrassCore。')));
+      this.proc.on('exit', () => this.teardownChannel(null, new Error('GrassCore 已退出。')));
       this.wire(this.proc.stdin!, this.proc.stdout!);
       await this.call('ping');
     }
@@ -63,7 +63,7 @@ export class CoreBridge extends EventEmitter {
   private spawnCore() {
     this.proc = spawn(this.coreExe, [], { stdio: 'ignore' });
     // spawn 失败（路径错误/ENOENT）走 error 事件——没有监听器会变成主进程未捕获异常
-    this.proc.on('error', () => this.teardownChannel(new Error('无法启动 GrassCore。')));
+    this.proc.on('error', () => this.teardownChannel(null, new Error('无法启动 GrassCore。')));
     this.proc.on('exit', (code) => this.emit('core-exit', code));
   }
 
@@ -77,7 +77,8 @@ export class CoreBridge extends EventEmitter {
   }
 
   private wire(writable: NodeJS.WritableStream, readable: NodeJS.ReadableStream): void {
-    this.channel = { writable, readable };
+    const currentChannel = { writable, readable };
+    this.channel = currentChannel;
     let buf = Buffer.alloc(0);
     readable.on('data', (chunk: Buffer) => {
       buf = Buffer.concat([buf, chunk]);
@@ -86,7 +87,7 @@ export class CoreBridge extends EventEmitter {
         // 帧长合法域（与 Core 端一致）：撕裂帧/脏缓冲会给出天文数字或负数——
         // 照常 slice 会乱吞缓冲，负数直接让 subarray 抛异常炸掉主进程
         if (!(len > 0 && len <= 64 * 1024 * 1024)) {
-          this.teardownChannel(new Error('与 GrassCore 的通信帧损坏，正在重连…'));
+          this.teardownChannel(currentChannel, new Error('与 GrassCore 的通信帧损坏，正在重连…'));
           return;
         }
         if (buf.length < 4 + len) break;
@@ -96,22 +97,31 @@ export class CoreBridge extends EventEmitter {
           this.onMessage(json);
         } catch {
           // 半条 JSON（Core 死在帧中间）：坏帧不炸主进程——拆通道重生
-          this.teardownChannel(new Error('与 GrassCore 的通信帧损坏，正在重连…'));
+          this.teardownChannel(currentChannel, new Error('与 GrassCore 的通信帧损坏，正在重连…'));
           return;
         }
       }
     });
     // Core 死亡契约：在途请求立即失败（否则 spinner 转到天荒地老），通道拆除，
     // 下次 call() 重新拉起 Core 并重接管运行中的 VM（QEMU 由 Core 重接管，不受影响）
-    const onDown = () => this.teardownChannel(new Error('GrassCore 已退出。正在尝试恢复…'));
+    let tornDown = false;
+    const onDown = () => {
+      if (tornDown) return;
+      tornDown = true;
+      this.teardownChannel(currentChannel, new Error('GrassCore 已退出。正在尝试恢复…'));
+    };
     readable.once('close', onDown);
     readable.once('end', onDown);
     readable.once('error', onDown);
     (writable as NodeJS.WritableStream & { once?: unknown }).once?.('close', onDown);
   }
 
-  /** 拆除通道：失败所有在途请求；下次 call 自动重生 Core。 */
-  private teardownChannel(reason: Error): void {
+  /** 拆除通道：失败所有在途请求；下次 call 自动重生 Core。忽略来自已过时通道的滞后事件。 */
+  private teardownChannel(
+    targetChannel: { writable: NodeJS.WritableStream; readable: NodeJS.ReadableStream } | null,
+    reason: Error,
+  ): void {
+    if (targetChannel && this.channel !== targetChannel) return;
     this.channel = null;
     for (const [, p] of this.pending) p.reject(reason);
     this.pending.clear();
