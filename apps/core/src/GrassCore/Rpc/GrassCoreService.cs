@@ -1973,12 +1973,28 @@ public sealed class QemuProcessLauncher(string qemuSystemPath) : IQemuProcessLau
                     File.WriteAllText(logPath, $"--- session {DateTimeOffset.Now:O} ---\n");
             }
             catch { /* 截断失败不影响日志追加 */ }
-            // 两个排水回调在不同线程池线程上并发 AppendAllText（AppendAllText 以
-            // FileShare.Read 打开——Windows 上共享冲突直接抛 IOException，而
-            // DataReceived 处理器里抛出的异常会击穿整个 Core 进程）——串行化
+            // 两个排水回调在不同线程池线程上并发写入日志。使用 FileShare.ReadWrite
+            // 避免 Windows 上的共享冲突，并在异常时静默捕获，防止未捕获异常击穿进程
             var logLock = new object();
-            proc.OutputDataReceived += (_, e) => { if (e.Data is not null) lock (logLock) File.AppendAllText(logPath, e.Data + "\n"); };
-            proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) lock (logLock) File.AppendAllText(logPath, e.Data + "\n"); };
+            void AppendLog(string? line)
+            {
+                if (line is null) return;
+                try
+                {
+                    lock (logLock)
+                    {
+                        using var fs = new FileStream(logPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
+                        using var writer = new StreamWriter(fs, System.Text.Encoding.UTF8);
+                        writer.WriteLine(line);
+                    }
+                }
+                catch
+                {
+                    // 日志写入失败（如测试清理或临时锁竞争）静默吞掉，绝对不能让 DataReceived 抛出未捕获异常
+                }
+            }
+            proc.OutputDataReceived += (_, e) => AppendLog(e.Data);
+            proc.ErrorDataReceived += (_, e) => AppendLog(e.Data);
             try { proc.BeginOutputReadLine(); }
             catch { /* stdout 排水失败不影响 stderr 排水 */ }
             try { proc.BeginErrorReadLine(); }
