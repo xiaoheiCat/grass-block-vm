@@ -21,9 +21,9 @@ jobs:
         with:
           dotnet-version: "10.0.x"
       - name: Build
-        run: dotnet build apps/core/GrassCore.sln -c Release
+        run: dotnet build apps/core/GrassCore.slnx -c Release
       - name: Test
-        run: dotnet test apps/core/GrassCore.sln -c Release --no-build
+        run: dotnet test apps/core/GrassCore.slnx -c Release --no-build
 
   desktop:
     name: Desktop UI
@@ -31,8 +31,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
-        with:
-          version: 11
       - uses: actions/setup-node@v4
         with:
           node-version: 22
