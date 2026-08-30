@@ -21,7 +21,7 @@ public static class FakeQemuImg
         {
             var ps1 = Path.Combine(dir, "fake-qemu-img.ps1");
             File.WriteAllText(ps1, """
-                param([Parameter(ValueFromRemainingArguments=$true)]$Rest)
+                $Rest = $args
                 $target = $Rest | Where-Object { "$_" -match '\.(qcow2|vmdk)' } | Select-Object -Last 1
                 # backing 可能是相对引用（快照链可移植性）——按 overlay 自身位置解析并
                 # 规范化（GetFullPath 消掉 ..）：真实 qemu-img info 返回干净绝对路径

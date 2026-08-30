@@ -34,12 +34,26 @@ internal static class HostResources
                 p.WaitForExit(3000);
                 if (bytes > 0) return bytes / (1024 * 1024);
             }
+            if (OperatingSystem.IsLinux() && File.Exists("/proc/meminfo"))
+            {
+                foreach (var line in File.ReadLines("/proc/meminfo"))
+                {
+                    if (line.StartsWith("MemTotal:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                        if (parts.Length >= 2 && long.TryParse(parts[1], out var kb))
+                            return kb / 1024;
+                    }
+                }
+            }
+            var gcMem = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+            if (gcMem > 0) return gcMem / (1024 * 1024);
         }
         catch { /* 探测失败退回保守默认 */ }
-        return 8 * 1024; // 8 GB 保守值
+        return 16 * 1024; // 16 GB 保守值
     }
 
-    /// <summary>内存钳制：[512, 宿主一半]。探测失败（8GB 保守值）时上限 4GB。</summary>
+    /// <summary>内存钳制：[512, 1024*1024 MiB (1TiB)] 合理有效范围。</summary>
     public static int ClampMemoryMiB(long requested) =>
-        (int)Math.Clamp(requested, 512, Math.Max(512, TotalMemoryMiB() / 2));
+        (int)Math.Clamp(requested, 512, 1024 * 1024);
 }
