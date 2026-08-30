@@ -11,11 +11,12 @@ apps/core/**/obj/
 *.user
 
 # Local .NET SDK & caches (developer-managed, not committed)
-.dotnet/
-.dotnet-home/
-.nuget/
-.local/
-Library/
+/.dotnet/
+/.dotnet-home/
+/.nuget/
+/.local/
+**/.local/
+/Library/
 dotnet-install.sh
 
 # Python venv used for PDF extraction (session artifact)
