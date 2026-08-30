@@ -22,9 +22,23 @@ public static class FakeQemuImg
             var ps1 = Path.Combine(dir, "fake-qemu-img.ps1");
             File.WriteAllText(ps1, """
                 $Rest = $args
-                $target = $Rest | Where-Object { "$_" -match '\.(qcow2|vmdk)' } | Select-Object -Last 1
                 $lat = [Text.Encoding]::GetEncoding(28591)
                 $opsLog = Join-Path $PSScriptRoot 'qemu-img.bat.chain-ops.log'
+
+                $target = $Rest | Where-Object {
+                    "$_" -notmatch '^-' -and
+                    "$_" -notmatch '^\d+$' -and
+                    "$_" -ne 'create' -and
+                    "$_" -ne 'commit' -and
+                    "$_" -ne 'rebase' -and
+                    "$_" -ne 'info' -and
+                    "$_" -ne 'convert' -and
+                    "$_" -ne 'check' -and
+                    "$_" -ne 'resize' -and
+                    "$_" -ne 'qcow2' -and
+                    "$_" -ne 'vmdk' -and
+                    "$_" -ne 'raw'
+                } | Select-Object -Last 1
 
                 function Resolve-Backing([string]$img, [string]$b) {
                     if ("$b" -match '^[a-zA-Z]:[\\/]' -or "$b" -match '^\\\\') { return $b }
@@ -89,9 +103,11 @@ public static class FakeQemuImg
                     $bi = [Array]::IndexOf($Rest, '-b')
                     if ($bi -ge 0 -and $bi + 1 -lt $Rest.Count) {
                         $newBacking = $Rest[$bi + 1]
-                        if (-not (Test-Path (Resolve-Backing $target $newBacking))) {
-                            [Console]::Error.WriteLine("qemu-img: Could not open backing image '$newBacking'")
-                            exit 1
+                        if ($Rest -notcontains '-u') {
+                            if (-not (Test-Path (Resolve-Backing $target $newBacking))) {
+                                [Console]::Error.WriteLine("qemu-img: Could not open backing image '$newBacking'")
+                                exit 1
+                            }
                         }
                     }
                     [IO.File]::AppendAllText($target, ($Rest -join ' ') + "`n", $lat)
@@ -109,6 +125,8 @@ public static class FakeQemuImg
                     }
                 }
                 if ($target) {
+                    $parent = Split-Path -Parent $target
+                    if ($parent -and -not (Test-Path $parent)) { [IO.Directory]::CreateDirectory($parent) | Out-Null }
                     if ("$target" -match '\.vmdk') {
                         [IO.File]::WriteAllText($target, "# Disk DescriptorFile`nfake-vmdk`n")
                     } else {

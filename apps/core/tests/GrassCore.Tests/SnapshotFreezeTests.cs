@@ -104,8 +104,8 @@ public class SnapshotFreezeTests : IDisposable
         foreach (var line in log.Split('\n', StringSplitOptions.RemoveEmptyEntries))
             if (line.Contains("rebase") && line.Contains("-b "))
             {
-                var overlay = line.Split(' ')[^1];
-                latestBackingByOverlay[overlay] = line.Split("-b ")[1].Split(' ')[0];
+                var overlay = line.Trim().Split(' ')[^1].Trim();
+                latestBackingByOverlay[overlay] = line.Split("-b ")[1].Split(' ')[0].Trim();
             }
         foreach (var (overlay, backing) in latestBackingByOverlay)
         {
