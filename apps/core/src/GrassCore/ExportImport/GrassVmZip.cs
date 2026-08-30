@@ -20,6 +20,7 @@ public static class GrassVmZip
     {
         GrassVmPackage.StateFile,   // state.json：本机使用痕迹
         GrassVmPackage.LockFile,    // vm.lock
+        "suspend.state",            // 挂起的 RAM 镜像：宿主指纹绑定+RAM 大小，属于本机痕迹
         GrassVmPackage.RuntimeDir + "/", // runtime/（session 等瞬态）
         GrassVmPackage.LogsDir + "/",    // logs/（本机日志）
         GrassVmPackage.TempDir + "/",   // temp/（升级备份等本机产物——档案不该带着旧配置旅行）
@@ -29,8 +30,9 @@ public static class GrassVmZip
     {
         var norm = relativeEntryName.Replace('\\', '/');
         return ExcludedRelativePaths.Any(x =>
-            x.EndsWith('/') ? norm.StartsWith(x, StringComparison.Ordinal) : norm == x)
-            || norm.EndsWith(TransactionalDiskOps.TempSuffix, StringComparison.Ordinal);
+            x.EndsWith('/') ? norm.StartsWith(x, StringComparison.OrdinalIgnoreCase)
+                : string.Equals(norm, x, StringComparison.OrdinalIgnoreCase))
+            || norm.EndsWith(TransactionalDiskOps.TempSuffix, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>校验 VM 处于可导出状态（必须已关机且未被占用）。</summary>
@@ -44,6 +46,15 @@ public static class GrassVmZip
         // 链接克隆的磁盘 backing 指向父 VM 包：档案离开这台机器的库就断链，导出没有意义
         if (new Config.ConfigStore(package).Load().CloneInfo is not null)
             throw new GrassCoreException("链接克隆的磁盘依赖父虚拟机，无法导出为独立档案。请先转换为完整克隆。");
+        // 未收尾的快照/恢复事务：档案会把"半恢复"现场带走——导入侧没有 state.json
+        // （PendingRestoreTxId 丢失），修复会把残局误判为"已提交"，prev（恢复前数据
+        // 的唯一副本）被当垃圾删掉。先启动一次（入口会跑修复收尾）再导出
+        if (File.Exists(Path.Combine(package.SnapshotsPath, "restore-journal.json")))
+            throw new GrassCoreException("此虚拟机有一个未完成的恢复操作。请先启动一次让其自动收尾，再导出。");
+        var enumOpts = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true };
+        if (Directory.EnumerateFiles(package.Path, "*" + Rpc.SnapshotService.RestorePrevSuffix, enumOpts).Any()
+            || Directory.EnumerateFiles(package.Path, "*" + Rpc.SnapshotService.StagedOverlaySuffix, enumOpts).Any())
+            throw new GrassCoreException("此虚拟机存在未收尾的快照/恢复残留。请先启动一次让其自动修复，再导出。");
     }
 
     /// <summary>导出 .grassvm.zip（完整档案）。条目以 &lt;包名&gt;.grassvm/ 为前缀，导入时保持同名。</summary>
@@ -73,8 +84,23 @@ public static class GrassVmZip
                     w.Write(position);
                 }
             }
-            if (File.Exists(zipPath)) File.Delete(zipPath);
-            File.Move(tempZip, zipPath);
+            // 原子替换：旧档案先改名保底，新档案落位成功后才删旧——中间任何一步失败，
+            // 用户手里至少留有一份完整档案
+            // 每次使用唯一备份名：上一轮备份因杀毒/权限未能删除时，不得永久
+            // 阻塞以后所有导出。
+            var backupZip = zipPath + ".grass-old-" + Guid.NewGuid().ToString("N");
+            var hadOld = File.Exists(zipPath);
+            if (hadOld) File.Move(zipPath, backupZip);
+            try
+            {
+                File.Move(tempZip, zipPath);
+            }
+            catch
+            {
+                if (hadOld) File.Move(backupZip, zipPath, overwrite: true);
+                throw;
+            }
+            if (hadOld) try { File.Delete(backupZip); } catch { /* 清理失败无害 */ }
         }
         catch
         {
@@ -89,7 +115,18 @@ public static class GrassVmZip
     /// </summary>
     public static GrassVmPackage Import(string zipPath, string libraryRoot)
     {
-        using var zip = ZipFile.OpenRead(zipPath);
+        // 损坏/截断/贴错扩展名的 zip 在 OpenRead 就抛 InvalidDataException/
+        // IOException——英文原文不进错误横幅，与 OVF 路径同标准
+        System.IO.Compression.ZipArchive Open()
+        {
+            try { return ZipFile.OpenRead(zipPath); }
+            catch (Exception e) when (e is System.IO.InvalidDataException or System.IO.IOException
+                 or System.IO.FileNotFoundException or NotSupportedException)
+            {
+                throw new GrassCoreException("无法读取这份压缩包（已损坏或不是有效的 zip 档案）。");
+            }
+        }
+        using var zip = Open();
         if (zip.Entries.Count == 0)
             throw new GrassCoreException("这是一个空的压缩包，不是有效的虚拟机档案。");
         // 包名取第一个一级目录（导出时以包根内容 + 包名目录形式写入）
@@ -108,20 +145,61 @@ public static class GrassVmZip
             Directory.CreateDirectory(staging);
             foreach (var entry in zip.Entries)
             {
-                var rel = first.EndsWith(GrassVmPackage.Extension, StringComparison.OrdinalIgnoreCase)
-                    ? entry.FullName[(first.Length + 1)..]
-                    : entry.FullName;
+                // 前缀剥离只对真带前缀的条目做：畸形档案（首条目是名为 *.grassvm 的
+                // 文件而非目录、或后续条目比前缀还短）会让范围切片抛裸
+                // ArgumentOutOfRangeException——翻译成明确的"不是有效档案"
+                string rel;
+                if (first.EndsWith(GrassVmPackage.Extension, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (!entry.FullName.StartsWith(first + "/", StringComparison.Ordinal))
+                        throw new GrassCoreException("压缩包的目录结构不是有效的虚拟机档案。");
+                    rel = entry.FullName[(first.Length + 1)..];
+                }
+                else
+                {
+                    rel = entry.FullName;
+                }
                 if (string.IsNullOrEmpty(rel)) continue;
+                // 显式目录条目（Finder / 多数 Windows 压缩工具会写）：无文件体，
+                // ExtractToFile 会按"把目录当文件打开"直接抛异常。目录由下方
+                // CreateDirectory 按需创建，这里跳过即可
+                if (rel.EndsWith('/') || string.IsNullOrEmpty(entry.Name)) continue;
                 var dest = Path.GetFullPath(Path.Combine(staging, rel));
                 if (!dest.StartsWith(staging + Path.DirectorySeparatorChar, StringComparison.Ordinal))
                     throw new GrassCoreException("压缩包包含非法路径（zip slip），已拒绝导入。");
                 if (IsExcluded(rel)) continue; // 本机痕迹即使被人塞进包里也不导入
+                // 手工打包的"崩溃/半恢复现场"档案：restore-journal / prev 副本 / 暂存
+                // overlay 进来后（档案不含 state.json，PendingRestoreTxId 必然丢失）
+                // 修复会把残局误判为"已提交"，prev（恢复前数据的唯一副本）被当垃圾
+                // 删掉。宁可拒收：让用户先在原机器上启动一次收尾再打包
+                if (rel == "snapshots/restore-journal.json"
+                    || rel.EndsWith(Rpc.SnapshotService.RestorePrevSuffix, StringComparison.Ordinal)
+                    || rel.EndsWith(Rpc.SnapshotService.StagedOverlaySuffix, StringComparison.Ordinal))
+                    throw new GrassCoreException(
+                        "这个档案包含未完成的恢复/快照事务残迹（restore-journal 或暂存层）。" +
+                        "请在原来的电脑上启动一次该虚拟机让其自动收尾，再重新导出/打包。");
                 Directory.CreateDirectory(Path.GetDirectoryName(dest)!);
                 entry.ExtractToFile(dest, overwrite: false);
             }
             var pkg0 = new GrassVmPackage(staging);
             // 档案刻意不含 runtime/logs 等瞬态目录；导入时补齐固定结构（确定无损修复）
             pkg0.EnsureStructure();
+            // 名称规则与 CreateVm/UpdateConfig/克隆/OVF 同一套：名称同时是 QEMU
+            // -name 的值（等号=未知键启动即退、逗号=QemuOpts 分隔符）与目录名。
+            // 手工打包的档案可以塞进任意 config.json——不校验的话导入出一台
+            // 永远开不了机的 VM（QEMU 拒参数即退，真错误埋在 qemu.log 里）
+            string importedName;
+            try
+            {
+                importedName = new Config.ConfigStore(pkg0).Load().Name;
+            }
+            catch (Exception e) when (e is System.Text.Json.JsonException or InvalidOperationException or ArgumentException)
+            {
+                throw new GrassCoreException("压缩包内的虚拟机配置（config.json）已损坏，无法导入。");
+            }
+            if (Rpc.GrassCoreService.IsInvalidVmName(pkgName) || Rpc.GrassCoreService.IsInvalidVmName(importedName))
+                throw new GrassCoreException(
+                    $"虚拟机名称不合法（{importedName}）：不能为空，不能包含文件系统不允许的字符、逗号或等号。");
             // 恢复快照工作位置（导出方写入的树拓扑语义；marker 只在档案里存在，落盘后转为 state）
             var marker = Path.Combine(staging, "snapshots", "position.marker");
             if (File.Exists(marker))

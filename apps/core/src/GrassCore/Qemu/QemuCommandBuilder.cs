@@ -71,14 +71,42 @@ public sealed class QemuCommandBuilder
         AddRawDevices(args);
         AddDisplayAndSpice(args);
 
-        // 挂起恢复：从保存的完整运行状态（内存/CPU/设备）回到挂起瞬间的唯一方式
+        // 挂起恢复：从保存的完整运行状态（内存/CPU/设备）回到挂起瞬间的唯一方式。
+        // 注意 -incoming 的值是普通字符串（迁移 URI），不经 QemuOpts 解析、不按逗号
+        // 切分——与 migrate 命令的 JSON 参数保持一致：都原样传，不做 Esc
         if (incomingStateFile is not null)
             args.AddRange(new[] { "-incoming", $"file:{incomingStateFile}" });
 
         // 全部网卡"断开"（或没有网卡）：显式 -nic none。否则 QEMU 会静默补一张默认
         // 用户态 NAT 网卡——用户以为断网了，实际上网照样通（消费级产品的安全性不能靠默认值）。
-        var hasNetworkArgs = args.Any(a => a.StartsWith("-netdev", StringComparison.Ordinal) || a.StartsWith("-nic", StringComparison.Ordinal) || a.StartsWith("-device e1000", StringComparison.Ordinal) || a.StartsWith("-device virtio-net", StringComparison.Ordinal));
-        if (!hasNetworkArgs)
+        // 只有【后端】选项（-netdev/-nic/-net）才会让 QEMU 不补默认网卡；裸 -device <网卡型号>
+        // 不带后端 = 一张没有网络的网卡，不影响默认网卡的判定（不能因为它而漏加
+        // -nic none——那会重新放开隐式 NAT，正好违背上面要堵的洞）。后端选项本身
+        // 在 RawArgumentBlocklist 里到不了这里，这里再查一遍是纵深防御
+        bool HasNicBackendArg(IReadOnlyList<string> a)
+        {
+            string prevNorm = "";
+            for (var i = 0; i < a.Count; i++)
+            {
+                // 连字前缀归一化（与 AddRawDevices 的黑名单同一理由：--netdev 与 -netdev 同义）
+                var norm = "-" + a[i].TrimStart('-');
+                // 值位跳过：-name 的值是用户自由文本（合法 VM 名可以就叫 "-nic"——
+                // 名称校验只挡逗号/等号/非法字符）。把值当选项名会错判"已有网卡
+                // 后端"而漏发 -nic none = 静默复活 QEMU 默认 NAT 网卡
+                var isValueOfName = prevNorm == "-name";
+                prevNorm = norm;
+                if (isValueOfName) continue;
+                if (norm is "-netdev" or "-nic" or "-network") return true;
+                // -net 的别名形态：-net user/tap/bridge…（独立 token 以 -net 开头但不是 -netdev）
+                if (norm == "-net" && i + 1 < a.Count
+                    && (a[i + 1] is "none" || a[i + 1].StartsWith("user", StringComparison.Ordinal)
+                        || a[i + 1].StartsWith("tap", StringComparison.Ordinal)
+                        || a[i + 1].StartsWith("bridge", StringComparison.Ordinal)))
+                    return true;
+            }
+            return false;
+        }
+        if (!HasNicBackendArg(args))
             args.AddRange(new[] { "-nic", "none" });
 
         // QMP：Windows Named Pipe（-mon mode=control）。Core 崩溃后凭 session.json + 此管道无损接管。
@@ -154,9 +182,17 @@ public sealed class QemuCommandBuilder
             case CdromDevice cd:
             {
                 var id = "cd" + cd.CreatedOrder;
-                var media = cd.IsoPath is null
+                // 安装镜像缺失 = 空光驱启动（预检把缺 ISO 归为非致命，承诺"启动后
+                // 可在显示器窗口更换介质"）。这里若照发 file=<不存在路径>，QEMU
+                // 打不开文件【启动即退】——"非致命"变成"永远开不了机的死路"，
+                // 显示器换介质恰恰需要一台已经跑起来的 VM
+                var isoPath = cd.IsoPath is null ? null : PathPolicy.Resolve(new GrassVmPackage(packageRoot), cd.IsoPath);
+                if (isoPath is not null && !File.Exists(isoPath)) isoPath = null;
+                var media = isoPath is null
                     ? "media=cdrom"
-                    : $"media=cdrom,file={Esc(PathPolicy.Resolve(new GrassVmPackage(packageRoot), cd.IsoPath))}";
+                    // format=raw：省略时 QEMU 会做整盘格式探测——guest 能喂给它一个
+                    // 看起来像 qcow2 的"ISO"（VMDK/VHDI 均可），probe 结果变成可写后端
+                    : $"media=cdrom,file={Esc(isoPath)},format=raw";
                 args.AddRange(new[] { "-drive", $"if=none,{media},id={id},readonly=on" });
                 // 光驱接到 SATA/IDE；热插拔换盘由 QMP blockdev-change-medium 完成
                 if (_profile.SystemDiskBus == DiskBus.Virtio || _profile.Machine == MachineKind.Q35)
@@ -188,7 +224,9 @@ public sealed class QemuCommandBuilder
                     // 桥接 / Host-only：TAP-Windows6 适配器（安装器已部署 Grass Block VM Virtual Ethernet Adapter）
                     // 桥接目标宿主网卡默认"自动选择"，用户可手动指定；该选择保存在宿主级配置中
                     NetworkMode.Bridged => $"tap,id={id},ifname={TapName(net)},script=no,downscript=no",
-                    NetworkMode.HostOnly => $"tap,id={id},ifname={TapName(net)},script=no,downscript=no",
+                    NetworkMode.HostOnly when !string.IsNullOrWhiteSpace(net.VirtualNetworkId)
+                        => $"tap,id={id},ifname={TapName(net)},script=no,downscript=no",
+                    NetworkMode.HostOnly => throw new InvalidOperationException("Host-only 网卡未选择虚拟网络。请先选择一个宿主虚拟网络。"),
                     _ => throw new InvalidOperationException(),
                 };
                 args.AddRange(new[] { "-netdev", netdev });
@@ -225,45 +263,136 @@ public sealed class QemuCommandBuilder
     // TAP 适配器名必须跨进程稳定（安装器按这个名字部署；string.GetHashCode 每进程随机化不可用）
     private static string TapName(NetworkDevice net)
     {
-        var hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(net.DeviceId));
+        var selection = net.Mode switch
+        {
+            NetworkMode.Bridged => net.BridgeAdapter ?? "auto",
+            NetworkMode.HostOnly => net.VirtualNetworkId ?? throw new InvalidOperationException("Host-only 网卡未选择虚拟网络。"),
+            _ => "none",
+        };
+        var identity = $"{net.Mode}:{selection}:{net.DeviceId}";
+        var hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(identity));
         return $"GrassVM-Tap-{BitConverter.ToString(hash, 0, 2).Replace("-", "")}";
     }
 
     /// <summary>同类设备内递增序号（每设备 bootindex 必须唯一：QEMU 在 realize 时拒绝重复值）。</summary>
     private readonly Dictionary<BootClass, int> _bootSeq = new();
+    /// <summary>未进 BootOrder 的类各占一段互不重叠的高位区间（否则两类的首台都拿同一个基数）。</summary>
+    private readonly Dictionary<BootClass, int> _unrankedSlot = new();
 
     private int BootIndex(BootClass @class)
     {
         var i = Config.BootOrder.IndexOf(@class);
-        var baseIndex = i < 0 ? int.MaxValue / 2 : i + 1;
+        // 类不在 BootOrder（用户手改配置）：每类一段独立高位区间。不能用 int.MaxValue/2
+        // 当基——×100 会整型溢出回绕，撞上排位 1 的设备（QEMU 拒绝重复 bootindex）
+        int baseIndex;
+        if (i >= 0)
+        {
+            baseIndex = i + 1;
+        }
+        else
+        {
+            if (!_unrankedSlot.TryGetValue(@class, out var slot))
+                slot = _unrankedSlot[@class] = _unrankedSlot.Count + 1;
+            baseIndex = 1_000_000 + slot * 1_000;
+        }
         var n = _bootSeq.TryGetValue(@class, out var v) ? v : 0;
         _bootSeq[@class] = n + 1;
-        return n == 0 ? baseIndex : baseIndex * 100 + n; // 同类第 2+ 台排在本类末尾之后
+        // 同类设备的 bootindex 必须构成【连续区段】：QEMU 按数值全局排序。
+        // 旧算法给首台 1/2/3、第二台 101/201——第二块盘(101) 排到了光驱(2)和
+        // 网卡(3)之后：双盘 VM 的系统盘在第二块时，固件先试空盘、再试光驱、
+        // 再走 PXE，最后才轮到系统盘。每类一段百位区间，类内按序递增
+        return baseIndex * 100 + n + 1;
     }
 
     private void AddRawDevices(List<string> args)
     {
         // Raw/兼容设备：忠实保留导入的原始参数，只读展示、只能删除后重新添加。
-        // 安全校验：不允许原始参数劫持控制通道或替换关键全局参数。
-        foreach (var raw in Config.DevicesOfType<RawDevice>())
+        // 标记 Unsupported 的（用户确认"仍然导入"的不可信/无法支持设备）绝不进
+        // 命令行。安全校验：不允许原始参数劫持控制通道或替换关键全局参数。
+        foreach (var raw in Config.DevicesOfType<RawDevice>().Where(r => !r.Unsupported))
         {
-            for (var i = 0; i < raw.Arguments.Count; i++)
+            if (raw.Arguments.Count == 0 || raw.Arguments.Count % 2 != 0)
+                throw new InvalidOperationException("兼容设备参数结构不完整（必须是 -device 与设备值成对出现）。");
+            for (var i = 0; i < raw.Arguments.Count; i += 2)
             {
-                var a = raw.Arguments[i];
-                if (i == 0 || !raw.Arguments[i - 1].StartsWith('-'))
-                {
-                    if (RawArgumentBlocklist.Contains(a))
-                        throw new InvalidOperationException($"兼容设备的参数不被允许：{a}");
-                }
+                var option = raw.Arguments[i];
+                var norm = "-" + option.TrimStart('-');
+                if (!string.Equals(norm, "-device", StringComparison.Ordinal))
+                    throw new InvalidOperationException($"兼容设备的参数不被允许：{option}");
+                var value = raw.Arguments[i + 1];
+                if (value.StartsWith('-'))
+                    throw new InvalidOperationException("兼容设备参数结构不完整（设备值不能是另一个选项）。");
+                if (DeviceValueReferencesHostFile(value))
+                    throw new InvalidOperationException("兼容设备不允许引用宿主文件或物理设备（file=/path=/romfile=/host= 等）。");
             }
             args.AddRange(raw.Arguments);
         }
     }
 
+    /// <summary>-device 值里出现的"宿主文件/后端引用"属性（QemuOpts 键不区分大小写）。</summary>
+    private static readonly string[] HostFileProps =
+    {
+        "file=", "path=", "romfile=", "chardev=", "netdev=", "fsdev=", "fd=", "bios=",
+        // host= = 宿主 PCI/USB 物理设备地址直通（vfio-pci,host=00:02.0）：
+        // 与 usb-host 型号同类的宿主硬件透传，不含任何文件引用键
+        "host=",
+    };
+
+    internal static bool DeviceValueReferencesHostFile(string deviceValue) =>
+        HostFileProps.Any(p => deviceValue.Contains(p, StringComparison.OrdinalIgnoreCase))
+        // usb-host = 把宿主 USB 物理设备（U 盘/安全密钥/手机）直接透传进客户机，
+        // 不含任何 file=/path= 这类文件引用键，靠属性黑名单拦不住。产品模型里
+        // 宿主 USB 设备默认属于 Host，用户要在显示器设备栏主动"连接到此虚拟机"
+        //——兼容设备参数静默透传绕过这道用户授权。型号段 = 首个逗号前（忽略空白）
+        || deviceValue.Split(',')[0].Trim().Equals("usb-host", StringComparison.OrdinalIgnoreCase);
+
     private static readonly HashSet<string> RawArgumentBlocklist = new()
     {
-        "-qmp", "-mon", "-chardev", "-serial", "-parallel", "-monitor", "-daemonize", "-snapshot",
-        "-spice", "-display", "-vnc", "-add-fd", "-pidfile", "-incoming", "-accel", "-machine",
+        // 控制通道 / 全局形态（劫持 Core 与 QEMU 的连接或生命周期）。
+        // -qmp-pretty 是 -qmp 的别名形态（同样开控制服务器）；-trace 以
+        // events=/file= 读写宿主文件（与 -D/-readconfig 同类）。
+        // -no-shutdown/-no-reboot/-action/-watchdog-action 改写"客户机关机 =
+        // QEMU 进程退出"这一 Core 状态机的根基：QEMU 永不退出 → Exited 不触发
+        // → vm.lock 永不释放、Library 永远显示运行中、Core 永不空闲退出
+        "-qmp", "-qmp-pretty", "-mon", "-chardev", "-serial", "-parallel", "-monitor", "-daemonize", "-snapshot",
+        "-no-shutdown", "-no-reboot", "-action", "-watchdog-action",
+        "-spice", "-display", "-vnc", "-add-fd", "-pidfile", "-incoming", "-accel", "-machine", "-M",
+        // -nographic 把串口和 HMP 监视器都复用到 stdio（正是上面注释里的经典劫持
+        // 形态）；-curses 同理占终端；-sdl 开 QEMU 自有的显示窗口（"用户永远
+        // 不该看到 QEMU"的破口）；-gdb/-s/-S 开宿主调试口/冻结启动
+        "-nographic", "-curses", "-sdl", "-gdb", "-s", "-S",
+        // 宿主资源读写（不受控地打开宿主文件/后端 = 数据外泄与破坏面）：
+        // -drive/-blockdev 可把宿主任意文件挂成客户机磁盘；-netdev/-nic/-object
+        // 可建宿主后端；-bios/-L/-plugin/-fw_cfg/-audiodev 可加载宿主代码/固件
+        "-drive", "-blockdev", "-netdev", "-nic", "-object", "-bios", "-L", "-plugin",
+        "-fw_cfg", "-audiodev", "-trace",
+        // 恢复/迁移形态（绕过挂起指纹校验直接重放状态）
+        "-loadvm",
+        // 设备全局微调（可改写固件可见形态）
+        "-global",
+        // 关键全局标量（QEMU 末位生效）：Core 自己在前面发出的 -m/-smp/-cpu/
+        // -name/-boot/-rtc/-vga 会被这些重复项静默改写——内存/CPU/启动顺序/
+        // 时钟/显卡形态全部失真，且用户毫无感知
+        "-m", "-smp", "-cpu", "-name", "-boot", "-rtc", "-vga",
+        // 宿主文件 → 客户机可见表的载入器（与 -option-rom/-fw_cfg 同类）：
+        // -acpitable file=… / -smbios file=… 都能把宿主任意文件内容塞进
+        // 客户机固件可见的 ACPI/SMBIOS 表
+        "-acpitable", "-smbios",
+        // 宿主文件别名/短选项（与 -drive 同效或更直接的宿主访问）：
+        // -hda..-hdd/-cdrom/-fda/-fdb/-sd/-mtdblock 直接把宿主文件挂成磁盘；
+        // -pflash 以【可写】方式打开宿主文件；-kernel/-initrd 把宿主文件载入客户机；
+        // -usbdevice disk:<文件> 把宿主文件挂成客户机可读写的 USB 存储盘（同类洞）；
+        // -virtfs/-fsdev 向客户机共享宿主任意目录；-net 可建 TAP/桥接宿主后端；
+        "-usbdevice",
+        // -D/-debugcon 往宿主任意路径写文件
+        "-hda", "-hdb", "-hdc", "-hdd", "-cdrom", "-fda", "-fdb", "-sd", "-mtdblock",
+        "-pflash", "-kernel", "-initrd", "-virtfs", "-fsdev", "-net", "-D", "-debugcon",
+        // 配置注入/改写（结构性绕过点）：
+        // -readconfig 从宿主文件加载任意 [drive]/[netdev]/[device] 配置 = 整个
+        // blocklist 的旁路；-writeconfig 往宿主任意路径写；-option-rom 把宿主
+        // 二进制载入客户机固件；-set 可改写已有选项（如 drive.<id>.file=宿主路径）；
+        // -mem-path 用宿主文件当客户机内存后端
+        "-readconfig", "-writeconfig", "-option-rom", "-set", "-mem-path",
     };
 
     private void AddDisplayAndSpice(List<string> args)

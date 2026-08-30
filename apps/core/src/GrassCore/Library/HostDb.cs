@@ -12,6 +12,9 @@ namespace GrassCore.Library;
 public sealed class HostDb : IDisposable
 {
     private readonly SqliteConnection _conn;
+    /// <summary>命令串行化门：Microsoft.Data.Sqlite 不支持单连接并发（读器重叠直接抛），
+    /// 而 RPC 分发是并发的（scanLibrary 轮询 + StartVm 写偏好同时发生）。</summary>
+    private readonly object _gate = new();
 
     public HostDb(string dbPath)
     {
@@ -71,19 +74,25 @@ public sealed class HostDb : IDisposable
 
     public string? GetPreference(string key)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT value FROM preferences WHERE key = $k";
-        cmd.Parameters.AddWithValue("$k", key);
-        return cmd.ExecuteScalar() as string;
+        string? v = null;
+        Locked(cmd =>
+        {
+            cmd.CommandText = "SELECT value FROM preferences WHERE key = $k";
+            cmd.Parameters.AddWithValue("$k", key);
+            v = cmd.ExecuteScalar() as string;
+        });
+        return v;
     }
 
     public void SetPreference(string key, string value)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "INSERT INTO preferences(key,value) VALUES($k,$v) ON CONFLICT(key) DO UPDATE SET value=$v";
-        cmd.Parameters.AddWithValue("$k", key);
-        cmd.Parameters.AddWithValue("$v", value);
-        cmd.ExecuteNonQuery();
+        Locked(cmd =>
+        {
+            cmd.CommandText = "INSERT INTO preferences(key,value) VALUES($k,$v) ON CONFLICT(key) DO UPDATE SET value=$v";
+            cmd.Parameters.AddWithValue("$k", key);
+            cmd.Parameters.AddWithValue("$v", value);
+            cmd.ExecuteNonQuery();
+        });
     }
 
     private void SetDefaultPreference(string key, string? value)
@@ -121,39 +130,50 @@ public sealed class HostDb : IDisposable
     /// <summary>自动启动列表支持拖拽排序；GrassCore 严格按此顺序启动。</summary>
     public void SetAutostartOrder(IEnumerable<string> orderedVmPaths)
     {
-        using var tx = _conn.BeginTransaction();
-        Exec("UPDATE autostart SET position = 1000000");
-        var pos = 0;
-        foreach (var p in orderedVmPaths)
+        // 整个事务持锁（Monitor 同线程可重入，内部 Exec/Locked 不死锁）
+        lock (_gate)
         {
-            using var cmd = _conn.CreateCommand();
-            cmd.CommandText = "UPDATE autostart SET position = $p WHERE vm_path = $v";
-            cmd.Parameters.AddWithValue("$p", pos++);
-            cmd.Parameters.AddWithValue("$v", p);
-            cmd.ExecuteNonQuery();
+            using var tx = _conn.BeginTransaction();
+            Exec("UPDATE autostart SET position = 1000000");
+            var pos = 0;
+            foreach (var p in orderedVmPaths)
+            {
+                Locked(cmd =>
+                {
+                    cmd.CommandText = "UPDATE autostart SET position = $p WHERE vm_path = $v";
+                    cmd.Parameters.AddWithValue("$p", pos);
+                    cmd.Parameters.AddWithValue("$v", p);
+                    cmd.ExecuteNonQuery();
+                });
+                pos++;
+            }
+            tx.Commit();
         }
-        tx.Commit();
     }
 
     public void SetAutostart(string vmPath, bool enabled)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO autostart(vm_path, enabled, position)
-            VALUES($v,$e,(SELECT COALESCE(MAX(position),-1)+1 FROM autostart))
-            ON CONFLICT(vm_path) DO UPDATE SET enabled=$e
-            """;
-        cmd.Parameters.AddWithValue("$v", vmPath);
-        cmd.Parameters.AddWithValue("$e", enabled ? 1 : 0);
-        cmd.ExecuteNonQuery();
+        Locked(cmd =>
+        {
+            cmd.CommandText = """
+                INSERT INTO autostart(vm_path, enabled, position)
+                VALUES($v,$e,(SELECT COALESCE(MAX(position),-1)+1 FROM autostart))
+                ON CONFLICT(vm_path) DO UPDATE SET enabled=$e
+                """;
+            cmd.Parameters.AddWithValue("$v", vmPath);
+            cmd.Parameters.AddWithValue("$e", enabled ? 1 : 0);
+            cmd.ExecuteNonQuery();
+        });
     }
 
     public void RemoveAutostart(string vmPath)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "DELETE FROM autostart WHERE vm_path = $v";
-        cmd.Parameters.AddWithValue("$v", vmPath);
-        cmd.ExecuteNonQuery();
+        Locked(cmd =>
+        {
+            cmd.CommandText = "DELETE FROM autostart WHERE vm_path = $v";
+            cmd.Parameters.AddWithValue("$v", vmPath);
+            cmd.ExecuteNonQuery();
+        });
     }
 
     // ---- virtual networks（一级资源；允许多个独立 Host-only，默认创建一个）----
@@ -169,19 +189,21 @@ public sealed class HostDb : IDisposable
 
     public void CreateNetwork(VirtualNetwork n)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO virtual_networks(id,name,subnet,dhcp_enabled,dhcp_range_start,dhcp_range_end,is_default)
-            VALUES($id,$name,$subnet,$dhcp,$rs,$re,$def)
-            """;
-        cmd.Parameters.AddWithValue("$id", n.Id);
-        cmd.Parameters.AddWithValue("$name", n.Name);
-        cmd.Parameters.AddWithValue("$subnet", n.Subnet);
-        cmd.Parameters.AddWithValue("$dhcp", n.DhcpEnabled ? 1 : 0);
-        cmd.Parameters.AddWithValue("$rs", (object?)n.DhcpRangeStart ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$re", (object?)n.DhcpRangeEnd ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$def", n.IsDefault ? 1 : 0);
-        cmd.ExecuteNonQuery();
+        Locked(cmd =>
+        {
+            cmd.CommandText = """
+                INSERT INTO virtual_networks(id,name,subnet,dhcp_enabled,dhcp_range_start,dhcp_range_end,is_default)
+                VALUES($id,$name,$subnet,$dhcp,$rs,$re,$def)
+                """;
+            cmd.Parameters.AddWithValue("$id", n.Id);
+            cmd.Parameters.AddWithValue("$name", n.Name);
+            cmd.Parameters.AddWithValue("$subnet", n.Subnet);
+            cmd.Parameters.AddWithValue("$dhcp", n.DhcpEnabled ? 1 : 0);
+            cmd.Parameters.AddWithValue("$rs", (object?)n.DhcpRangeStart ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$re", (object?)n.DhcpRangeEnd ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$def", n.IsDefault ? 1 : 0);
+            cmd.ExecuteNonQuery();
+        });
     }
 
     /// <summary>自动选择不冲突的 RFC1918 网段（检查已有 Host-only 网段；手动指定时只做合法性提示，不阻止）。</summary>
@@ -202,9 +224,13 @@ public sealed class HostDb : IDisposable
 
     private int CountNetworks()
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = "SELECT COUNT(*) FROM virtual_networks";
-        return Convert.ToInt32(cmd.ExecuteScalar()!);
+        int v = 0;
+        Locked(cmd =>
+        {
+            cmd.CommandText = "SELECT COUNT(*) FROM virtual_networks";
+            v = Convert.ToInt32(cmd.ExecuteScalar()!);
+        });
+        return v;
     }
 
     // ---- vm index cache ----
@@ -219,23 +245,25 @@ public sealed class HostDb : IDisposable
 
     public void UpsertIndex(VmIndexEntry e)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = """
-            INSERT INTO vm_index_cache(package_path,name,artwork_summary,mtime,last_known_state)
-            VALUES($p,$n,$a,$m,$s)
-            ON CONFLICT(package_path) DO UPDATE SET name=$n,artwork_summary=$a,mtime=$m,last_known_state=$s
-            """;
-        cmd.Parameters.AddWithValue("$p", e.PackagePath);
-        cmd.Parameters.AddWithValue("$n", e.Name);
-        cmd.Parameters.AddWithValue("$a", (object?)e.ArtworkSummary ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$m", (object?)e.Mtime ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("$s", (object?)e.LastKnownState ?? DBNull.Value);
-        cmd.ExecuteNonQuery();
+        Locked(cmd =>
+        {
+            cmd.CommandText = """
+                INSERT INTO vm_index_cache(package_path,name,artwork_summary,mtime,last_known_state)
+                VALUES($p,$n,$a,$m,$s)
+                ON CONFLICT(package_path) DO UPDATE SET name=$n,artwork_summary=$a,mtime=$m,last_known_state=$s
+                """;
+            cmd.Parameters.AddWithValue("$p", e.PackagePath);
+            cmd.Parameters.AddWithValue("$n", e.Name);
+            cmd.Parameters.AddWithValue("$a", (object?)e.ArtworkSummary ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$m", (object?)e.Mtime ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$s", (object?)e.LastKnownState ?? DBNull.Value);
+            cmd.ExecuteNonQuery();
+        });
     }
 
     public void RebuildIndexCache(string libraryRoot)
     {
-        Exec("DELETE FROM vm_index_cache");
+        lock (_gate) Exec("DELETE FROM vm_index_cache");
         foreach (var pkg in GrassVmPackage.ScanLibraryRoot(libraryRoot))
         {
             UpsertIndex(new VmIndexEntry(pkg.Path, pkg.Name, null,
@@ -247,19 +275,35 @@ public sealed class HostDb : IDisposable
 
     private void Exec(string sql)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = sql;
-        cmd.ExecuteNonQuery();
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = sql;
+            cmd.ExecuteNonQuery();
+        }
     }
 
     private List<T> Query<T>(string sql, Func<SqliteDataReader, T> map)
     {
-        using var cmd = _conn.CreateCommand();
-        cmd.CommandText = sql;
-        using var r = cmd.ExecuteReader();
-        var list = new List<T>();
-        while (r.Read()) list.Add(map(r));
-        return list;
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            cmd.CommandText = sql;
+            using var r = cmd.ExecuteReader();
+            var list = new List<T>();
+            while (r.Read()) list.Add(map(r));
+            return list;
+        }
+    }
+
+    /// <summary>串行化执行一条自建命令（单语句公共方法的统一入口）。</summary>
+    private void Locked(Action<SqliteCommand> body)
+    {
+        lock (_gate)
+        {
+            using var cmd = _conn.CreateCommand();
+            body(cmd);
+        }
     }
 
     public void Dispose() => _conn.Dispose();

@@ -100,10 +100,27 @@ public class QemuCommandBuilderTests : IDisposable
         var args = Build(config, _pkg.Path);
         var j = string.Join(" ", args);
 
-        // 默认启动顺序 硬盘 → CD/DVD → 网络启动（bootindex 1/2/3；空槽位无影响）
-        Assert.Contains("ide-hd,drive=disk10,bus=ahci0.0,bootindex=1", j);
-        Assert.Contains("ide-cd,drive=cd11,bus=ahci0.1,bootindex=2", j);
-        Assert.Contains(",bootindex=3", j); // 网络
+        // 默认启动顺序 硬盘 → CD/DVD → 网络启动（区段 bootindex：硬盘 101…、
+        // 光驱 201…、网络 301…；空槽位无影响）
+        Assert.Contains("ide-hd,drive=disk10,bus=ahci0.0,bootindex=101", j);
+        Assert.Contains("ide-cd,drive=cd11,bus=ahci0.1,bootindex=201", j);
+        Assert.Contains(",bootindex=301", j); // 网络
+    }
+
+    [Fact]
+    public void Cd_MissingIso_BootsWithEmptyDrive_NotDeadEnd()
+    {
+        // 缺失的安装镜像（用户清理 Downloads 是常态）必须降级为空光驱：照发
+        // file=<不存在路径> 会让 QEMU 打不开文件【启动即退】——预检承诺的
+        // "空光驱启动、运行后换介质"就成了永远到不了的谎言（显示器换介质
+        // 恰恰需要一台已经跑起来的 VM）
+        var config = OsProfileLibrary.CreateDefaultConfig("ubuntu", "CdMissing");
+        config.Devices.Add(new CdromDevice { IsoPath = "C:/definitely/missing-安装镜像.iso", CreatedOrder = 20 });
+        var j = string.Join(" ", Build(config, _pkg.Path));
+
+        Assert.DoesNotContain("missing", j);                    // 不引用不存在的文件
+        Assert.Contains("media=cdrom", j);                      // 空光驱仍然在位（可热插换盘）
+        Assert.Contains("ide-cd,drive=cd20", j);                // 设备本体照常接上
     }
 
     [Fact]
@@ -145,8 +162,14 @@ public class QemuCommandBuilderTests : IDisposable
     [Fact]
     public void Cdrom_IsReadonly_AndHotpluggable()
     {
+        // 构建器对"文件不存在的 ISO"降级为空光驱（缺镜像 ≠ 开不了机）——
+        // 这里要断言 file= 形态，先把镜像文件真实造出来
+        var isoDir = Path.Combine(_dir, "iso");
+        Directory.CreateDirectory(isoDir);
+        var iso = Path.Combine(isoDir, "win11.iso");
+        File.WriteAllText(iso, "fake-iso");
         var config = OsProfileLibrary.CreateDefaultConfig("windows-11", "Builder VM");
-        config.Devices.Add(new CdromDevice { IsoPath = "C:\\iso\\win11.iso", CreatedOrder = 30 });
+        config.Devices.Add(new CdromDevice { IsoPath = iso, CreatedOrder = 30 });
         var j = string.Join(" ", Build(config, _pkg.Path));
 
         Assert.Contains("media=cdrom,file=", j);
@@ -175,6 +198,71 @@ public class QemuCommandBuilderTests : IDisposable
         var evil = OsProfileLibrary.CreateDefaultConfig("ubuntu", "Builder VM");
         evil.Devices.Add(new RawDevice { Arguments = new List<string> { "-qmp", "tcp:0.0.0.0:4444" }, CreatedOrder = 40 });
         Assert.Throws<InvalidOperationException>(() => Build(evil, _pkg.Path));
+
+        // 宿主文件别名（与 -drive 同效或更直接）：全都被拒——blocklist 漏一个
+        // 就能把宿主任意文件挂进客户机
+        foreach (var alias in new[]
+                 {
+                     "-hda", "-cdrom", "-pflash", "-kernel", "-initrd", "-virtfs", "-fsdev",
+                     "-net", "-object", "-drive", "-blockdev", "-netdev", "-nic", "-L", "-plugin",
+                     "-fw_cfg", "-audiodev", "-loadvm", "-global", "-D", "-debugcon",
+                     "-readconfig", "-writeconfig", "-option-rom", "-set", "-mem-path",
+                     // 关键全局标量（QEMU 末位生效）：改写 Core 的 -m/-smp/-cpu 等
+                     "-m", "-smp", "-cpu", "-name", "-boot", "-rtc", "-vga",
+                     // 宿主文件 → 客户机固件表（与 -option-rom 同类）
+                     "-acpitable", "-smbios",
+                     // 宿主文件挂成可读写 USB 盘（与 -hda 同类）
+                     "-usbdevice",
+                     // 别名/同类形态：-qmp-pretty 同样开控制服务器；-sdl 开
+                     // QEMU 自有显示窗口；-trace 以 events=/file= 读写宿主文件；
+                     // -no-shutdown 等改写"关机=退出"的状态机根基（锁永不释放）
+                     "-qmp-pretty", "-sdl", "-trace", "-no-shutdown", "-no-reboot", "-action", "-watchdog-action",
+                     // 双连字形态：QEMU 的解析器同收 --opt（实测 --qmp 会真的开控制
+                     // 服务器）——精确匹配会让整个黑名单被 -- 前缀绕过
+                     "--qmp", "--drive", "--nographic", "--readconfig",
+                 })
+        {
+            var cfg = OsProfileLibrary.CreateDefaultConfig("ubuntu", "Builder VM");
+            cfg.Devices.Add(new RawDevice
+            {
+                Arguments = new List<string> { alias, "C:/Users/victim/secret.bin" },
+                CreatedOrder = 40,
+            });
+            var ex = Record.Exception(() => Build(cfg, _pkg.Path));
+            Assert.True(ex is InvalidOperationException, $"别名未被拦截：{alias}");
+        }
+
+        // -device 值里的宿主文件引用（loader,file=）同样被拒；
+        // romfile= 也是宿主文件引用（option ROM 读任意文件），大小写不敏感
+        // （QemuOpts 键不区分大小写——loader,FILE= 不能绕过）
+        var loader = OsProfileLibrary.CreateDefaultConfig("ubuntu", "Builder VM");
+        loader.Devices.Add(new RawDevice
+        {
+            Arguments = new List<string> { "-device", "loader,file=C:/Users/victim/firmware.bin" },
+            CreatedOrder = 40,
+        });
+        Assert.Throws<InvalidOperationException>(() => Build(loader, _pkg.Path));
+        foreach (var payload in new[]
+                 {
+                     "virtio-net-pci,romfile=C:/Users/victim/rom.bin",
+                     "loader,FILE=C:/Users/victim/firmware.bin",
+                     "virtio-net-pci,netdev=n0",   // 后端引用同样拒（netdev 由 Core 全权管理）
+                     "vfio-pci,host=00:02.0",       // 宿主 PCI 物理设备直通（与 usb-host 同类）
+                     "e1000,bootindex=2",           // 对照：普通属性不受影响
+                 })
+        {
+            var cfg2 = OsProfileLibrary.CreateDefaultConfig("ubuntu", "Builder VM");
+            cfg2.Devices.Add(new RawDevice
+            {
+                Arguments = new List<string> { "-device", payload },
+                CreatedOrder = 41,
+            });
+            var ex2 = Record.Exception(() => Build(cfg2, _pkg.Path));
+            if (payload == "e1000,bootindex=2")
+                Assert.Null(ex2);
+            else
+                Assert.True(ex2 is InvalidOperationException, $"宿主文件/后端引用未被拦截：{payload}");
+        }
     }
 
     [Fact]
@@ -213,6 +301,19 @@ public class QemuCommandBuilderTests : IDisposable
             .Select(a => a.Split("bootindex=")[1].Split(',')[0]).ToList();
         Assert.Equal(indices.Count, indices.Distinct().Count());
 
+        // 1b) 类区段连续：所有硬盘 < 所有光驱 < 所有网卡（QEMU 按数值全局排序。
+        // 旧算法第二块盘 101 排到光驱 2 / 网卡 3 之后——双盘 VM 先 PXE 再系统盘）
+        List<int> AllIdx(params string[] devices) => args
+            .Where(a => a.Contains("bootindex=", StringComparison.Ordinal)
+                        && devices.Any(d => a.Contains(d, StringComparison.Ordinal)))
+            .Select(a => int.Parse(a.Split("bootindex=")[1].Split(',')[0])).ToList();
+        var diskIdx = AllIdx("ide-hd", "scsi-hd", "virtio-blk");
+        var cdIdx = AllIdx("ide-cd", "scsi-cd");
+        var netIdx = AllIdx("e1000", "virtio-net");
+        Assert.True(diskIdx.Count >= 2 && netIdx.Count >= 2, "本测试需要多盘多网卡形态");
+        Assert.True(diskIdx.Max() < cdIdx.Min(), "硬盘区段必须整体排在光驱前");
+        Assert.True(cdIdx.Max() < netIdx.Min(), "光驱必须整体排在网卡前");
+
         // 2) 网卡 MAC 派生自 DeviceId：两块卡必须不同
         var macs = args.Where(a => a.Contains("mac=", StringComparison.Ordinal))
             .Select(a => a.Split("mac=")[1].Split(',')[0]).ToList();
@@ -234,5 +335,21 @@ public class QemuCommandBuilderTests : IDisposable
         Assert.Contains("-nic", args);
         var i = Array.IndexOf(args, "-nic");
         Assert.Equal("none", args[i + 1]);
+    }
+
+    [Fact]
+    public void RawNicDeviceWithoutBackend_StillEmitsNicNone()
+    {
+        // 裸 -device e1000（兼容设备、无后端）≠ 用户要网络：QEMU 的默认网卡只被
+        // 后端选项（-netdev/-nic/-net）抑制。若被裸 -device 抑制了 -nic none，
+        // QEMU 会静默补一张隐式 SLIRP NAT 网卡——"断网"承诺被绕过
+        var config = OsProfileLibrary.CreateDefaultConfig("ubuntu", "RawNic");
+        config.Devices.RemoveAll(d => d is NetworkDevice);
+        config.Devices.Add(new RawDevice { Arguments = new List<string> { "-device", "e1000" }, CreatedOrder = 20 });
+        var args = Build(config, _pkg.Path);
+
+        var i = Array.IndexOf(args, "-nic");
+        Assert.True(i >= 0 && args[i + 1] == "none",
+            "裸 -device 网卡型号不得抑制 -nic none（会重新放开隐式 NAT 网卡）");
     }
 }

@@ -17,6 +17,13 @@ public sealed class VmState
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
     };
 
+    /// <summary>
+    /// 与 Load/Save 同源的读取选项。供需要【严格读】的调用方共用（损坏即抛，
+    /// 而不是像 Load 那样静默重建——Restore 事务的提交判定依赖它区分
+    /// "pending 已清"与"state 读不了"）。
+    /// </summary>
+    internal static JsonSerializerOptions ForRead => Opts;
+
     public DateTimeOffset? LastStartedAt { get; set; }
     /// <summary>记录创建/最后运行时的 QEMU major（升级保护判定用；1.4 = 一套确定版本的 Core+QEMU+Helper+驱动）。</summary>
     public string? LastQemuMajor { get; set; }
@@ -36,6 +43,13 @@ public sealed class VmState
     public string? SuspendedStatePath { get; set; }
     /// <summary>挂起时的宿主环境指纹：只保证相同宿主 CPU 环境 + 同一 QEMU major 下恢复。</summary>
     public string? SuspendFingerprint { get; set; }
+
+    /// <summary>
+    /// 进行中的 Restore 事务一次性标识（与 snapshots/restore-journal.json 的 TxId 配对）。
+    /// 事务开始前写入；提交点（位置 + 清除）一次落盘。修复用它判定"已提交/未提交"——
+    /// 只看"位置 == 目标"在恢复到当前位置时无法区分（目标本来就是当前位置）。
+    /// </summary>
+    public string? PendingRestoreTxId { get; set; }
 
     public sealed record WindowState(int Width, int Height);
 

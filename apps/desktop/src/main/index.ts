@@ -12,15 +12,27 @@ import { WebSocketServer } from './ws-lite';
 import { CoreBridge } from './core-bridge';
 
 let bridge: CoreBridge | null = null;
+// 单飞：并发首调（启动风暴里 statusList + 每个 VM 卡片的并行 RPC）共享同一次
+// 连接尝试——否则会孵出多个 GrassCore 进程
+let bridgeConnecting: Promise<CoreBridge> | null = null;
 
 async function createBridge(): Promise<CoreBridge> {
   if (bridge) return bridge;
-  const isDevPackaged = app.isPackaged
-    ? path.join(process.resourcesPath, 'GrassCore', 'GrassCore.exe')
-    : path.join(__dirname, '..', '..', 'core-rundir', 'GrassCore.exe');
-  bridge = new CoreBridge(isDevPackaged);
-  await bridge.ensureRunning();
-  return bridge;
+  if (bridgeConnecting) return bridgeConnecting;
+  bridgeConnecting = (async () => {
+    const isDevPackaged = app.isPackaged
+      ? path.join(process.resourcesPath, 'GrassCore', 'GrassCore.exe')
+      : path.join(__dirname, '..', '..', 'core-rundir', 'GrassCore.exe');
+    const b = new CoreBridge(isDevPackaged);
+    await b.ensureRunning();
+    return b;
+  })();
+  try {
+    bridge = await bridgeConnecting;
+    return bridge;
+  } finally {
+    bridgeConnecting = null;
+  }
 }
 
 function createLibraryWindow(): void {
@@ -43,7 +55,13 @@ function createLibraryWindow(): void {
 }
 
 /** 显示器窗口：UI 崩溃窗口可消失，但 Guest 继续运行；重开 UI 后"打开显示器"重新接入。 */
-function createDisplayWindow(vmName: string, spicePort: number, packagePath: string, token: string): BrowserWindow {
+function createDisplayWindow(
+  vmName: string,
+  spicePort: number,
+  bridgePort: number,
+  packagePath: string,
+  token: string,
+): BrowserWindow {
   const win = new BrowserWindow({
     width: 1024,
     height: 768,
@@ -57,10 +75,11 @@ function createDisplayWindow(vmName: string, spicePort: number, packagePath: str
     },
   });
   win.setMenuBarVisibility(false);
-  // 显示器页面通过 URL query 拿到本机 SPICE 端口；实际画面由 spice-client 经 WS 桥接入
+  // 桥端口（WS 接入点）与 SPICE 端口（127.0.0.1 直连、不暴露给页面）分开传：
+  // 前者给 spice-client 连接用，后者仅作展示/诊断
   win.loadFile(path.join(__dirname, '..', 'renderer', 'display', 'index.html'), {
     // 电源动作需要包路径（Core 按包路径寻址）；名称仅用于展示
-    query: { vm: vmName, port: String(spicePort), path: packagePath, token },
+    query: { vm: vmName, port: String(bridgePort), spicePort: String(spicePort), path: packagePath, token },
   });
   return win;
 }
@@ -107,29 +126,42 @@ ipcMain.handle('paths:defaultLibraryDir', () =>
   path.join(app.getPath('documents'), 'Grass Block VM'),
 );
 
+/** 正在打开中的显示器（包路径集合）：双击"打开显示器"会并发进来两次 invoke，
+ *  异步桥启动让两个都通过"没有已开窗口"的检查——各开一扇窗+各起一座桥。
+ *  同步占位把这个竞态关掉。 */
+const openingDisplays = new Set<string>();
+
 ipcMain.handle('display:open', async (_e, vmName: string, spicePort: number, packagePath: string) => {
-  // 一台 VM 同时只允许一个显示器窗口：已开则聚焦（重复桥也会堆叠资源）
+  // 一台 VM 同时只允许一个显示器窗口：已开则聚焦。只按包路径匹配——按标题匹配
+  // 会撞上重名 VM 或库主窗口（标题也是 VM 名时聚焦错窗口，显示器"打不开"）
   const existing = [...BrowserWindow.getAllWindows()].find(
-    (w) => (w.getTitle() === vmName || openDisplays.get(w.id) === packagePath) && !w.isDestroyed(),
+    (w) => openDisplays.get(w.id) === packagePath && !w.isDestroyed(),
   );
   if (existing) {
     existing.focus();
     return true;
   }
-  const bridge = await startSpiceBridge(spicePort);
-  const win = createDisplayWindow(vmName, spicePort, packagePath, bridge.wss.token);
-  openDisplays.set(win.id, packagePath);
-  displayBridges.set(win.id, bridge);
-  win.on('closed', () => {
-    openDisplays.delete(win.id);
-    const b = displayBridges.get(win.id);
-    if (b) {
-      displayBridges.delete(win.id);
-      for (const client of b.wss.clients) client.terminate();
-      b.server.close();
-    }
-  });
-  return true;
+  if (openingDisplays.has(packagePath)) return true; // 并发的第二次点击：等第一路开完
+  openingDisplays.add(packagePath);
+  try {
+    const bridge = await startSpiceBridge(spicePort);
+    const bridgePort = (bridge.server.address() as net.AddressInfo).port;
+    const win = createDisplayWindow(vmName, spicePort, bridgePort, packagePath, bridge.wss.token);
+    openDisplays.set(win.id, packagePath);
+    displayBridges.set(win.id, bridge);
+    win.on('closed', () => {
+      openDisplays.delete(win.id);
+      const b = displayBridges.get(win.id);
+      if (b) {
+        displayBridges.delete(win.id);
+        for (const client of b.wss.clients) client.terminate();
+        b.server.close();
+      }
+    });
+    return true;
+  } finally {
+    openingDisplays.delete(packagePath);
+  }
 });
 
 // 文件选择对话框：导入（.zip/.ova/.ovf）、导出保存位置、安装镜像选择共用。
@@ -157,7 +189,9 @@ app.whenReady().then(async () => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createLibraryWindow();
   });
-  // 自启动：应用启动时按宿主级清单串行拉起（间隔 10s 由 Core 钳制），失败项由 Core 通知
+  // 自启动只在【开机登录触发的启动】跑（安装器写的 Run 键带 --autostart）。
+  // 用户手动打开应用不拉清单——否则每次打开库都把所有 autostart VM 开一遍
+  if (!process.argv.includes('--autostart')) return;
   try {
     const b = await createBridge();
     b.call('runAutostart', {}).catch((e: unknown) => console.error('[autostart]', e));

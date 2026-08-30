@@ -199,6 +199,25 @@ public class SnapshotServiceTests : IDisposable
     }
 
     [Fact]
+    public void Delete_RetryAfterPartialCleanup_CompletesResidue()
+    {
+        // "删除被占用 → 稍后重删一次"的承诺必须真的能兑现：树里已无此快照
+        //（metadata 已被上次删除清掉）只剩物理残目录时，重删是完成清理，
+        // 不是裸抛 KeyNotFoundException
+        var pkg = GrassVmPackage.CreateNew(_dir, "重删机");
+        var config = OsProfileLibrary.CreateDefaultConfig("ubuntu", "重删机");
+        var s1 = SnapshotService.Create(pkg, config, "one");
+        SnapshotService.Delete(pkg, s1.Uuid);
+
+        var dir = Path.Combine(pkg.SnapshotsPath, s1.Uuid);
+        Directory.CreateDirectory(dir); // 上次中途失败留下的残目录
+        File.WriteAllText(Path.Combine(dir, "freeze-intent.json"), "{}");
+
+        SnapshotService.Delete(pkg, s1.Uuid); // 不抛
+        Assert.False(Directory.Exists(dir));
+    }
+
+    [Fact]
     public void Create_AfterRestore_ParentsToRestoredPosition_NotLatestLeaf()
     {
         var pkg = GrassVmPackage.CreateNew(_dir, "位置机");

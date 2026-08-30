@@ -28,17 +28,41 @@ public sealed class GrassCoreService
     /// <summary>是否有运行中的 VM（Core 空闲退出判定用）。</summary>
     public bool HasRunningVms => !_running.IsEmpty;
 
-    /// <summary>本机标识（宿主级持久，首次生成）：会话归属判定，防别机会话被本机"收尾"。</summary>
+    /// <summary>
+    /// 进行中的收尾/磁盘作业数（快照提交/rebase、升级保护清理等）。
+    /// 空闲退出必须等它归零：VM 从 _running 摘除之后还有一个 qemu-img 窗口，
+    /// 大盘 commit 轻松超过两分钟——Core 死在链维护一半 = 下个实例并发抢锁。
+    /// </summary>
+    private int _inFlightDiskJobs;
+
+    public bool HasInFlightDiskJobs => Volatile.Read(ref _inFlightDiskJobs) > 0;
+
+    private void WithDiskJob(Action body)
+    {
+        Interlocked.Increment(ref _inFlightDiskJobs);
+        try { body(); }
+        finally { Interlocked.Decrement(ref _inFlightDiskJobs); }
+    }
+
+    /// <summary>
+    /// 本机标识（宿主级持久，首次生成）：会话归属判定，防别机会话被本机"收尾"。
+    /// 进程内缓存：写进 session 的值与后续校验必须字字相同——每次都走 DB 读取，
+    /// 任何一次读漏都会现场生成新 GUID，把自家会话误判成"别机的"（接管静默跳过）
+    /// </summary>
+    private string? _machineIdCached;
+
     private string MachineId
     {
         get
         {
+            if (_machineIdCached is not null) return _machineIdCached;
             var id = _db.GetPreference("machineId");
             if (id is null)
             {
                 id = Guid.NewGuid().ToString("N");
                 _db.SetPreference("machineId", id);
             }
+            _machineIdCached = id;
             return id;
         }
     }
@@ -46,6 +70,18 @@ public sealed class GrassCoreService
     /// <summary>每包一把信号量：生命周期操作（启动/恢复/挂起/电源）按包串行——并发 RPC 分发下双击 start 不会再赛跑。</summary>
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> _pkgGates =
         new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>进行中的生命周期阶段（"starting"/"suspending"）：ScanLibrary 如实上报，
+    /// UI 才不会在长达数分钟的挂起/启动期间显示错误状态、点开注定失败的电源菜单。</summary>
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _lifecycleInFlight =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    private T WithLifecyclePhase<T>(string packagePath, string phase, Func<T> action)
+    {
+        _lifecycleInFlight[packagePath] = phase;
+        try { return action(); }
+        finally { _lifecycleInFlight.TryRemove(packagePath, out _); }
+    }
 
     private T WithPackageGate<T>(string packagePath, Func<T> action)
     {
@@ -88,6 +124,17 @@ public sealed class GrassCoreService
         public QmpClient? Qmp { get; set; }
         /// <summary>已发送 ACPI 电源按钮请求（正常关机的唯一可信信号；quit/崩溃不算）。</summary>
         public volatile bool AcpiShutdownRequested;
+        /// <summary>
+        /// 本次是挂起恢复（-incoming）。退出时若挂起标记还在（恢复确认循环没能确认
+        /// running），保存的内存状态不可再重放——客户机可能已跑过并写过磁盘。
+        /// </summary>
+        public volatile bool ResumedFromSuspend;
+        /// <summary>
+        /// 退出收尾由监督方负责（挂起流程）：它持有包级门并自己放锁。监视器此时
+        /// 必须让位——否则同步派发（WaitForExit 在持门线程上触发 Exited）会自死锁，
+        /// 异步派发也会抢在监督方之前放锁/清 runtime
+        /// </summary>
+        public volatile bool ExitCleanupSuppressed;
     }
 
     /// <summary>当前 Library Root（宿主只有一个；更改只影响之后创建/导入）。</summary>
@@ -126,8 +173,15 @@ public sealed class GrassCoreService
                     if (VmState.Load(p).SuspendedStatePath is not null) state = "suspended";
                 }
                 catch { /* state.json 损坏按 stopped 列出，打开时完整性检查给诊断 */ }
-                if (_running.ContainsKey(p.Path)) state = "running";
-                else if (File.Exists(p.LockPath) && File.Exists(p.SessionPath)) state = "running"; // 异常残留：接管中
+                // 进行中的生命周期（启动/挂起可能长达数分钟）：如实上报，UI 才不会
+                // 在"实际已暂停"的挂起途中显示 正在运行 + 可点电源菜单
+                if (_lifecycleInFlight.TryGetValue(p.Path, out var phase))
+                    state = phase;
+                else if (_running.ContainsKey(p.Path)) state = "running";
+                // 锁+会话残留但【本 Core 没在运行它】（接管被合法拒绝：会话缺
+                // MachineId / 损坏 / 别的机器的会话）：按 stopped 如实列出
+                // （Locked=true 已经表达了"有残锁"）。报成 running 会让 UI 禁用
+                // 解除锁定按钮——唯一诚实的恢复路径被掐死，卡片永久卡死
                 return new VmSummaryDto(
                     Path: p.Path, Name: p.Name, OsProfileId: osProfile, State: state,
                     CpuCores: cpu, MemoryMiB: mem,
@@ -156,22 +210,40 @@ public sealed class GrassCoreService
     {
         var name = args.GetProperty("name").GetString()!;
         var profileId = args.GetProperty("profileId").GetString()!;
-        var diskGiB = args.GetProperty("diskGiB").GetInt64();
-        // 名称同时是包目录名与 QEMU -name 值：文件系统非法字符或逗号（QEMU 选项解析分隔符）都拒绝
-        if (string.IsNullOrWhiteSpace(name) || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || name.Contains(','))
+        // 与 cpuCores/memoryMiB/resizeDisk 同一道防线：向导输入 1e999 时
+        // Number → Infinity，JSON.stringify 把它序列化成 null，GetInt64 对
+        // Null 元素裸抛英文 InvalidOperationException——按产品规则给可读错误
+        var diskGiBEl = args.GetProperty("diskGiB");
+        var diskGiB = diskGiBEl.ValueKind == JsonValueKind.Number && diskGiBEl.TryGetInt64(out var diskGiBValue)
+            ? diskGiBValue
+            : throw new GrassCoreException("磁盘大小必须是整数 GB。");
+        // 名称同时是包目录名与 QEMU -name 值：文件系统非法字符、逗号（QEMU 选项
+        // 解析分隔符）与等号（会被 -name 当成 key=value 键，启动即失败）都拒绝
+        if (IsInvalidVmName(name))
             throw new GrassCoreException(
-                $"虚拟机名称不合法：{name}（不能为空，不能包含文件系统不允许的字符或逗号）");
+                $"虚拟机名称不合法：{name}（不能为空，不能包含文件系统不允许的字符、逗号或等号）");
         var isoPath = args.TryGetProperty("isoPath", out var iso) && iso.ValueKind != JsonValueKind.Null ? iso.GetString() : null;
 
         // 向导可调参数：cpuCores / memoryMiB（缺省 = Profile 推荐；钳制到安全范围）
         var root = _db.LibraryRoot ?? throw new InvalidOperationException("尚未设置虚拟机存档位置。");
         var profile = OsProfileLibrary.ById(profileId);
         var pkg = GrassVmPackage.CreateNew(root, name);
+        try
+        {
         var config = OsProfileLibrary.CreateDefaultConfig(profileId, name);
-        if (args.TryGetProperty("cpuCores", out var cpuEl) && cpuEl.ValueKind == JsonValueKind.Number)
-            config.CpuCores = Math.Clamp(cpuEl.GetInt32(), 1, Math.Max(1, Environment.ProcessorCount));
-        if (args.TryGetProperty("memoryMiB", out var memEl) && memEl.ValueKind == JsonValueKind.Number)
-            config.MemoryMiB = Math.Clamp(memEl.GetInt32(), 512, Math.Max(512, (int)(GetTotalHostMemoryMiB() / 2)));
+        // 向导的数字输入是自由文本：越界值要【钳制】而不是裸抛（GetInt32 对
+        // 超 int 的 JSON 数抛 FormatException、英文原文直接进错误横幅——
+        // "宁可钳制不可拒绝"）。磁盘 GiB 同理钳到产品域上限，防止
+        // GiB→字节的乘法静默回绕成负 size 交给 qemu-img
+        if (args.TryGetProperty("cpuCores", out var cpuEl) && cpuEl.ValueKind == JsonValueKind.Number
+            && cpuEl.TryGetInt64(out var cpu64))
+            config.CpuCores = (int)Math.Clamp(cpu64, 1, Math.Max(1, Environment.ProcessorCount));
+        if (args.TryGetProperty("memoryMiB", out var memEl) && memEl.ValueKind == JsonValueKind.Number
+            && memEl.TryGetInt64(out var mem64))
+            config.MemoryMiB = Library.HostResources.ClampMemoryMiB((int)Math.Clamp(mem64, 512, int.MaxValue));
+        // 产品域：单盘 1..2048 GiB（任何真实 Profile 之上；2048TiB 级别的
+        // 请求既放不下也建不出，钳到上限后由空间预检/真实 qemu-img 报可读错误）
+        diskGiB = Math.Clamp(diskGiB, 1, 2048);
 
         // 向导强制的"至少一个可启动来源"（普通安装场景），底层模型不被限制
         var order = DeviceNamer.NextCreatedOrder(config);
@@ -192,10 +264,16 @@ public sealed class GrassCoreService
         }
         if (profile.Firmware == FirmwareKind.Uefi)
         {
-            // NVRAM 变量卷从模板复制，每 VM 独立
-            Directory.CreateDirectory(pkg.FirmwarePath);
+            // NVRAM 变量卷从模板复制，每 VM 独立。
+            // 模板缺失必须当场失败（回滚包目录）：静默跳过的话，建出来的是一台
+            // 预检永远拒绝启动的 VM，且提示语指向一个不存在的"设置里重建"入口
+            // ——死路一条。与 OVF 导入的同场景处理（警告）至少同样显式
             var template = Path.Combine(_ovmfDir, "OVMF_VARS.fd");
-            if (File.Exists(template)) File.Copy(template, Path.Combine(pkg.FirmwarePath, "VARS.fd"));
+            if (!File.Exists(template))
+                throw new GrassCoreException(
+                    $"无法创建 UEFI 虚拟机：固件模板缺失（{template}）。请重新安装或修复应用后重试。");
+            Directory.CreateDirectory(pkg.FirmwarePath);
+            File.Copy(template, Path.Combine(pkg.FirmwarePath, "VARS.fd"));
         }
 
         // 稀疏 QCOW2 创建（事务式）
@@ -204,7 +282,17 @@ public sealed class GrassCoreService
 
         new ConfigStore(pkg).Save(config);
         _db.UpsertIndex(new HostDb.VmIndexEntry(pkg.Path, pkg.Name, null, DateTimeOffset.UtcNow.ToString("o"), null));
-        // "创建后立即启动"（向导默认开）：由 Core 一并完成，UI 只负责刷新
+        }
+        catch
+        {
+            // 创建失败回滚包目录：半成品（无 config.json 的骨架）会被 ScanLibrary
+            // 当成坏 VM 列出来，且没有删除入口——用户只能去文件管理器里刨
+            try { if (Directory.Exists(pkg.Path)) Directory.Delete(pkg.Path, recursive: true); }
+            catch { /* 残留骨架：StartVm 预检会给诊断 */ }
+            throw;
+        }
+        // "创建后立即启动"（向导默认开）：由 Core 一并完成，UI 只负责刷新。
+        // 在回滚范围【之外】：VM 已完整建成，启动失败不该连带删掉它
         if (args.TryGetProperty("startAfterCreate", out var sac) && sac.ValueKind == JsonValueKind.True)
         {
             StartVm(pkg.Path);
@@ -220,7 +308,8 @@ public sealed class GrassCoreService
 
     // ---------- 启动 / 电源 ----------
 
-    public object StartVm(string packagePath) => WithPackageGate(packagePath, () => StartVmCore(packagePath));
+    public object StartVm(string packagePath) => WithPackageGate(packagePath, () =>
+        WithLifecyclePhase(packagePath, "starting", () => StartVmCore(packagePath)));
 
     private object StartVmCore(string packagePath)
     {
@@ -237,14 +326,13 @@ public sealed class GrassCoreService
         if (_running.ContainsKey(pkg.Path))
             throw new GrassCoreException("此虚拟机已经在运行。");
 
-        // 修复"快照换入中断"残留（幂等）：工作盘缺失但暂存 overlay 完好 → 完成换入
-        SnapshotService.RepairStagedOverlays(pkg);
-
-        // 预检：资源、vm.lock、显示设备、NVRAM（WHPX 检测在 Windows 主机上执行）
+        // 收尾 + 预检（StartVm/ResumeVm 共用同一套次序，见 RepairThenPreflight）：
+        // ① vm.lock 先拒；② 修复"快照换入中断"残留；③ 全量预检。
+        // 关键：②必须在磁盘预检【之前】——Create/Restore 的换入事务崩溃现场是
+        // "工作盘缺失 + 暂存 overlay 完好"，那正是修复要补齐的形态；预检先跑
+        // 会把可自愈的现场误报成"磁盘文件丢失"的死路（内部盘没有重定位入口）
         var view = ToConfigView(config);
-        var problems = StartupPreflight.Check(pkg, view);
-        if (problems.Any(p => p.Fatal))
-            throw new GrassCoreException(string.Join("\n", problems.Where(p => p.Fatal).Select(p => p.UserMessage)));
+        RepairThenPreflight(pkg, view);
 
         // WHPX：只使用硬件虚拟化，初始化失败即阻止启动，绝不静默回退 TCG
         if (OperatingSystem.IsWindows())
@@ -261,14 +349,19 @@ public sealed class GrassCoreService
         Process? proc = null;
         try
         {
-            // 升级保护：跨 QEMU major 首启 → 备份元数据 + 隐藏保护快照（由快照服务落盘）
-            if (UpgradeProtection.NeedsProtection(state.LastQemuMajor, _bundledQemuMajor))
+            // 升级保护：跨 QEMU major 首启 → 备份元数据 + 隐藏保护快照（由快照服务落盘）。
+            // 已存在未清理的保护快照就不再造：启动若在"快照已落、LastQemuMajor 还没写"
+            // 之间失败，重试会叠一层又一层的保护快照（删除计时只认正常关机）。
+            var protectionCreated = false;
+            if (UpgradeProtection.NeedsProtection(state.LastQemuMajor, _bundledQemuMajor)
+                && !SnapshotService.LoadTree(pkg).All.Any(s => s.IsUpgradeProtection))
             {
                 var plan = UpgradeProtection.CreatePlan(pkg, state.LastQemuMajor!, _bundledQemuMajor);
                 UpgradeProtection.BackupMetadata(pkg, plan.MetadataBackupDir);
                 SnapshotService.Create(pkg, config, name: "升级保护快照", isUpgradeProtection: true,
                     diskOps: new Qemu.TransactionalDiskOps(_qemuImgPath),
                     upgradeProtectionBackupDir: plan.MetadataBackupDir);
+                protectionCreated = true;
             }
 
             var sessionId = Guid.NewGuid().ToString("N")[..12];
@@ -287,6 +380,19 @@ public sealed class GrassCoreService
             proc = _launcher.Start(cmd);
             session.QemuPid = proc.Id;
             AtomicFile.WriteJsonValidated(pkg.SessionPath, session.Serialize());
+
+            // 跨 major 首启：5 秒早期失败检测（升级保护的配套——QemuSurvivesEarlyWindow
+            // 此前没有任何调用方，承诺的"提示回退上一 major"从未发生）。只在这条稀有
+            // 路径上等 5 秒，正常启动不付出这个延迟。失败时走 catch 的 RollbackStart
+            // （放锁/清 runtime）；保护快照与备份刻意保留
+            if (protectionCreated
+                && !WhpxCapability.QemuSurvivesEarlyWindowAsync(proc).GetAwaiter().GetResult())
+            {
+                throw new GrassCoreException(
+                    "新版 QEMU 在 5 秒内退出，可能与此虚拟机不兼容。诊断信息已写入 logs/qemu.log；" +
+                    "升级保护快照与元数据备份已保留（24 小时内不会自动删除），" +
+                    "可回退到上一版本，或导出脱敏日志反馈问题。");
+            }
 
             // 注意：升级保护快照已在磁盘上推进了 CurrentSnapshotUuid——必须重读，
             // 不能用过期实例覆盖（否则位置标记回退，后续自动删除会误判"位置不在这"，
@@ -334,7 +440,8 @@ public sealed class GrassCoreService
     }
 
     /// <summary>挂起恢复：-incoming 从保存状态回到挂起瞬间。只保证相同宿主 CPU + 同一 QEMU major。</summary>
-    public object ResumeVm(string packagePath) => WithPackageGate(packagePath, () => ResumeVmCore(packagePath));
+    public object ResumeVm(string packagePath) => WithPackageGate(packagePath, () =>
+        WithLifecyclePhase(packagePath, "starting", () => ResumeVmCore(packagePath)));
 
     private object ResumeVmCore(string packagePath)
     {
@@ -356,13 +463,11 @@ public sealed class GrassCoreService
         if (_running.ContainsKey(pkg.Path))
             throw new GrassCoreException("此虚拟机已经在运行。");
 
-        // 与 StartVm 同一套预检（含换入中断修复）：挂起恢复同样要磁盘/固件在位，
-        // 否则 QEMU 秒退、用户只看到"恢复没反应"
-        SnapshotService.RepairStagedOverlays(pkg);
+        // 与 StartVm 同一套次序（见 RepairThenPreflight）：vm.lock 先拒 → 修复
+        // 换入中断残留 → 全量预检。挂起恢复同样要磁盘/固件在位，否则 QEMU 秒退、
+        // 用户只看到"恢复没反应"；Restore 日志收不了尾同样拒绝
         var view = ToConfigView(config);
-        var problems = StartupPreflight.Check(pkg, view);
-        if (problems.Any(p => p.Fatal))
-            throw new GrassCoreException(string.Join("\n", problems.Where(p => p.Fatal).Select(p => p.UserMessage)));
+        RepairThenPreflight(pkg, view);
         if (OperatingSystem.IsWindows())
         {
             var whpx = WhpxCapability.CheckWindows();
@@ -393,41 +498,90 @@ public sealed class GrassCoreService
             session.QemuPid = proc.Id;
             AtomicFile.WriteJsonValidated(pkg.SessionPath, session.Serialize());
 
-            var vm = new RunningVm(pkg.Path, session, proc);
+            var vm = new RunningVm(pkg.Path, session, proc) { ResumedFromSuspend = true };
             vm.Qmp = TryConnectQmp(session.QmpPipe);
             _running[pkg.Path] = vm;
             registered = true;
             WatchQemuProcess(vm);
 
             // 恢复确认：-incoming 迁移完成（query-status=running）后才清除挂起标记。
-            // 一次失败的恢复尝试不能毁掉整个保存的会话（保守：失败时标记保留，可重试）。
+            // 不设时限：大内存 + 慢存储的迁移可能远超几分钟——超时放弃的话，迁移稍后
+            // 完成、客户机开始写盘，而标记还在 = 之后把旧 RAM 重放到新磁盘（挂起语义
+            // 要防的损坏）。循环在 running 确认或进程退出时结束（QMP 连不上的重试
+            // 逐渐退避，避免对死管道高频敲门）。
             _ = Task.Run(async () =>
             {
                 try
                 {
-                    var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(5);
-                    while (DateTime.UtcNow < deadline && !vm.Process.HasExited)
+                    var qmpMisses = 0;
+                    while (true)
                     {
-                        var q = vm.Qmp ?? TryConnectQmp(session.QmpPipe);
+                        if (vm.Process.HasExited)
+                        {
+                            // -incoming 之后进程退出：客户机可能已经跑过并写过磁盘，
+                            // 旧内存快照不再匹配磁盘——留着它 = 下次恢复把旧 RAM 重放到
+                            // 新磁盘上。作废状态。
+                            // 例外：用户在确认窗口里挂起了——退出是【合法的新挂起】，
+                            // suspend.state 是刚保存的新状态（挂起流程写标记前会清
+                            // ResumedFromSuspend）。作废它 = 用户 RAM 凭空消失
+                            if (!vm.ResumedFromSuspend) return;
+                            break;
+                        }
+                        QmpClient? q;
+                        if (vm.Qmp is not null)
+                        {
+                            q = vm.Qmp;
+                        }
+                        else if (qmpMisses % 60 == 0) // 每 ~30 秒重试一次连接
+                        {
+                            q = TryConnectQmp(session.QmpPipe);
+                        }
+                        else
+                        {
+                            q = null;
+                        }
                         if (q is not null)
                         {
                             vm.Qmp = q;
+                            qmpMisses = 0;
                             if (await q.VmStatusAsync() == "running")
                             {
-                                var st = VmState.Load(pkg);
-                                st.SuspendedStatePath = null;
-                                st.SuspendFingerprint = null;
-                                st.Save(pkg);
-                                try { File.Delete(suspendFile); } catch { /* 空间回收失败不致命 */ }
+                                // 与进程退出分支同一道防线：响应在途期间用户可能
+                                // 已挂起（新状态刚落盘、ResumedFromSuspend 已被挂起
+                                // 流程复位）——此刻清标记/删状态文件 = 把用户刚
+                                // 保存的新 RAM 状态静默销毁。
+                                // 清尾整体放包级门内 + 门内复核标志：标志检查与
+                                // 落盘之间的窗口（GC 暂停/线程冻结足以撕开）里
+                                // 一次并发挂起会写同一份 state.json/同一个
+                                // suspend.state——不互斥就被这里静默抹掉
+                                if (!vm.ResumedFromSuspend) return;
+                                WithPackageGate(pkg.Path, () =>
+                                {
+                                    if (!vm.ResumedFromSuspend) return true; // 挂起已完整接管，新状态归它
+                                    ClearResumedSuspendMarker(pkg, suspendFile);
+                                    return true;
+                                });
                                 return;
                             }
                         }
+                        else
+                        {
+                            qmpMisses++;
+                        }
                         await Task.Delay(500);
                     }
+                    // 确认循环超时兜底：同样走门 + 标志复核（并发挂起的窗口不分分支）
+                    WithPackageGate(pkg.Path, () =>
+                    {
+                        if (!vm.ResumedFromSuspend) return true;
+                        ClearResumedSuspendMarker(pkg, suspendFile);
+                        return true;
+                    });
                 }
                 catch
                 {
-                    // 确认失败：保留挂起标记（宁可保守；下次正常关机后标记自然失效）
+                    // 确认失败且未能判定：退出路径的兜底（ResumedFromSuspend 标记 +
+                    // WatchQemuProcess）仍会处理；这里保留标记不冒险
                 }
             });
             return new { qemuPid = proc.Id, resumed = true };
@@ -443,6 +597,20 @@ public sealed class GrassCoreService
     }
 
     /// <summary>
+    /// 恢复确认后的旧挂起状态清尾。只允许在包级门【内】、且门内复核
+    /// <c>ResumedFromSuspend</c> 仍为 true 后调用：并发挂起写的是同一份
+    /// state.json 与同一个 suspend.state 文件，不互斥的清尾会把它静默抹掉。
+    /// </summary>
+    private static void ClearResumedSuspendMarker(GrassVmPackage pkg, string suspendFile)
+    {
+        var st = VmState.Load(pkg);
+        st.SuspendedStatePath = null;
+        st.SuspendFingerprint = null;
+        st.Save(pkg);
+        try { File.Delete(suspendFile); } catch { /* 空间回收失败不致命 */ }
+    }
+
+    /// <summary>
     /// QEMU 进程退出监视：ACPI 关机/quit/客户机内关机最终都表现为进程退出。
     /// 在这里做干净关机记账：清空 runtime/、释放 vm.lock、
     /// 升级保护快照满 24 小时后自动删除（§22.3）。
@@ -454,17 +622,89 @@ public sealed class GrassCoreService
         {
             try
             {
+                // 挂起流程正在监督退出（它持有包门、自己收尾放锁）：这里让位，
+                // 否则同步派发时自死锁、异步派发时抢放锁
+                if (vm.ExitCleanupSuppressed) return;
+                // 误报防线：Exited 触发但 PID 还在【跑】（且还是 QEMU）= 事件系统误报，
+                // 绝不能放锁/清 runtime——那会让第二台 QEMU 拿到同一块盘的双写权。
+                // 必须同时看 HasExited：Windows 上本组件持有的句柄会让刚退出的进程
+                // 在进程表里"僵尸式存活"（GetProcessById 成功、ProcessName 还是
+                // qemu-system-x86_64）——不看 HasExited 会把每一次真实退出都当成
+                // 误报跳过收尾，vm.lock 永不释放、Core 永不空闲退出
+                try
+                {
+                    var still = System.Diagnostics.Process.GetProcessById(vm.Session.QemuPid);
+                    if (!still.HasExited
+                        && still.ProcessName.Contains("qemu", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Console.Error.WriteLine(
+                            $"[grass] QEMU 退出监视误报（pid={vm.Session.QemuPid} 仍在运行），跳过收尾。");
+                        return;
+                    }
+                }
+                catch (ArgumentException) { /* PID 确实没了：正常路径 */ }
+                catch (InvalidOperationException) { /* 同上 */ }
+
                 if (!_running.Remove(vm.PackagePath, out var removed)) return; // 已被挂起/强制路径处理
                 removed.Qmp?.Dispose();
                 var pkg = new GrassVmPackage(vm.PackagePath);
-                // 正常关机 = 我们发出过 ACPI 电源按钮请求后的退出。
-                // 强制关机（quit）/崩溃/宿主断电都不算——升级保护快照只在真正正常关机后才开始 24h 计时。
-                if (vm.AcpiShutdownRequested)
-                    TryDeleteExpiredUpgradeProtection(pkg);
-                // 正常退出路径：清空 runtime/ 并删除 vm.lock
-                if (Directory.Exists(pkg.RuntimePath))
-                    foreach (var f in Directory.EnumerateFiles(pkg.RuntimePath)) File.Delete(f);
-                new VmLock(pkg).Release();
+                // 挂起恢复的 VM 退出时挂起标记还在（确认循环没能确认 running）：
+                // 客户机可能已跑过并写过磁盘，保存的内存状态不可再重放——作废。
+                // 这是确认循环（无时限轮询）之外的最后兜底：QMP 全程不可用 + 进程退出
+                // 的组合下，循环里的 break 分支可能没来得及清标记
+                if (vm.ResumedFromSuspend)
+                {
+                    var st = VmState.Load(pkg);
+                    if (st.SuspendedStatePath is not null)
+                    {
+                        var sf = PathPolicy.Resolve(pkg, st.SuspendedStatePath);
+                        st.SuspendedStatePath = null;
+                        st.SuspendFingerprint = null;
+                        st.Save(pkg);
+                        try { if (File.Exists(sf)) File.Delete(sf); } catch { /* 回收失败不致命 */ }
+                    }
+                }
+                // 收尾（升级保护清理 + runtime 清空 + 放锁）全部进包级互斥门：
+                // 退出瞬间 UI 就显示"已关机"，此刻的 解除锁定→启动 / 快照 RPC 都
+                // 拿得到空闲的门。门外的清理（尤其几分钟的 qemu-img commit + NAS/
+                // 杀毒拖长的 runtime 删除）会在等门用户操作【之后】醒来，把新会话
+                // 刚写好的 session.json 删掉、把新会话的活锁放掉——双写者灾难正是
+                // vm.lock 要防的事。门内复核运行状态 + 会话身份，都不是本会话就不动。
+                // 必须挪到线程池跑：WaitForExit（挂起流程）会在【持门的调用线程】上
+                // 同步派发 Exited——同一根线程再进 SemaphoreSlim = 自死锁（实测挂死）
+                System.Threading.Tasks.Task.Run(() =>
+                {
+                    try
+                    {
+                        WithDiskJob(() => WithPackageGate(vm.PackagePath, () =>
+                        {
+                            if (_running.ContainsKey(vm.PackagePath)) return; // 等门期间已被再次启动
+                            // 双保险：runtime 里的 session 不是本会话 = 有人已解锁并启动过
+                            //（新会话可能又已退出）——残局属于别人，不碰
+                            try
+                            {
+                                if (File.Exists(pkg.SessionPath)
+                                    && RuntimeSession.Deserialize(File.ReadAllText(pkg.SessionPath)) is { } nowSession
+                                    && nowSession.SessionId != vm.Session.SessionId)
+                                    return;
+                            }
+                            catch { /* 读不了就按本会话处理（正常路径） */ }
+                            // 正常关机 = 我们发出过 ACPI 电源按钮请求后的退出。
+                            // 强制关机（quit）/崩溃/宿主断电都不算——升级保护快照只在真正
+                            // 正常关机后才开始 24h 计时
+                            if (vm.AcpiShutdownRequested)
+                                TryDeleteExpiredUpgradeProtection(pkg);
+                            // 正常退出路径：清空 runtime/ 并删除 vm.lock
+                            if (Directory.Exists(pkg.RuntimePath))
+                                foreach (var f in Directory.EnumerateFiles(pkg.RuntimePath)) File.Delete(f);
+                            new VmLock(pkg).Release();
+                        }));
+                    }
+                    catch
+                    {
+                        // 收尾失败：残留锁由下次启动预检诊断（与旧的同步路径语义一致）
+                    }
+                });
             }
             catch
             {
@@ -520,59 +760,107 @@ public sealed class GrassCoreService
                 var pkg = result.Package;
                 var session = result.Session;
                 // 归属判定：别机的会话一概不动（库可能在 NAS/同步盘上；别机 PID 在本机
-                // 必然"不存在"，按死了处理会解锁别人正在运行的 VM）
-                if (session.MachineId is not null && session.MachineId != MachineId)
+                // 必然"不存在"，按死了处理会解锁别人正在运行的 VM）。
+                // 无 MachineId 的旧/手工会话同样保守跳过：分不清归属时宁可留给
+                // 用户手动解锁（vm.lock 永不自动清除的不变式）
+                if (session.MachineId is null || session.MachineId != MachineId)
                     continue;
                 // PID 未写入（Core 在 Start 与回写 session 之间崩溃）≠ 死了。
                 // 此时 QEMU 可能正在运行：按"死了"清 runtime/放锁会破坏 vm.lock 永不自动清除的
                 // 不变式（残留锁交给用户手动确认解锁）
                 if (session.QemuPid <= 0)
                     continue;
-                if (!result.QemuAlive)
+                // 一切读改写都在包级互斥门内做：扫描快照可能在门排队期间过期——
+                // 两次并发 adopt（Core 启动 + UI 重连各发一次）交错时，无门的清理
+                // 会按【旧快照】删掉新会话刚写好的 session.json、放掉活锁。
+                // 门内先重读 session 再判死活，扫描结果只当"候选线索"
+                WithPackageGate(pkg.Path, () =>
                 {
-                    // QEMU 已不在（比如 Core 崩溃期间客户机内正常关机）：做干净收尾
-                    if (Directory.Exists(pkg.RuntimePath))
-                        foreach (var f in Directory.EnumerateFiles(pkg.RuntimePath)) File.Delete(f);
-                    new VmLock(pkg).Release();
-                    dead.Add(pkg.Path);
-                    continue;
-                }
-                var proc = Process.GetProcessById(session.QemuPid);
-                // PID 复用防护：进程名必须还是 QEMU（否则是别人复用了 PID——把它当 QEMU 接管
-                // 会在错误进程退出时误清 runtime/误放锁）
-                if (!proc.ProcessName.Contains("qemu", StringComparison.OrdinalIgnoreCase))
+                    var fresh = RuntimeSession.Deserialize(File.ReadAllText(pkg.SessionPath));
+                    if (fresh is null || fresh.SessionId != session.SessionId)
+                        return; // 会话已被替换（有人刚启动了它）——快照过期，不动
+                    if (fresh.MachineId is null || fresh.MachineId != MachineId)
+                        return;
+                    // 存活判定与扫描器同语义（GetProcessById 成功 = 活着）：不要用
+                    // HasExited——非本组件启动的进程在部分平台上会误报"已退出"，
+                    // 把活着的 QEMU 当尸体清掉 runtime/放锁
+                    System.Diagnostics.Process proc;
+                    try { proc = System.Diagnostics.Process.GetProcessById(fresh.QemuPid); }
+                    catch (ArgumentException) { proc = null!; }
+                    catch (InvalidOperationException) { proc = null!; }
+                    if (proc is null)
+                    {
+                        // QEMU 已不在（比如 Core 崩溃期间客户机内正常关机）：做干净收尾
+                        InvalidateStaleSuspendMarker(pkg, fresh);
+                        if (Directory.Exists(pkg.RuntimePath))
+                            foreach (var f in Directory.EnumerateFiles(pkg.RuntimePath)) File.Delete(f);
+                        new VmLock(pkg).Release();
+                        dead.Add(pkg.Path);
+                        return;
+                    }
+                    // PID 复用防护：进程名必须还是 QEMU（否则是别人复用了 PID——把它当 QEMU 接管
+                    // 会在错误进程退出时误清 runtime/误放锁）
+                    if (!proc.ProcessName.Contains("qemu", StringComparison.OrdinalIgnoreCase))
+                    {
+                        InvalidateStaleSuspendMarker(pkg, fresh);
+                        if (Directory.Exists(pkg.RuntimePath))
+                            foreach (var f in Directory.EnumerateFiles(pkg.RuntimePath)) File.Delete(f);
+                        new VmLock(pkg).Release();
+                        dead.Add(pkg.Path);
+                        return;
+                    }
+                // 幂等（先于任何新连接！）：UI 每次重启都会对还活着的 Core 重发
+                // adoptRunningVms。已在 _running 里的 VM 直接跳过——否则这里新开的
+                // QmpClient 既不进表也不释放（泄漏 + 与活连接争抢同一根管道，
+                // RequireQmp 只认 vm.Qmp ??=，死掉的旧连接永远不会被替换）。
+                if (_running.ContainsKey(pkg.Path))
                 {
-                    if (Directory.Exists(pkg.RuntimePath))
-                        foreach (var f in Directory.EnumerateFiles(pkg.RuntimePath)) File.Delete(f);
-                    new VmLock(pkg).Release();
-                    dead.Add(pkg.Path);
-                    continue;
+                    adopted.Add(pkg.Path);
+                    return;
                 }
-                var vm = new RunningVm(pkg.Path, session, proc);
-                vm.Qmp = TryConnectQmp(session.QmpPipe);
+                var vm = new RunningVm(pkg.Path, fresh, proc);
+                vm.Qmp = TryConnectQmp(fresh.QmpPipe);
                 // 挂起标记 + 活着的 QEMU = 上次 Core 在"标记已落盘、quit 未送达"窗口崩溃。
                 // 原进程仍握有完整状态：直接 cont 让它继续跑，清掉标记并回收 suspend.state
                 // （否则库列表显示"已挂起"，之后"恢复"会把旧内存重放到已前进的磁盘上）。
                 var staleState = VmState.Load(pkg);
                 if (staleState.SuspendedStatePath is not null)
                 {
-                    try
+                    // QMP 不可达时空过整个 try（?. 短路）会把标记当"已恢复"清掉、
+                    // 删掉唯一的保存状态，而 QEMU 可能永远停在 paused。必须有真实连接
+                    // 且 cont 真正送达，才有资格动标记。
+                    if (vm.Qmp is not null)
                     {
-                        vm.Qmp?.ExecuteAsync("cont").GetAwaiter().GetResult();
-                        var suspendFile = PathPolicy.Resolve(pkg, staleState.SuspendedStatePath);
-                        staleState.SuspendedStatePath = null;
-                        staleState.SuspendFingerprint = null;
-                        staleState.Save(pkg);
-                        if (File.Exists(suspendFile)) File.Delete(suspendFile);
+                        try
+                        {
+                            vm.Qmp.ExecuteAsync("cont").GetAwaiter().GetResult();
+                            var suspendFile = PathPolicy.Resolve(pkg, staleState.SuspendedStatePath);
+                            staleState.SuspendedStatePath = null;
+                            staleState.SuspendFingerprint = null;
+                            staleState.Save(pkg);
+                            if (File.Exists(suspendFile)) File.Delete(suspendFile);
+                        }
+                        catch
+                        {
+                            // cont 送不出去：保守保留标记与状态文件（用户仍可恢复/手动
+                            // 处理）。但有一种形态必须防住——客户机其实已经在跑
+                            //（-incoming 迁移完成、Core 死在确认循环之前）：对运行中的
+                            // VM 发 cont 会报错走到这里，标记却还挂着。给这台 VM 打上
+                            // "恢复待确认"标记：它退出时退出监视会作废这份旧状态——
+                            // 否则之后"恢复"= 把旧 RAM 重放到已被写过的磁盘（静默损毁）
+                            vm.ResumedFromSuspend = true;
+                        }
                     }
-                    catch
+                    else
                     {
-                        // cont 不可达：保守保留标记（用户仍可从 suspend.state 恢复）
+                        // 连 QMP 都连不上：同样无法证明客户机没跑过。同样的防线
+                        vm.ResumedFromSuspend = true;
                     }
                 }
                 _running[pkg.Path] = vm;
                 WatchQemuProcess(vm);
                 adopted.Add(pkg.Path);
+                });
             }
             catch
             {
@@ -582,13 +870,22 @@ public sealed class GrassCoreService
         return new { adopted, cleanedUp = dead };
     }
 
+    /// <summary>
+    /// 名称同时是包目录名与 QEMU -name 的值：文件系统非法字符、逗号（QemuOpts
+    /// 分隔符）、等号（-name 会按 key=value 解析，未知键让 QEMU 启动即退）都不行
+    /// </summary>
+    internal static bool IsInvalidVmName(string name) =>
+        string.IsNullOrWhiteSpace(name)
+        || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
+        || name.Contains(',')
+        || name.Contains('=');
+
     private static bool IsProcessAlive(int pid)
     {
         try
         {
             var p = Process.GetProcessById(pid);
-            return !p.HasExited;
-        }
+            return !p.HasExited;        }
         catch (ArgumentException)
         {
             return false;
@@ -596,7 +893,12 @@ public sealed class GrassCoreService
     }
 
     private string CurrentHostFingerprint() =>
-        $"{Environment.ProcessorCount}cpus|{_bundledQemuMajor}|{Environment.OSVersion.Version}";
+        // CPU 型号/厂商入指纹：-cpu max 暴露宿主特性，同核数的 Intel 与 AMD 之间
+        // 迁移状态不保证可回放。宿主 OS 版本【不】入指纹：Windows 功能更新必然撞上
+        // 假不匹配——而挂起状态此时是可用的，把每台挂起机变砖没有道理。
+        // 真不兼容（CPU 换代）→ 用户走"放弃保存的状态"（丢弃挂起点，从盘重启）
+        $"{Environment.ProcessorCount}cpus|{_bundledQemuMajor}"
+            + $"|{Environment.GetEnvironmentVariable("PROCESSOR_IDENTIFIER") ?? "unknown-cpu"}";
 
     private QmpClient? TryConnectQmp(string pipeName)
     {
@@ -622,6 +924,15 @@ public sealed class GrassCoreService
     {
         if (!_running.TryGetValue(packagePath, out var vm))
             throw new GrassCoreException("此虚拟机没有在运行。");
+        // 死连接要替换：QMP 管道中途断掉（对端重置/读循环退出）后 vm.Qmp 还是那个
+        // 已 Dispose 的实例——只补 null 的话，shutdown/suspend/forceOff 从此全部
+        // 抛"连接已关闭"直到 QEMU 自己退出（最坏：挂起中途 stop 后既不能继续也不
+        // 能强制关机）
+        if (vm.Qmp is { IsDisposed: true })
+        {
+            try { vm.Qmp.Dispose(); } catch { /* 已关 */ }
+            vm.Qmp = null;
+        }
         // QMP 可能在启动窗口内未就绪：后续操作在这里重试连接
         vm.Qmp ??= TryConnectQmp(vm.Session.QmpPipe);
         return vm.Qmp ?? throw new GrassCoreException("QMP 控制通道不可用（QEMU 可能仍在启动），请稍后重试。");
@@ -639,18 +950,37 @@ public sealed class GrassCoreService
             case "shutdown":
             {
                 var qmp = RequireQmp(packagePath);
-                // 标志先于发送：客户机可能在响应到达前就完成关机退出（监视器会读它）
-                _running[packagePath].AcpiShutdownRequested = true;
-                var r = qmp.AcpiShutdownAsync().GetAwaiter().GetResult();
-                return QmpResult(r);
+                if (!_running.TryGetValue(packagePath, out var vm))
+                    throw new GrassCoreException("虚拟机已不在运行。");
+                // 标志先于发送：客户机可能在响应到达前就完成关机退出（监视器会读它）。
+                // 发送失败必须复位——否则这台 VM 之后 quit（用户强制/崩溃）会被
+                // 监视器误判成"正常关机"，升级保护快照被提前删除
+                vm.AcpiShutdownRequested = true;
+                try
+                {
+                    var r = qmp.AcpiShutdownAsync().GetAwaiter().GetResult();
+                    return QmpResult(r);
+                }
+                catch
+                {
+                    vm.AcpiShutdownRequested = false;
+                    throw;
+                }
             }
-            // 强制关机 = 电源菜单 + 二次确认后调用方才允许（不算正常关机）
+            // 强制关机 = 电源菜单 + 二次确认后调用方才允许（不算正常关机）。
+            // 清掉 ACPI 标记：此前被忽略的关机请求不算数——强退被计成"正常关机"会让
+            // 升级保护快照提前进入 24h 删除计时
             case "forceOff":
+            {
+                if (_running.TryGetValue(packagePath, out var fo))
+                    fo.AcpiShutdownRequested = false;
                 return QmpResult(RequireQmp(packagePath).ForceQuitAsync().GetAwaiter().GetResult());
+            }
             // 挂起 = 保存完整运行状态后完全退出 QEMU（不是 pause；1.0 无"暂停"）。
             // 直接调内部实现：PowerAction 已持有该包的门，再进公共 SuspendVm 会同线程重入死锁。
+            // 挂起阶段照样上报（大内存 VM 的保存可达数分钟）
             case "suspend":
-                return SuspendVmCore(packagePath);
+                return WithLifecyclePhase(packagePath, "suspending", () => SuspendVmCore(packagePath));
             default:
                 throw new GrassCoreException($"未知电源动作：{action}");
         }
@@ -659,7 +989,8 @@ public sealed class GrassCoreService
     private static object QmpResult(System.Text.Json.JsonElement e) => new { sent = true, result = e.ToString() };
 
     private object SuspendVm(string packagePath) =>
-        WithPackageGate(packagePath, () => SuspendVmCore(packagePath));
+        WithPackageGate(packagePath, () =>
+            WithLifecyclePhase(packagePath, "suspending", () => SuspendVmCore(packagePath)));
 
     private object SuspendVmCore(string packagePath)
     {
@@ -667,7 +998,49 @@ public sealed class GrassCoreService
         var qmp = RequireQmp(packagePath);
         // 挂起序列：stop（稳定点）→ migrate file:（保存内存/CPU/设备状态）→ 轮询至完成 → quit。
         // migrate 命令在迁移【开始】时即返回；大内存 VM 需要真实等待。
-        qmp.StopAsync().GetAwaiter().GetResult();
+        try
+        {
+            qmp.StopAsync().GetAwaiter().GetResult();
+        }
+        catch
+        {
+            // stop 可能已生效只是回包丢了（连接在收发之间断开）——尽力恢复运行；
+            // cont 送不出去时抛带指引的话术（裸 IO 异常只会让用户一头雾水）
+            try { qmp.ExecuteAsync("cont").GetAwaiter().GetResult(); }
+            catch
+            {
+                throw new GrassCoreException(
+                    "暂停虚拟机时控制通道中断，虚拟机可能仍处于暂停状态。请尝试恢复运行或强制关机。");
+            }
+            throw new GrassCoreException("暂停虚拟机时控制通道中断，虚拟机已恢复运行。");
+        }
+        // 挂起监督的武装/解除：从【migrate 开始写盘】那一刻起，退出监视器就必须
+        // 让位——QEMU 若在"migrate 已完成、挂起标记还没落盘"之间被外杀/崩溃，
+        // 监视器的 ResumedFromSuspend 分支会把【刚写入的】suspend.state 当作旧
+        // 恢复状态删掉（RAM 状态的唯一副本凭空消失）。任何"VM 已恢复运行/
+        // 挂起放弃"的失败路径都要解除，把收尾交还监视器
+        RunningVm? suspendingVm = null;
+        _running.TryGetValue(pkg.Path, out suspendingVm);
+        var prevResumedFromSuspend = suspendingVm?.ResumedFromSuspend ?? false;
+        var prevSuppressed = suspendingVm?.ExitCleanupSuppressed ?? false;
+        void ArmSuspendSupervision()
+        {
+            if (suspendingVm is null) return;
+            // 新状态即将落盘 = 本次会话不再是"待确认的恢复"；quit 不算正常关机
+            //（升级保护计时只认 ACPI）；本流程接管退出收尾（持有包级门，确认
+            // 退出后自己放锁——监视器插手会抢放锁/重入门自死锁）
+            suspendingVm.ResumedFromSuspend = false;
+            suspendingVm.AcpiShutdownRequested = false;
+            suspendingVm.ExitCleanupSuppressed = true;
+        }
+        void DisarmSuspendSupervision()
+        {
+            if (suspendingVm is null) return;
+            suspendingVm.ResumedFromSuspend = prevResumedFromSuspend;
+            suspendingVm.AcpiShutdownRequested = false;
+            suspendingVm.ExitCleanupSuppressed = prevSuppressed;
+        }
+        ArmSuspendSupervision();
         var stateFile = Path.Combine(pkg.FirmwarePath, "..", "suspend.state");
         stateFile = Path.GetFullPath(stateFile);
         try
@@ -677,34 +1050,69 @@ public sealed class GrassCoreService
         catch
         {
             // migrate 命令本身失败（QMP 错误/连接死）：VM 还冻在 stop 状态——尽力恢复运行
+            DisarmSuspendSupervision();
             try { qmp.ExecuteAsync("cont").GetAwaiter().GetResult(); } catch { /* 连接已死则无法恢复 */ }
             throw;
         }
         var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(10);
-        while (true)
+        try
         {
-            var status = qmp.MigrationStatusAsync().GetAwaiter().GetResult();
-            if (status == "completed") break;
-            if (status is "failed" or "cancelled")
+            while (true)
             {
-                // 保存失败：恢复运行而不是把 VM 冻在 stop 状态
-                qmp.ExecuteAsync("cont").GetAwaiter().GetResult();
-                throw new GrassCoreException($"保存挂起状态失败（{status}），虚拟机已恢复运行。");
+                var status = qmp.MigrationStatusAsync().GetAwaiter().GetResult();
+                if (status == "completed") break;
+                if (status is "failed" or "cancelled")
+                {
+                    // 保存失败：恢复运行而不是把 VM 冻在 stop 状态
+                    DisarmSuspendSupervision();
+                    qmp.ExecuteAsync("cont").GetAwaiter().GetResult();
+                    throw new GrassCoreException($"保存挂起状态失败（{status}），虚拟机已恢复运行。");
+                }
+                if (DateTime.UtcNow > deadline)
+                {
+                    DisarmSuspendSupervision();
+                    qmp.ExecuteAsync("cont").GetAwaiter().GetResult();
+                    throw new GrassCoreException("保存挂起状态超时，虚拟机已恢复运行。");
+                }
+                Thread.Sleep(500);
             }
-            if (DateTime.UtcNow > deadline)
+        }
+        catch (GrassCoreException)
+        {
+            throw; // 上面两条已自己 cont 过、带用户话术（Disarm 已在抛出前完成）
+        }
+        catch
+        {
+            // 轮询途中 QMP 断了（读循环自我 Dispose）：VM 冻在 stop 状态且没有
+            // cont 的 RPC 入口——不恢复的话用户只剩"强制关机"一条路
+            DisarmSuspendSupervision();
+            try { qmp.ExecuteAsync("cont").GetAwaiter().GetResult(); }
+            catch
             {
-                qmp.ExecuteAsync("cont").GetAwaiter().GetResult();
-                throw new GrassCoreException("保存挂起状态超时，虚拟机已恢复运行。");
+                // 连接已死：RequireQmp 下次会重建，但本次无法恢复运行——
+                // 抛出带指引的错（至少不是裸 IO 异常）
+                throw new GrassCoreException(
+                    "保存挂起状态期间控制通道中断，虚拟机可能仍处于暂停状态。请尝试恢复运行或强制关机。");
             }
-            Thread.Sleep(500);
+            throw new GrassCoreException("保存挂起状态期间控制通道中断，虚拟机已恢复运行。");
         }
 
-        // 先落盘挂起标记再退出 QEMU：若 Core 在 quit 前后崩溃，VM 一致地处于"已挂起"，
+        // RAM 状态已在盘上（监视器自 migrate 起就让位，本流程全权负责）：
+        // 落盘挂起标记。若 Core 在 quit 前后崩溃，VM 一致地处于"已挂起"，
         // suspend.state 不会被静默丢弃（顺序颠倒会让保存的会话凭空消失）。
+        // Save 失败：什么都没持久化，解除监督交还监视器（原语义）
         var state = VmState.Load(pkg);
         state.SuspendedStatePath = PathPolicy.NormalizeReference(pkg, stateFile);
         state.SuspendFingerprint = CurrentHostFingerprint();
-        state.Save(pkg);
+        try
+        {
+            state.Save(pkg);
+        }
+        catch
+        {
+            DisarmSuspendSupervision();
+            throw;
+        }
 
         try
         {
@@ -712,13 +1120,67 @@ public sealed class GrassCoreService
         }
         catch
         {
-            // quit 失败：标记回滚（QEMU 仍在运行/可控，用户可重试挂起或正常关机）
+            // quit 失败 ≠ QEMU 还活着：migrate 已完成、进程可能恰好退出（死管道
+            // 让 ForceQuit 抛错）。Exited 已在监督窗口里被让位、不会重发——不补
+            // 这个检查，vm.lock 与运行表永久悬挂（关机/强退/解锁/接管全被挡死，
+            // Core 永不空闲退出）。进程已死 = 挂起其实已成功，走确认退出路径
+            var alreadyExited = false;
+            try { if (suspendingVm is not null) alreadyExited = suspendingVm.Process.HasExited; }
+            catch { /* 句柄查询失败按存活处理 */ }
+            if (alreadyExited)
+            {
+                if (suspendingVm is not null) suspendingVm.ExitCleanupSuppressed = false;
+                ReleaseVm(pkg, clearRuntime: false);
+                return new { suspended = true, stateFile };
+            }
+            // 真还活着：标记回滚（QEMU 仍在运行/可控，用户可重试挂起或正常关机）；
+            // 退出收尾的监督解除（进程还活着，监视器保持武装）。
+            // ResumedFromSuspend 不回置 true：标记/状态文件已回滚到"未挂起"，
+            // 旧恢复状态本就该作废（quit 失败 = 进程通常还活着）
+            if (suspendingVm is not null) suspendingVm.ExitCleanupSuppressed = false;
             state.SuspendedStatePath = null;
             state.SuspendFingerprint = null;
             state.Save(pkg);
+            // 标记已回滚 = 这个 suspend.state 是本次失败挂起写下的孤儿文件（RAM
+            // 大小，没人会再引用）——当场删，别留着变成导出档案里的残渣
+            try { if (File.Exists(stateFile)) File.Delete(stateFile); } catch { /* 占用：留给启动清理 */ }
             throw;
         }
 
+        // quit 只是 QEMU 的确认——退出是异步的。vm.lock 的契约是"锁在 = 被占用"，
+        // 立刻放锁会让快速重启的 StartVm 在 QEMU 还在冲刷磁盘时拿锁竞速。有界等它
+        // 退完；超时仍活着就【不放锁也不摘表】——此刻放锁 = 锁没了但磁盘映像还被
+        // 一个活进程持有，下一次 StartVm 拿锁成功就是双写者。解除监督、把收尾
+        // 交还退出监视器，等进程真正死亡时做全套（放锁 + 清 runtime）
+        if (_running.TryGetValue(pkg.Path, out var suspending))
+        {
+            var exited = false;
+            try { exited = suspending.Process.WaitForExit(10_000); }
+            catch { exited = true; /* 已退出/监视器竞争：按已退处理 */ }
+            if (!exited)
+            {
+                suspending.ExitCleanupSuppressed = false; // 监视器重新接管收尾
+                // 复核：QEMU 可能恰好在超时边界退出，而已派发的 Exited 在标志复位
+                // 【之前】读到抑制让位返回——事件不会重发，从此谁也不收尾 =
+                // vm.lock/运行表永久悬挂。此刻进程已死就直接走确认退出路径
+                try
+                {
+                    if (suspending.Process.HasExited)
+                    {
+                        ReleaseVm(pkg, clearRuntime: false);
+                        return new { suspended = true, stateFile };
+                    }
+                }
+                catch { /* 句柄查询失败：按未退出处理，监视器接管 */ }
+                return new
+                {
+                    suspended = true,
+                    stateFile,
+                    note = "QEMU 仍在退出中：已保存挂起状态，等它完全退出后虚拟机会自动回到“已关机”。",
+                };
+            }
+        }
+        if (suspendingVm is not null) suspendingVm.ExitCleanupSuppressed = false;
         ReleaseVm(pkg, clearRuntime: false); // 挂起后退出 QEMU，vm.lock 释放；suspend.state 在包内
         return new { suspended = true, stateFile };
     }
@@ -735,12 +1197,45 @@ public sealed class GrassCoreService
         }
     }
 
-    public object UnlockVm(string packagePath)
+    public object UnlockVm(string packagePath) =>
+        WithPackageGate(packagePath, () => UnlockVmCore(packagePath));
+
+    private object UnlockVmCore(string packagePath)
     {
-        // 调用方必须已取得用户的风险确认（UI 弹窗）
+        // 调用方必须已取得用户的风险确认（UI 弹窗）。Core 仍然自己执法：
+        // 本实例在跑的 VM 绝不允许解锁（并发 start 已拿锁后，过期 UI 卡片的解锁请求
+        // 会把活锁删掉 → 第二个 QEMU 打开同一张盘 = vm.lock 要防的事故本身）
         var pkg = new GrassVmPackage(packagePath);
+        if (_running.ContainsKey(pkg.Path))
+            throw new GrassCoreException("虚拟机正在运行，不能解锁。请先正常关机。");
         new VmLock(pkg).ForceUnlockByUser();
         return new { unlocked = true };
+    }
+
+    /// <summary>
+    /// 放弃保存的挂起状态（用户明确确认后）：清标记、删 suspend.state。
+    /// 挂起指纹不匹配（宿主 CPU 变更等）时这是唯一出路——没有它，挂起机永远
+    /// 无法启动/恢复/修改/导出/删除（每条路都被"先恢复并正常关机"挡住）。
+    /// 代价：挂起瞬间之后的内存状态丢弃（磁盘数据完好，从盘冷启动）。
+    /// </summary>
+    public object DiscardSuspendState(string packagePath) =>
+        WithPackageGate(packagePath, () => DiscardSuspendStateCore(packagePath));
+
+    private object DiscardSuspendStateCore(string packagePath)
+    {
+        var pkg = new GrassVmPackage(packagePath);
+        if (_running.ContainsKey(pkg.Path))
+            throw new GrassCoreException("虚拟机正在运行，不能放弃保存的状态。");
+        var state = VmState.Load(pkg);
+        if (state.SuspendedStatePath is null)
+            throw new GrassCoreException("这台虚拟机没有保存的挂起状态。");
+        var suspendFile = PathPolicy.Resolve(pkg, state.SuspendedStatePath);
+        state.SuspendedStatePath = null;
+        state.SuspendFingerprint = null;
+        state.Save(pkg);
+        try { if (File.Exists(suspendFile)) File.Delete(suspendFile); }
+        catch (IOException) { /* 状态文件回收失败不阻断：标记已清，残留文件随包清理 */ }
+        return new { discarded = true };
     }
 
     /// <summary>CD/DVD 热插拔（唯一允许运行中修改的设备）：换镜像 / 弹出。</summary>
@@ -810,6 +1305,10 @@ public sealed class GrassCoreService
         // 挂起状态同样不可改：保存的内存/CPU/设备拓扑属于旧配置，-incoming 无法在更改后的硬件上回放
         if (VmState.Load(pkg).SuspendedStatePath is not null)
             throw new GrassCoreException("虚拟机已挂起。请先恢复并正常关机后再修改设置。");
+        // Restore 事务没收尾时同样拒绝：此刻保存的修改会在回滚收尾时被
+        // PreRestoreConfigJson 静默覆盖——用户以为改成功了，实际全部丢掉
+        if (!SnapshotService.RepairStagedOverlays(pkg, new Qemu.TransactionalDiskOps(_qemuImgPath)))
+            throw new GrassCoreException("此虚拟机有一个未完成的恢复操作正在收尾（磁盘可能被占用）。请关闭占用它的程序后重试。");
 
         VmConfiguration config;
         try
@@ -825,12 +1324,16 @@ public sealed class GrassCoreService
 
         // 钳制到安全范围（宁可钳制不可拒绝——消费级产品原则）
         config.CpuCores = Math.Clamp(config.CpuCores, 1, Math.Max(1, Environment.ProcessorCount));
-        var maxMem = Math.Max(512, (int)(GetTotalHostMemoryMiB() / 2));
+        // 上限与【已保存值】取大：资源查询失败（退回保守值）时不能把已保存的配置
+        // 静默腰斩——用户改个无关设置，8GB 变 4GB 无任何提示。注意基线是盘上的
+        // 旧值而不是提交值本身：拿提交值当基线，任意超额内存都能原样通过
+        var savedMem = new ConfigStore(pkg).Load().MemoryMiB;
+        var maxMem = Math.Max(Math.Max(512, (int)(GetTotalHostMemoryMiB() / 2)), savedMem);
         config.MemoryMiB = Math.Clamp(config.MemoryMiB, 512, maxMem);
         if (string.IsNullOrWhiteSpace(config.Name)) throw new GrassCoreException("虚拟机名称不能为空。");
-        if (config.Name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || config.Name.Contains(','))
+        if (IsInvalidVmName(config.Name))
             throw new GrassCoreException(
-                "名称包含文件系统或 QEMU 不允许的字符（含逗号）。");
+                "名称包含文件系统或 QEMU 不允许的字符（含逗号、等号）。");
         if (config.Devices.Count > 16)
             throw new GrassCoreException("设备数量超出上限（16）。");
 
@@ -838,21 +1341,7 @@ public sealed class GrassCoreService
         return new { saved = true, cpuCores = config.CpuCores, memoryMiB = config.MemoryMiB };
     }
 
-    private static long GetTotalHostMemoryMiB()
-    {
-        try
-        {
-            if (OperatingSystem.IsWindows())
-            {
-                using var searcher = new System.Management.ManagementObjectSearcher(
-                    "SELECT TotalVisibleMemorySize FROM Win32_OperatingSystem");
-                var row = searcher.Get().Cast<System.Management.ManagementBaseObject>().First();
-                return Convert.ToInt64(row["TotalVisibleMemorySize"]) / 1024;
-            }
-        }
-        catch { /* WMI 不可用时退回保守默认 */ }
-        return 8 * 1024; // 8 GB 保守值
-    }
+    private static long GetTotalHostMemoryMiB() => Library.HostResources.TotalMemoryMiB();
 
     /// <summary>扩容硬盘（只能扩大；qemu-img resize 事务化执行 + 魔数校验保持链完整）。</summary>
     public object ResizeDisk(string packagePath, string deviceId, long newGiB) => WithPackageGate(packagePath, () => ResizeDiskCore(packagePath, deviceId, newGiB));
@@ -860,13 +1349,17 @@ public sealed class GrassCoreService
     private object ResizeDiskCore(string packagePath, string deviceId, long newGiB)
     {
         var pkg = new GrassVmPackage(packagePath);
-        if (_running.ContainsKey(pkg.Path))
-            throw new GrassCoreException("虚拟机正在运行，关机后才能修改硬盘容量。");
-        if (VmState.Load(pkg).SuspendedStatePath is not null)
-            throw new GrassCoreException("虚拟机已挂起。请先恢复并正常关机后再修改硬盘容量。");
+        // 与快照/克隆同一套守卫：resize 是对工作盘的破坏性写（copy + 原子改名），
+        // 别机正在运行这台 VM（NAS/共享库 + 残留 vm.lock）时动它 = 双写者损盘；
+        // Restore 日志没收尾时动它 = 扩容结果随后被回滚成旧纪元的盘
+        EnsureStoppedForMutation(pkg);
         var config = new ConfigStore(pkg).Load();
         var disk = config.Devices.OfType<DiskDevice>().SingleOrDefault(d => d.DeviceId == deviceId)
                    ?? throw new GrassCoreException("找不到这块硬盘。");
+        // 与 CreateVm 同一套域钳制（"宁可钳制不可拒绝"）：设置页的 max 只是
+        // 建议值，999999 这种输入要么被乘法回绕成负数、要么把荒谬尺寸交给
+        // qemu-img 报原始错误
+        newGiB = Math.Clamp(newGiB, 1, 2048);
         var newSize = newGiB * 1024L * 1024 * 1024;
         if (newSize <= disk.SizeBytes)
             throw new GrassCoreException("硬盘容量只能扩大，不能缩小。");
@@ -885,20 +1378,25 @@ public sealed class GrassCoreService
     /// <summary>克隆/快照等重操作的关机状态守卫：运行/锁定/挂起都不允许（Core 是唯一守门人）。</summary>
     private void EnsureStoppedForMutation(GrassVmPackage pkg)
     {
-        // 换入中断修复（幂等）：残留暂存 overlay 不清掉，CreateOverlay 会因 overwrite:false 失败
-        SnapshotService.RepairStagedOverlays(pkg);
+        // 先做纯读检查，后跑修复：共享库上别机正在运行（残留 vm.lock）时，
+        // 修复会 move/rebase 它正打开的冻结 backing——必须先拒绝再动磁盘
         if (_running.ContainsKey(pkg.Path))
             throw new GrassCoreException("虚拟机正在运行，关机后才能执行此操作。");
         if (File.Exists(pkg.LockPath))
             throw new GrassCoreException("虚拟机被锁定（可能异常退出残留）。请先解除锁定。");
         if (VmState.Load(pkg).SuspendedStatePath is not null)
             throw new GrassCoreException("虚拟机已挂起。请先恢复并正常关机后再执行此操作。");
+        // 换入中断修复（幂等）：残留暂存 overlay 不清掉，CreateOverlay 会因 overwrite:false 失败。
+        // Restore 日志收不了尾 = 磁盘撕裂态，变更操作（快照/克隆/删除）一律拒绝
+        if (!SnapshotService.RepairStagedOverlays(pkg, new Qemu.TransactionalDiskOps(_qemuImgPath)))
+            throw new GrassCoreException("此虚拟机有一个未完成的恢复操作正在收尾（磁盘可能被占用）。请关闭占用它的程序后重试。");
     }
 
     public object FullClone(string packagePath, string newName) => WithPackageGate(packagePath, () => FullCloneCore(packagePath, newName));
 
     private object FullCloneCore(string packagePath, string newName)
     {
+        if (IsInvalidVmName(newName)) throw new GrassCoreException("新虚拟机名称不合法（不能含逗号、等号或文件系统不允许的字符）。");
         var pkg = new GrassVmPackage(packagePath);
         EnsureStoppedForMutation(pkg);
         var cloner = new Clone.CloneService(new Qemu.TransactionalDiskOps(_qemuImgPath));
@@ -911,6 +1409,7 @@ public sealed class GrassCoreService
 
     private object LinkedCloneCore(string packagePath, string snapshotUuid, string newName)
     {
+        if (IsInvalidVmName(newName)) throw new GrassCoreException("新虚拟机名称不合法（不能含逗号、等号或文件系统不允许的字符）。");
         var pkg = new GrassVmPackage(packagePath);
         EnsureStoppedForMutation(pkg);
         var cloner = new Clone.CloneService(new Qemu.TransactionalDiskOps(_qemuImgPath));
@@ -945,19 +1444,78 @@ public sealed class GrassCoreService
         var tempRoot = Path.Combine(Path.GetTempPath(), "grassvm-import-" + Guid.NewGuid().ToString("N"));
         try
         {
-            string ovfPath;
-            if (ovfOrOvaPath.EndsWith(".ova", StringComparison.OrdinalIgnoreCase))
-            {
-                var dir = Path.Combine(tempRoot, "ova");
-                ovfPath = ExportImport.OvfImporter.ExtractOva(ovfOrOvaPath, dir);
-            }
-            else
-            {
-                ovfPath = ovfOrOvaPath;
-            }
             var importer = new ExportImport.OvfImporter(new Qemu.TransactionalDiskOps(_qemuImgPath));
-            var plan = importer.PlanFromOvf(System.Xml.Linq.XDocument.Load(ovfPath), Path.GetDirectoryName(Path.GetFullPath(ovfPath))!);
+            ExportImport.OvfImporter.ImportPlan plan;
+            try
+            {
+                // 解包（.ova 的 tar 层）也在防护内：损坏/截断/贴错扩展名的档案
+                // 抛 InvalidDataException/EndOfStream——英文原文不进错误横幅。
+                // 解包前先核【临时盘】空间（tar 全量解到 %TMP%）：临时盘 ≠ 存档
+                // 盘（典型 C: vs D:），满了会让用户拿到"档案无效"的误导性结论
+                string ovfPath;
+                if (ovfOrOvaPath.EndsWith(".ova", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        var need = new FileInfo(ovfOrOvaPath).Length;
+                        var tmpAvail = new DriveInfo(
+                            Path.GetPathRoot(Path.GetTempPath()) ?? Path.GetTempPath()).AvailableFreeSpace;
+                        if (tmpAvail < need)
+                            throw new GrassCoreException(
+                                $"解包 OVA 约需 {Math.Max(1, need / 1024 / 1024 / 1024)} GB 临时空间，" +
+                                $"但系统临时目录所在磁盘只剩 {tmpAvail / 1024 / 1024 / 1024} GB。请先清理系统盘空间后重试。");
+                    }
+                    catch (GrassCoreException) { throw; }
+                    catch { /* 盘信息读不到：让后续真实 IO 错误兜底 */ }
+                    var dir = Path.Combine(tempRoot, "ova");
+                    ovfPath = ExportImport.OvfImporter.ExtractOva(ovfOrOvaPath, dir);
+                }
+                else
+                {
+                    ovfPath = ovfOrOvaPath;
+                }
+                plan = importer.PlanFromOvf(System.Xml.Linq.XDocument.Load(ovfPath),
+                    Path.GetDirectoryName(Path.GetFullPath(ovfPath))!);
+            }
+            catch (GrassCoreException)
+            {
+                throw; // 产品化错误原样上抛
+            }
+            catch (System.IO.FileNotFoundException)
+            {
+                throw new GrassCoreException("找不到这份档案文件（可能已被移动、重命名或删除）。");
+            }
+            catch (Exception e) when (e is System.Xml.XmlException or ArgumentException or InvalidOperationException
+                     or System.IO.InvalidDataException or System.IO.EndOfStreamException or NotSupportedException)
+            {
+                // 非 XML / 结构坏的档案 / 损坏截断的 tar，与 zip 路径同标准：
+                // 产品化措辞，不把英文 .NET 异常原文甩进横幅
+                throw new GrassCoreException("这份档案不是有效的 OVF/OVA 描述文件。");
+            }
+            catch (System.IO.IOException e)
+            {
+                // 真实 IO 问题（临时盘满、源文件被占用）不是"档案坏"——指引用户
+                // 清空间/关占用程序，而不是去重下重导档案
+                throw new GrassCoreException($"读取或解包档案失败（磁盘空间不足或文件被其他程序占用）：{e.Message}");
+            }
             var required = ExportImport.OvfImporter.EstimateRequiredBytes(plan.Disks);
+            // §15.1"转换前估算空间，不足直接给出所需 GB 数"：计划阶段就对存档
+            // 位置核对并警告（UI 会把 warnings 逐条过给用户），别等转换中途
+            // 才以裸 IO 错误失败
+            if (_db.LibraryRoot is not null)
+            {
+                try
+                {
+                    var libRoot = Path.GetFullPath(_db.LibraryRoot);
+                    var avail = new DriveInfo(Path.GetPathRoot(libRoot) ?? libRoot).AvailableFreeSpace;
+                    if (avail < required)
+                        plan.Warnings.Add(
+                            $"导入约需 {Math.Max(1, required / 1024 / 1024 / 1024)} GB 空闲空间，" +
+                            $"但存档位置当前只有 {avail / 1024 / 1024 / 1024} GB 可用，导入很可能中途失败。" +
+                            "请先清理空间或更换存档位置。");
+                }
+                catch { /* 盘信息读不到：执行阶段还有一道硬校验兜底 */ }
+            }
             return new
             {
                 vmName = plan.Config.Name,
@@ -972,28 +1530,97 @@ public sealed class GrassCoreService
         }
         finally
         {
-            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
+            // 清理失败不能改写结果：导入已成功（包 + 索引都在）却报错，重试就撞
+            // "同名 VM 已存在"；杀毒/索引器短暂占用刚转换的磁盘是常态
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true); }
+            catch { /* 残留临时目录交给系统清理 */ }
         }
     }
 
     public object ExecuteImportOvf(string ovfOrOvaPath, string vmName, bool allowUnsupported)
     {
+        if (IsInvalidVmName(vmName)) throw new GrassCoreException("虚拟机名称不合法（不能含逗号、等号或文件系统不允许的字符）。");
         var root = _db.LibraryRoot ?? throw new GrassCoreException("尚未设置虚拟机存档位置。");
         var tempRoot = Path.Combine(Path.GetTempPath(), "grassvm-import-" + Guid.NewGuid().ToString("N"));
         try
         {
-            string ovfPath = ovfOrOvaPath.EndsWith(".ova", StringComparison.OrdinalIgnoreCase)
-                ? ExportImport.OvfImporter.ExtractOva(ovfOrOvaPath, Path.Combine(tempRoot, "ova"))
-                : ovfOrOvaPath;
-            var importer = new ExportImport.OvfImporter(new Qemu.TransactionalDiskOps(_qemuImgPath));
-            var plan = importer.PlanFromOvf(System.Xml.Linq.XDocument.Load(ovfPath), Path.GetDirectoryName(Path.GetFullPath(ovfPath))!);
+            var importer = new ExportImport.OvfImporter(new Qemu.TransactionalDiskOps(_qemuImgPath),
+                Path.Combine(_ovmfDir, "OVMF_VARS.fd"));
+            ExportImport.OvfImporter.ImportPlan plan;
+            try
+            {
+                // 解包（tar 层）+ XML 解析同在防护内（与计划路径同标准），解包前
+                // 同样先核临时盘空间
+                string ovfPath;
+                if (ovfOrOvaPath.EndsWith(".ova", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        var need = new FileInfo(ovfOrOvaPath).Length;
+                        var tmpAvail = new DriveInfo(
+                            Path.GetPathRoot(Path.GetTempPath()) ?? Path.GetTempPath()).AvailableFreeSpace;
+                        if (tmpAvail < need)
+                            throw new GrassCoreException(
+                                $"解包 OVA 约需 {Math.Max(1, need / 1024 / 1024 / 1024)} GB 临时空间，" +
+                                $"但系统临时目录所在磁盘只剩 {tmpAvail / 1024 / 1024 / 1024} GB。请先清理系统盘空间后重试。");
+                    }
+                    catch (GrassCoreException) { throw; }
+                    catch { /* 盘信息读不到：让后续真实 IO 错误兜底 */ }
+                    ovfPath = ExportImport.OvfImporter.ExtractOva(ovfOrOvaPath, Path.Combine(tempRoot, "ova"));
+                }
+                else
+                {
+                    ovfPath = ovfOrOvaPath;
+                }
+                plan = importer.PlanFromOvf(System.Xml.Linq.XDocument.Load(ovfPath),
+                    Path.GetDirectoryName(Path.GetFullPath(ovfPath))!);
+            }
+            catch (GrassCoreException)
+            {
+                throw;
+            }
+            catch (System.IO.FileNotFoundException)
+            {
+                throw new GrassCoreException("找不到这份档案文件（可能已被移动、重命名或删除）。");
+            }
+            catch (Exception e) when (e is System.Xml.XmlException or ArgumentException or InvalidOperationException
+                     or System.IO.InvalidDataException or System.IO.EndOfStreamException or NotSupportedException)
+            {
+                throw new GrassCoreException("这份档案不是有效的 OVF/OVA 描述文件。");
+            }
+            catch (System.IO.IOException e)
+            {
+                throw new GrassCoreException($"读取或解包档案失败（磁盘空间不足或文件被其他程序占用）：{e.Message}");
+            }
+            // 空间预检（§15.1"不足直接给出所需 GB 数"）：执行前再核一次——
+            // 计划到执行之间用户可能已把空间用掉/换过存档位置。
+            // UNC 存档根（\\server\share\…）没有盘符，DriveInfo 构造直接抛
+            // ArgumentException——与计划路径同标准：读不到就跳过硬校验，
+            // 让转换阶段的真实 IO 错误兜底（计划阶段已给过空间警告）
+            var requiredExec = ExportImport.OvfImporter.EstimateRequiredBytes(plan.Disks);
+            var libRootAbs = Path.GetFullPath(root);
+            long availBytes;
+            try
+            {
+                availBytes = new DriveInfo(Path.GetPathRoot(libRootAbs) ?? libRootAbs).AvailableFreeSpace;
+            }
+            catch (Exception e) when (e is ArgumentException or System.IO.IOException)
+            {
+                availBytes = long.MaxValue; // UNC/不可枚举根：跳过
+            }
+            if (availBytes < requiredExec)
+                throw new GrassCoreException(
+                    $"导入需要约 {Math.Max(1, requiredExec / 1024 / 1024 / 1024)} GB 空闲空间，" +
+                    $"但存档位置只剩 {availBytes / 1024 / 1024 / 1024} GB。请先清理空间或更换存档位置。");
             var pkg = importer.ExecuteAsync(plan, root, vmName, allowUnsupported).GetAwaiter().GetResult();
             _db.UpsertIndex(new HostDb.VmIndexEntry(pkg.Path, pkg.Name, null, DateTimeOffset.UtcNow.ToString("o"), null));
             return new { path = pkg.Path, name = pkg.Name, warnings = plan.Warnings };
         }
         finally
         {
-            if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true);
+            // 同上：清理失败不改写成功结果
+            try { if (Directory.Exists(tempRoot)) Directory.Delete(tempRoot, recursive: true); }
+            catch { /* 残留临时目录交给系统清理 */ }
         }
     }
 
@@ -1007,6 +1634,18 @@ public sealed class GrassCoreService
         var exporter = new ExportImport.OvfExporter(new Qemu.TransactionalDiskOps(_qemuImgPath));
         var ovfPath = exporter.ExportAsync(pkg, destDir).GetAwaiter().GetResult();
         return new { ovf = ovfPath };
+    }
+
+    public object ExportOva(string packagePath, string ovaPath) =>
+        WithPackageGate(packagePath, () => ExportOvaCore(packagePath, ovaPath));
+
+    private object ExportOvaCore(string packagePath, string ovaPath)
+    {
+        var pkg = new GrassVmPackage(packagePath);
+        ExportImport.GrassVmZip.EnsureExportable(pkg, _running.ContainsKey(pkg.Path));
+        var exporter = new ExportImport.OvfExporter(new Qemu.TransactionalDiskOps(_qemuImgPath));
+        var result = exporter.ExportOvaAsync(pkg, ovaPath, pkg.TempPath).GetAwaiter().GetResult();
+        return new { ova = result };
     }
 
     // ---------- 快照 ----------
@@ -1025,6 +1664,14 @@ public sealed class GrassCoreService
 
     public object ListSnapshots(string packagePath) => SnapshotService.List(new GrassVmPackage(packagePath));
 
+    /// <summary>恢复前预览：把 Core 的警告（配置回滚、包外盘不回滚等）交给 UI 在确认框里如实展示。</summary>
+    public object PlanRestoreSnapshot(string packagePath, string uuid)
+    {
+        var pkg = new GrassVmPackage(packagePath);
+        var plan = SnapshotPlanner.PlanRestore(SnapshotService.LoadTree(pkg), uuid);
+        return new { warnings = plan.Warnings };
+    }
+
     public object RestoreSnapshot(string packagePath, string uuid) => WithPackageGate(packagePath, () => RestoreSnapshotCore(packagePath, uuid));
 
     private object RestoreSnapshotCore(string packagePath, string uuid)
@@ -1039,11 +1686,117 @@ public sealed class GrassCoreService
     public object PlanDeleteSnapshot(string packagePath, string uuid)
     {
         var pkg = new GrassVmPackage(packagePath);
+        var tree = SnapshotService.LoadTree(pkg);
+        // 陈旧 UUID（列表刷新前被别处删掉）→ 产品化措辞，而不是裸 KeyNotFound。
+        // 必须放在 PlanDelete 之前——规划器内部同样按 uuid 索引
+        if (!tree.TryGet(uuid, out var target) || target is null)
+            throw new GrassCoreException("快照不存在，请刷新列表。");
         var clones = SnapshotService.FindLinkedCloneReferences(pkg);
-        var plan = SnapshotPlanner.PlanDelete(SnapshotService.LoadTree(pkg), uuid, clones);
+        var plan = SnapshotPlanner.PlanDelete(tree, uuid, clones);
+        // 链根基座（无父）删除不做 commit/rebase：物理文件保留（后代还指着它），
+        // 只是元数据移除——又快，也没有"合并进前一个快照"这回事。非根删除是否
+        // 合并取决于【物理依赖者】（孩子冻结层 / 实际压在这层上的活动盘）：没有
+        // 依赖者的删除 = 直接丢弃（快、不 commit）；有依赖者才 commit 进父层。
+        // UI 靠这两个字段给出如实的确认措辞
+        var isChainRoot = target.ParentSnapshotUuid is null;
+        var parent = isChainRoot ? null
+            : tree.TryGet(target.ParentSnapshotUuid!, out var parentNode) ? parentNode : null;
+        // 【逐盘】与执行侧同判：某盘有物理依赖者（孩子冻结层文件在场 / 活动盘
+        // 压在这层上 / 指针查询失败按保守计）且父快照有它的引用 → 该盘 commit
+        // 合并；父没有该盘引用（建盘时点落在父之后）→ 该盘按"保留基座"处置。
+        // 两种处置会出现在同一次删除里（混合盘型）——措辞绝不能"全有或全无"：
+        // 承诺"不合并"而实际跑分钟级 commit = 把用户当猴耍；承诺"合并"而实际
+        // 只动元数据 = 用户为不存在的改写白等白担心
+        var children = tree.ChildrenOf(uuid).ToList();
+        var positionWasHere = string.Equals(
+            GrassCore.Config.VmState.Load(pkg).CurrentSnapshotUuid, uuid, StringComparison.OrdinalIgnoreCase);
+        bool mergeDevice = false, keepDevice = false;
+        try
+        {
+            var ops = new Qemu.TransactionalDiskOps(_qemuImgPath);
+            var config = new ConfigStore(pkg).Load();
+            foreach (var (devId, frozenRel) in target.DiskOverlayRefs)
+            {
+                var frozenAbs = System.IO.Path.Combine(pkg.SnapshotsPath, uuid,
+                    frozenRel.Replace('/', System.IO.Path.DirectorySeparatorChar));
+                var frozenExists = File.Exists(frozenAbs);
+                // 执行侧对【目标自己的冻结文件缺失】整盘跳过（continue，无合并
+                // 也无保留）——计划侧必须同判，否则缺失+孩子在场时承诺"合并"
+                // 而实际是元数据删除
+                if (!frozenExists) continue;
+                // 父的该盘冻结文件路径（在场才存在合并语义；childHas 的"上一轮
+                // 已 rebase"排除要用到）
+                string? parentFrozenAbs = null;
+                if (parent is not null && parent.DiskOverlayRefs.TryGetValue(devId, out var pr))
+                {
+                    var pAbs0 = System.IO.Path.Combine(pkg.SnapshotsPath, parent.Uuid,
+                        pr.Replace('/', System.IO.Path.DirectorySeparatorChar));
+                    if (File.Exists(pAbs0)) parentFrozenAbs = pAbs0;
+                }
+                // 孩子在场 = 依赖者——除非它的 backing 已经指向父：那是上一轮删除
+                // 自己的产物（物理 rebase 先于元数据改挂，崩溃夹在中间），执行侧
+                // 会排除它、这层盘按"无依赖"直接丢弃。计划不排除的话，措辞会承诺
+                // 一次并不存在的分钟级合并（同轮崩溃重试现场）
+                var childHas = false;
+                foreach (var c in children)
+                {
+                    if (!c.DiskOverlayRefs.TryGetValue(devId, out var r)) continue;
+                    var cAbs = System.IO.Path.Combine(pkg.SnapshotsPath, c.Uuid,
+                        r.Replace('/', System.IO.Path.DirectorySeparatorChar));
+                    if (!File.Exists(cAbs)) continue;
+                    if (parentFrozenAbs is not null)
+                    {
+                        string? cb;
+                        try { cb = ops.QueryBackingFileStrict(cAbs); }
+                        catch (GrassCore.Qemu.QemuImgException) { cb = cAbs; } // 失败：保守按依赖计（同执行侧）
+                        if (cb is not null
+                            && string.Equals(System.IO.Path.GetFullPath(cb), System.IO.Path.GetFullPath(parentFrozenAbs),
+                                StringComparison.OrdinalIgnoreCase))
+                            continue; // 已被上一轮 rebase 到父：只差元数据改挂
+                    }
+                    childHas = true;
+                    break;
+                }
+                // 活动盘判定（执行侧同一套规则，含失败保守计）
+                var activeDependent = false;
+                var disk = config.Devices.OfType<DiskDevice>().FirstOrDefault(d => d.DeviceId == devId);
+                if (disk is not null)
+                {
+                    var active = GrassVm.PathPolicy.Resolve(pkg, disk.Path);
+                    if (File.Exists(active) && frozenExists)
+                    {
+                        string? b;
+                        try { b = ops.QueryBackingFileStrict(active); }
+                        catch (GrassCore.Qemu.QemuImgException)
+                        {
+                            b = frozenAbs; // 查询失败：按依赖计（保守，同执行侧）
+                        }
+                        if (b is not null
+                            && string.Equals(System.IO.Path.GetFullPath(b), System.IO.Path.GetFullPath(frozenAbs),
+                                StringComparison.OrdinalIgnoreCase))
+                            activeDependent = true;
+                        else if (b is null && positionWasHere)
+                            activeDependent = true;
+                    }
+                }
+                if (!childHas && !activeDependent) continue; // 这层盘无依赖者：随删除丢弃
+                // 合并（commit 进父层）要求父的该盘冻结文件【在场】（上面已算出）
+                //——父文件缺失/损坏时执行侧走"保留基座"，计划承诺"合并"就是
+                // 又一次措辞与事实的分叉
+                var parentFrozenExists = parentFrozenAbs is not null;
+                if (!parentFrozenExists) keepDevice = true;
+                else mergeDevice = true;
+            }
+        }
+        catch
+        {
+            mergeDevice = true; // 元数据/查询整体失败：按"有合并"提示（保守）
+        }
         return new
         {
-            requiresMerge = plan.RequiresMerge,
+            isChainRoot,
+            requiresMerge = !isChainRoot && mergeDevice,
+            keepsBase = !isChainRoot && keepDevice,
             affectedLinkedClones = plan.AffectedLinkedClones.Select(c => new { c.ChildVmName, c.ChildVmPath }),
             rebindings = plan.Rebindings,
         };
@@ -1060,6 +1813,37 @@ public sealed class GrassCoreService
     }
 
     // ---------- 自动启动（串行：启动 1 台 → 等默认 10 秒 → 下一台；失败只跳过该 VM）----------
+
+    public object SetAutostart(string packagePath, bool enabled)
+    {
+        var pkg = new GrassVmPackage(packagePath);
+        if (!File.Exists(pkg.ConfigPath))
+            throw new GrassCoreException("虚拟机不存在。");
+        // 宿主级属性（不写入 .grassvm，迁移不继承）；路径规范化，防止相对/绝对混用
+        _db.SetAutostart(Path.GetFullPath(pkg.Path), enabled);
+        return new { path = pkg.Path, enabled };
+    }
+
+    public object RemoveAutostart(string packagePath)
+    {
+        var pkg = new GrassVmPackage(packagePath);
+        _db.RemoveAutostart(Path.GetFullPath(pkg.Path));
+        return new { path = pkg.Path, removed = true };
+    }
+
+    public object SetAutostartOrder(string[] orderedVmPaths)
+    {
+        _db.SetAutostartOrder(orderedVmPaths.Select(p => Path.GetFullPath(p)));
+        return new { count = orderedVmPaths.Length };
+    }
+
+    public object GetAutostartInterval() => new { intervalSeconds = _db.AutostartIntervalSeconds };
+
+    public object SetAutostartInterval(int seconds)
+    {
+        _db.AutostartIntervalSeconds = seconds;
+        return new { intervalSeconds = _db.AutostartIntervalSeconds };
+    }
 
     public async Task<object> RunAutostartAsync(CancellationToken ct = default)
     {
@@ -1083,10 +1867,62 @@ public sealed class GrassCoreService
 
     // ---------- 静态工具 ----------
 
+    /// <summary>
+    /// 启动前收尾 + 预检（StartVm/ResumeVm/自启动共用）。次序是承诺：
+    /// ① vm.lock 先拒——共享库上别机运行中（残留 vm.lock）时，修复会动它
+    /// 正打开的冻结 backing，必须先拒绝、不碰磁盘；
+    /// ② 修复换入中断残留（幂等）——快照/恢复事务的崩溃现场是"工作盘缺失 +
+    ///    暂存 overlay 完好"，恰恰靠这步补齐；Restore 日志收不了尾 = 多盘撕裂
+    ///    在两个时间点 → 修复返回 false → 拒绝启动；
+    /// ③ 全量预检（资源/锁/显示设备/NVRAM/磁盘在位）。放在修复之后：先跑的话
+    ///    会把可自愈的现场误报成"磁盘文件丢失"，而内部盘没有重定位入口——死路。
+    /// </summary>
+    private void RepairThenPreflight(GrassVmPackage pkg, VmConfigView view)
+    {
+        if (File.Exists(pkg.LockPath))
+            throw new GrassCoreException(
+                "此虚拟机已被占用（vm.lock 存在）。只有在确认它没有在其他实例或其他电脑上运行时，才能解除锁定。");
+        if (!SnapshotService.RepairStagedOverlays(pkg, new Qemu.TransactionalDiskOps(_qemuImgPath)))
+            throw new GrassCoreException("此虚拟机有一个未完成的恢复操作正在收尾（磁盘可能被占用）。请关闭占用它的程序后重试。");
+        var fatal = StartupPreflight.Check(pkg, view).Where(p => p.Fatal).ToList();
+        if (fatal.Count > 0)
+            throw new GrassCoreException(string.Join("\n", fatal.Select(p => p.UserMessage)));
+    }
+
+    /// <summary>
+    /// 收养扫描的死进程分支专用：作废"会话其实是一次 -incoming 恢复"留下的
+    /// 陈旧挂起标记。恢复会话会重放 suspend.state（-incoming），而标记在确认
+    /// 完成前一直挂着；Core 崩了 + QEMU 随后退出时，包上只剩 state.json 的
+    /// 挂起标记——下一次 ResumeVm 会把【旧 RAM 状态】回放到已经前进过的磁盘
+    /// 上（静默损毁客户机文件系统）。判别：suspend.state 的写入时间 ≤ 会话
+    /// 开始时间 = 文件是该会话之前就写好的（它是通过 -incoming 被消费的，
+    /// 不是该会话产生的挂起）；文件比会话新 = 该会话自己在 SuspendVm 里写的
+    /// （合法挂起，保留）。读不了时间戳/文件缺失时同样作废：标记已是无用残迹
+    /// </summary>
+    private static void InvalidateStaleSuspendMarker(GrassVmPackage pkg, RuntimeSession session)
+    {
+        try
+        {
+            var st = VmState.Load(pkg);
+            if (st.SuspendedStatePath is null) return;
+            var sf = PathPolicy.Resolve(pkg, st.SuspendedStatePath);
+            DateTime? written = null;
+            try { if (File.Exists(sf)) written = File.GetLastWriteTimeUtc(sf); }
+            catch { /* 读不了时间戳：按作废处理 */ }
+            if (written is not null && written.Value > session.StartedAt.UtcDateTime)
+                return; // 文件是该会话在挂起流程里写的：合法挂起，保留
+            st.SuspendedStatePath = null;
+            st.SuspendFingerprint = null;
+            st.Save(pkg);
+            try { if (File.Exists(sf)) File.Delete(sf); } catch { /* 尽力 */ }
+        }
+        catch { /* state 读写失败：留待下轮，绝不阻断收养收尾 */ }
+    }
+
     private static VmConfigView ToConfigView(VmConfiguration config)
     {
         var disks = config.DevicesOfType<DiskDevice>()
-            .Select(d => new VmConfigView.DiskView(d.Path, "硬盘")).ToList();
+            .Select(d => new VmConfigView.DiskView(d.Path, "硬盘", d.IsExternal)).ToList();
         var cds = config.DevicesOfType<CdromDevice>()
             .Select(c => new VmConfigView.CdView(c.IsoPath, "CD/DVD")).ToList();
         return new VmConfigView(
@@ -1113,6 +1949,10 @@ public sealed class QemuProcessLauncher(string qemuSystemPath) : IQemuProcessLau
             FileName = qemuSystemPath,
             UseShellExecute = false,
             CreateNoWindow = true,
+            // 两个流都要重定向：BeginOutputReadLine 在 stdout 未重定向时直接抛
+            // InvalidOperationException，外层 catch 吞掉后 BeginErrorReadLine 也
+            // 不会执行——stderr 管道没人读，QEMU 写满 ~4KB 后整机冻结
+            RedirectStandardOutput = true,
             RedirectStandardError = true,
         };
         foreach (var a in cmd.Args) psi.ArgumentList.Add(a);
@@ -1124,10 +1964,25 @@ public sealed class QemuProcessLauncher(string qemuSystemPath) : IQemuProcessLau
             var logDir = System.IO.Path.Combine(cmd.PackageRoot ?? ".", GrassVmPackage.LogsDir);
             Directory.CreateDirectory(logDir);
             var logPath = System.IO.Path.Combine(logDir, "qemu.log");
-            proc.OutputDataReceived += (_, e) => { if (e.Data is not null) File.AppendAllText(logPath, e.Data + "\n"); };
-            proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) File.AppendAllText(logPath, e.Data + "\n"); };
-            proc.BeginOutputReadLine();
-            proc.BeginErrorReadLine();
+            // 会话起点截断（>2MB 时无条件截断）：诊断要的是最近一次启动的早期输出，
+            // 无限追加会让 .grassvm 包静默膨胀（搬家/拷贝的是这个目录）
+            try
+            {
+                var fi = new FileInfo(logPath);
+                if (!fi.Exists || fi.Length > 2 * 1024 * 1024)
+                    File.WriteAllText(logPath, $"--- session {DateTimeOffset.Now:O} ---\n");
+            }
+            catch { /* 截断失败不影响日志追加 */ }
+            // 两个排水回调在不同线程池线程上并发 AppendAllText（AppendAllText 以
+            // FileShare.Read 打开——Windows 上共享冲突直接抛 IOException，而
+            // DataReceived 处理器里抛出的异常会击穿整个 Core 进程）——串行化
+            var logLock = new object();
+            proc.OutputDataReceived += (_, e) => { if (e.Data is not null) lock (logLock) File.AppendAllText(logPath, e.Data + "\n"); };
+            proc.ErrorDataReceived += (_, e) => { if (e.Data is not null) lock (logLock) File.AppendAllText(logPath, e.Data + "\n"); };
+            try { proc.BeginOutputReadLine(); }
+            catch { /* stdout 排水失败不影响 stderr 排水 */ }
+            try { proc.BeginErrorReadLine(); }
+            catch { /* 日志/排水失败不影响 QEMU 运行 */ }
         }
         catch
         {

@@ -58,6 +58,9 @@ public sealed class QmpClient : IDisposable
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, TaskCompletionSource<JsonDocument>> _pending = new();
     private Task? _readLoop;
     private volatile bool _disposed;
+
+    /// <summary>连接已关闭（管道重置/读循环退出后 Dispose）。调用方据此重建连接。</summary>
+    public bool IsDisposed => _disposed;
     private int _nextId = 1;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
 
@@ -107,7 +110,7 @@ public sealed class QmpClient : IDisposable
 
     private async Task<JsonDocument> ExecuteRawAsync(object payload, CancellationToken ct)
     {
-        int id;
+        int id = -1;
         var tcs = new TaskCompletionSource<JsonDocument>(TaskCreationOptions.RunContinuationsAsynchronously);
         ThrowIfDisposed();
         try
@@ -129,9 +132,17 @@ public sealed class QmpClient : IDisposable
             json = json.Insert(json.Length - 1, $",\"id\":{id}");
             await _writer.WriteLineAsync(json).ConfigureAwait(false);
         }
+        catch (ObjectDisposedException)
+        {
+            // 拿到锁之后、写完之前被 Dispose：给调用方干净的"QMP 不可用"，
+            // 并清掉刚登记的挂起项
+            if (id >= 0) _pending.TryRemove(id, out _);
+            throw new QmpException("QMP 连接已关闭。");
+        }
         finally
         {
-            _sendLock.Release();
+            try { _sendLock.Release(); }
+            catch (ObjectDisposedException) { /* 信号量随连接一起释放了 */ }
         }
         // 响应由常驻读循环匹配 id 后完成；ct 取消 → 唤醒等待方（而不是永远挂起）
         using var reg = ct.Register(() =>
@@ -166,9 +177,12 @@ public sealed class QmpClient : IDisposable
             }
             catch
             {
-                // 连接关闭/损坏：让所有在途命令失败并停止循环
+                // 连接关闭/损坏：让所有在途命令失败并停止循环。
+                // 标记自身已死：QEMU 还活着、管道却断了的情况（对端重置/瞬态读错误），
+                // 没有这个标记的话持有方永远不重建连接——后续所有电源操作一直抛
                 foreach (var kv in _pending) kv.Value.TrySetException(new QmpException("QMP 连接已关闭。"));
                 _pending.Clear();
+                _disposed = true;
                 return;
             }
         }
@@ -176,11 +190,16 @@ public sealed class QmpClient : IDisposable
 
     private void DispatchEvent(JsonDocument msg)
     {
-        if (msg.RootElement.TryGetProperty("event", out var ev))
+        if (!msg.RootElement.TryGetProperty("event", out var ev)) return;
+        var name = ev.GetString()!;
+        try
         {
-            var name = ev.GetString()!;
             if (_eventHandlers.TryGetValue(name, out var h)) h(msg.RootElement);
             else UnhandledEvent?.Invoke(msg.RootElement, name);
+        }
+        catch
+        {
+            // 观察者异常不能被读循环误判成 QMP 传输损坏。
         }
     }
 
@@ -193,15 +212,32 @@ public sealed class QmpClient : IDisposable
 
     public void Dispose()
     {
+        // 先立牌再拿锁：新的发送者会在锁内被 ThrowIfDisposed 拦住；
+        // 已在锁内注册的命令一定在 _pending 里——失效不会漏。
         _disposed = true;
-        // 在途命令立即失败（否则只能等读循环碰巧观察到流关闭，调用方白白挂住）
-        foreach (var (_, tcs) in _pending)
-            tcs.TrySetException(new QmpException("QMP 连接已关闭。"));
-        _pending.Clear();
-        try { _writer.Dispose(); } catch (ObjectDisposedException) { }
-        try { _reader.Dispose(); } catch (ObjectDisposedException) { }
-        _transport.Dispose();
-        try { _sendLock.Dispose(); } catch (ObjectDisposedException) { }
+        try
+        {
+            _sendLock.Wait(TimeSpan.FromSeconds(5));
+        }
+        catch (ObjectDisposedException)
+        {
+            // 已被并发释放过
+        }
+        try
+        {
+            // 在途命令立即失败（否则只能等读循环碰巧观察到流关闭，调用方白白挂住）
+            foreach (var (_, tcs) in _pending)
+                tcs.TrySetException(new QmpException("QMP 连接已关闭。"));
+            _pending.Clear();
+            try { _writer.Dispose(); } catch (ObjectDisposedException) { }
+            try { _reader.Dispose(); } catch (ObjectDisposedException) { }
+            _transport.Dispose();
+        }
+        finally
+        {
+            try { _sendLock.Release(); } catch (Exception) { /* SemaphoreFullException/ODE 均可 */ }
+            try { _sendLock.Dispose(); } catch (ObjectDisposedException) { }
+        }
     }
 }
 

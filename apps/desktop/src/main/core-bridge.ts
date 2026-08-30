@@ -83,10 +83,22 @@ export class CoreBridge extends EventEmitter {
       buf = Buffer.concat([buf, chunk]);
       while (buf.length >= 4) {
         const len = buf.readInt32LE(0);
+        // 帧长合法域（与 Core 端一致）：撕裂帧/脏缓冲会给出天文数字或负数——
+        // 照常 slice 会乱吞缓冲，负数直接让 subarray 抛异常炸掉主进程
+        if (!(len > 0 && len <= 64 * 1024 * 1024)) {
+          this.teardownChannel(new Error('与 GrassCore 的通信帧损坏，正在重连…'));
+          return;
+        }
         if (buf.length < 4 + len) break;
         const json = buf.subarray(4, 4 + len).toString('utf8');
         buf = buf.subarray(4 + len);
-        this.onMessage(json);
+        try {
+          this.onMessage(json);
+        } catch {
+          // 半条 JSON（Core 死在帧中间）：坏帧不炸主进程——拆通道重生
+          this.teardownChannel(new Error('与 GrassCore 的通信帧损坏，正在重连…'));
+          return;
+        }
       }
     });
     // Core 死亡契约：在途请求立即失败（否则 spinner 转到天荒地老），通道拆除，

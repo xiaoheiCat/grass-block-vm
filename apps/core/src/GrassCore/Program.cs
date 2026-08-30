@@ -66,7 +66,7 @@ public static class Program
             while (true)
             {
                 await Task.Delay(TimeSpan.FromSeconds(15));
-                if (Transport.ActiveConnections > 0 || service.HasRunningVms)
+                if (Transport.ActiveConnections > 0 || service.HasRunningVms || service.HasInFlightDiskJobs)
                 {
                     idleSince = null;
                     continue;
@@ -138,12 +138,23 @@ public static class Program
             p.GetProperty("isoPath").ValueKind == JsonValueKind.Null ? null : p.GetProperty("isoPath").GetString()),
         "getConfig" => s.GetConfig(p.GetProperty("packagePath").GetString()!),
         "runAutostart" => s.RunAutostartAsync().GetAwaiter().GetResult(),
+        "setAutostart" => s.SetAutostart(p.GetProperty("packagePath").GetString()!, p.GetProperty("enabled").GetBoolean()),
+        "removeAutostart" => s.RemoveAutostart(p.GetProperty("packagePath").GetString()!),
+        "setAutostartOrder" => s.SetAutostartOrder(p.GetProperty("orderedVmPaths").EnumerateArray().Select(e => e.GetString()!).ToArray()),
+        "getAutostartInterval" => s.GetAutostartInterval(),
+        "setAutostartInterval" => s.SetAutostartInterval(p.GetProperty("intervalSeconds").GetInt32()),
         "updateConfig" => s.UpdateConfig(p.GetProperty("packagePath").GetString()!, p.GetProperty("configJson").GetString()!),
         "resizeDisk" => s.ResizeDisk(
             p.GetProperty("packagePath").GetString()!,
             p.GetProperty("deviceId").GetString()!,
-            p.GetProperty("newGiB").GetInt64()),
+            // 自由文本数字输入：小数/NaN 会让 GetInt64 裸抛英文异常——
+            // 按产品规则给可读错误，整数交给 ResizeDisk 钳制
+            p.GetProperty("newGiB").ValueKind == JsonValueKind.Number
+                && p.GetProperty("newGiB").TryGetInt64(out var newGiB)
+                ? newGiB
+                : throw new GrassCore.Rpc.GrassCoreException("磁盘大小必须是整数 GB。")),
         "unlockVm" => s.UnlockVm(p.GetProperty("packagePath").GetString()!),
+        "discardSuspendState" => s.DiscardSuspendState(p.GetProperty("packagePath").GetString()!),
         "fullClone" => s.FullClone(p.GetProperty("packagePath").GetString()!, p.GetProperty("newName").GetString()!),
         "linkedClone" => s.LinkedClone(p.GetProperty("packagePath").GetString()!, p.GetProperty("snapshotUuid").GetString()!, p.GetProperty("newName").GetString()!),
         "exportZip" => s.ExportZip(p.GetProperty("packagePath").GetString()!, p.GetProperty("zipPath").GetString()!),
@@ -151,8 +162,10 @@ public static class Program
         "planImportOvf" => s.PlanImportOvf(p.GetProperty("path").GetString()!),
         "executeImportOvf" => s.ExecuteImportOvf(p.GetProperty("path").GetString()!, p.GetProperty("vmName").GetString()!, p.GetProperty("allowUnsupported").GetBoolean()),
         "exportOvf" => s.ExportOvf(p.GetProperty("packagePath").GetString()!, p.GetProperty("destDir").GetString()!),
+        "exportOva" => s.ExportOva(p.GetProperty("packagePath").GetString()!, p.GetProperty("ovaPath").GetString()!),
         "createSnapshot" => s.CreateSnapshot(p.GetProperty("packagePath").GetString()!, p.GetProperty("name").GetString()!, null),
         "listSnapshots" => s.ListSnapshots(p.GetProperty("packagePath").GetString()!),
+        "planRestoreSnapshot" => s.PlanRestoreSnapshot(p.GetProperty("packagePath").GetString()!, p.GetProperty("uuid").GetString()!),
         "restoreSnapshot" => s.RestoreSnapshot(p.GetProperty("packagePath").GetString()!, p.GetProperty("uuid").GetString()!),
         "planDeleteSnapshot" => s.PlanDeleteSnapshot(p.GetProperty("packagePath").GetString()!, p.GetProperty("uuid").GetString()!),
         "deleteSnapshot" => s.DeleteSnapshot(p.GetProperty("packagePath").GetString()!, p.GetProperty("uuid").GetString()!),

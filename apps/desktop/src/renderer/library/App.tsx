@@ -13,6 +13,7 @@ import {
   vmSubtitle,
 } from './vm-state';
 import { CreateWizard } from './CreateWizard';
+import { SnapshotsDialog } from './SnapshotsDialog';
 import { ForceOffConfirm, UnlockConfirm, VmSettings } from './VmSettings';
 
 interface GrassApi {
@@ -31,6 +32,7 @@ export function App(): React.ReactElement {
   const [profiles, setProfiles] = useState<OsProfileDto[]>([]);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [settingsVm, setSettingsVm] = useState<VmSummary | null>(null);
+  const [snapshotsVm, setSnapshotsVm] = useState<VmSummary | null>(null);
   const [forceOffVm, setForceOffVm] = useState<VmSummary | null>(null);
   const [unlockVm, setUnlockVm] = useState<VmSummary | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -146,11 +148,28 @@ export function App(): React.ReactElement {
     }
   }, [fail]);
 
-  // 完整克隆：独立副本（无快照历史、无本机痕迹）
+  // 完整克隆：独立副本（无快照历史、无本机痕迹）。
+  // 包外（外部）硬盘不会被复制——父与克隆继续共享同一物理文件，提示里如实说明
   const onFullClone = useCallback(
     async (vm: VmSummary) => {
       if (!api) return;
-      const name = window.prompt('新虚拟机的名称（完整克隆：独立副本，不含快照历史）', `${vm.name} 副本`);
+      let hasExternal = false;
+      try {
+        const c = await api.coreCall<{ devices: Array<{ deviceType: string; isExternal?: boolean }> }>(
+          'getConfig',
+          { packagePath: vm.path },
+        );
+        hasExternal = c.devices.some((d) => d.deviceType === 'disk' && d.isExternal === true);
+      } catch {
+        /* 拿不到配置就按普通提示走 */
+      }
+      const base = '新虚拟机的名称（完整克隆：独立副本，不含快照历史）';
+      const name = window.prompt(
+        hasExternal
+          ? `${base}\n注意：这台虚拟机的包外硬盘不会被复制，克隆将继续直接使用同一文件——不要同时运行两台。`
+          : base,
+        `${vm.name} 副本`,
+      );
       if (!name?.trim()) return;
       try {
         await api.coreCall('fullClone', { packagePath: vm.path, newName: name.trim() });
@@ -178,6 +197,21 @@ export function App(): React.ReactElement {
     [refresh, fail],
   );
 
+  // 导出 OVA（标准交换格式；给其他虚拟化软件用的场景）
+  const onExportOva = useCallback(
+    async (vm: VmSummary) => {
+      if (!api) return;
+      const target = await api.pickSaveFile(`${vm.name}.ova`, '开放虚拟设备（OVA）', ['ova']);
+      if (!target) return;
+      try {
+        await api.coreCall('exportOva', { packagePath: vm.path, ovaPath: target });
+      } catch (e) {
+        fail(e);
+      }
+    },
+    [fail],
+  );
+
   // 导入：.grassvm.zip 完整档案 或 .ova/.ovf（计划→[仍然导入]→执行）
   const onImport = useCallback(async () => {
     if (!api) return;
@@ -203,11 +237,17 @@ export function App(): React.ReactElement {
         if (plan.warnings.length > 0 && !window.confirm(plan.warnings.join('\n'))) return;
         const name = window.prompt('虚拟机名称', plan.vmName);
         if (!name?.trim()) return;
-        await api.coreCall('executeImportOvf', {
+        const exec = await api.coreCall<{ warnings?: string[] }>('executeImportOvf', {
           path: src,
           vmName: name.trim(),
           allowUnsupported: plan.blocksImport,
         });
+        // 执行阶段新产生的警告（如固件模板缺失 → UEFI 虚拟机 NVRAM 未初始化）
+        // 只会出现在这个返回值里——丢掉它，用户第一次听到的就是预检报错
+        const execWarnings = exec?.warnings ?? [];
+        if (execWarnings.length > 0) {
+          window.alert(`虚拟机已导入，但存在以下警告：\n${execWarnings.join('\n')}`);
+        }
       }
       await refresh();
     } catch (e) {
@@ -228,11 +268,13 @@ export function App(): React.ReactElement {
           onUnlock={setUnlockVm}
           onOpenDisplay={onOpenDisplay}
           onSettings={setSettingsVm}
+          onSnapshots={setSnapshotsVm}
           onFullClone={onFullClone}
           onExportZip={onExportZip}
+          onExportOva={onExportOva}
         />
       )),
-    [vms, onStart, onResume, onPower, onOpenDisplay, onFullClone, onExportZip],
+    [vms, onStart, onResume, onPower, onOpenDisplay, onFullClone, onExportZip, onExportOva],
   );
 
   if (!api) {
@@ -325,6 +367,9 @@ export function App(): React.ReactElement {
         />
       )}
       {settingsVm && <VmSettings vm={settingsVm} onClose={() => setSettingsVm(null)} />}
+      {snapshotsVm && (
+        <SnapshotsDialog vm={snapshotsVm} onClose={() => setSnapshotsVm(null)} />
+      )}
       {forceOffVm && (
         <ForceOffConfirm
           vmName={forceOffVm.name}
@@ -367,8 +412,10 @@ function VmCard(props: {
   onUnlock(vm: VmSummary): void;
   onOpenDisplay(vm: VmSummary): void;
   onSettings(vm: VmSummary): void;
+  onSnapshots(vm: VmSummary): void;
   onFullClone(vm: VmSummary): void;
   onExportZip(vm: VmSummary): void;
+  onExportOva(vm: VmSummary): void;
 }): React.ReactElement {
   const { vm } = props;
   const action = primaryAction(vm.state);
@@ -398,7 +445,10 @@ function VmCard(props: {
             {primaryActionLabel(action)}
           </button>
         )}
-        {(vm.state === 'running' || vm.state === 'suspending') && (
+        {/* 电源菜单只在真正 running 时给出：挂起途中（suspending）Core 持着包级
+            门走 stop→migrate→quit（大内存可达数分钟），此刻点任何电源项都会在
+            等门后撞上"此虚拟机没有在运行"——注定失败的菜单不如不给 */}
+        {vm.state === 'running' && (
           <details className="power-menu">
             <summary>电源</summary>
             <div className="power-menu-items">
@@ -431,6 +481,12 @@ function VmCard(props: {
             )}
             <button
               className="menu-item"
+              onClick={() => props.onSnapshots(vm)}
+            >
+              快照…
+            </button>
+            <button
+              className="menu-item"
               disabled={busy || vm.state === 'suspended'}
               title={vm.state === 'suspended' ? '已挂起的虚拟机需要先恢复并正常关机' : undefined}
               onClick={() => props.onFullClone(vm)}
@@ -444,6 +500,18 @@ function VmCard(props: {
               onClick={() => props.onExportZip(vm)}
             >
               导出档案…
+            </button>
+            <button
+              className="menu-item"
+              disabled={busy || vm.state === 'suspended'}
+              title={
+                vm.state === 'suspended'
+                  ? '已挂起的虚拟机需要先恢复并正常关机'
+                  : '导出为标准 OVA（给其他虚拟化软件使用；不保留快照）'
+              }
+              onClick={() => props.onExportOva(vm)}
+            >
+              导出 OVA…
             </button>
           </div>
         </details>

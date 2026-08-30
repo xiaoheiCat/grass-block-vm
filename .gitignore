@@ -10,8 +10,12 @@ apps/core/**/bin/
 apps/core/**/obj/
 *.user
 
-# Local .NET SDK install (developer-managed, not committed)
+# Local .NET SDK & caches (developer-managed, not committed)
 .dotnet/
+.dotnet-home/
+.nuget/
+.local/
+Library/
 dotnet-install.sh
 
 # Python venv used for PDF extraction (session artifact)
@@ -19,8 +23,11 @@ dotnet-install.sh
 
 # Logs & temp
 *.log
+*.dmp
 .grass-tmp
 temp/
+TestResults/
+**/TestResults/
 
 # macOS
 .DS_Store

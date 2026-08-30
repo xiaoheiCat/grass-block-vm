@@ -68,6 +68,11 @@ public sealed class GrassVmPackage
         if (!Directory.Exists(libraryRoot)) yield break;
         foreach (var dir in Directory.EnumerateDirectories(libraryRoot))
         {
+            // 以 "." 开头的是事务暂存目录（.creating-…/.importing-…）：导入/创建
+            // 进行中（可达数分钟）或中断残留。它们没有 config.json，列出来就是
+            // 一张打不开也删不掉的"幽灵卡"——扫描直接跳过
+            var name = System.IO.Path.GetFileName(dir);
+            if (name.StartsWith(".", StringComparison.Ordinal)) continue;
             if (IsGrassVmDirectory(dir)) yield return new GrassVmPackage(dir);
         }
     }
@@ -82,11 +87,24 @@ public sealed class GrassVmPackage
         if (invalid >= 0 || string.IsNullOrWhiteSpace(name))
             throw new ArgumentException("VM 名称不能包含文件系统非法字符。");
         var root = System.IO.Path.Combine(parentDir, name + Extension);
-        if (Directory.Exists(root) || File.Exists(root))
-            throw new InvalidOperationException($"已存在同名虚拟机：{System.IO.Path.GetFileName(root)}");
-        var pkg = new GrassVmPackage(root);
-        pkg.EnsureStructure();
-        return pkg;
+        // 检查-再-创建之间有竞态（并发 CreateVm 都通过 Directory.Exists 检查）：
+        // 先在旁边造好完整目录，再用一次原子 rename 抢注——只有一个赢家
+        var staging = System.IO.Path.Combine(parentDir, $".creating-{name}-{System.IO.Path.GetRandomFileName()}{Extension}");
+        try
+        {
+            var staged = new GrassVmPackage(staging);
+            staged.EnsureStructure();
+            Directory.Move(staging, root);
+            return new GrassVmPackage(root);
+        }
+        catch (IOException)
+        {
+            // 目标已存在（rename 失败）或暂存目录创建失败
+            try { if (Directory.Exists(staging)) Directory.Delete(staging, recursive: true); } catch { /* 尽力 */ }
+            if (Directory.Exists(root) || File.Exists(root))
+                throw new InvalidOperationException($"已存在同名虚拟机：{System.IO.Path.GetFileName(root)}");
+            throw;
+        }
     }
 
     /// <summary>确保固定目录存在。缺失 disks/ 等目录属于"确定无损"问题，允许保守自动修复。</summary>
@@ -138,16 +156,80 @@ public sealed class GrassVmPackage
         return report;
     }
 
-    /// <summary>应用启动时清理所有残留 .grass-tmp 临时产物。原文件永不被原地破坏，因此清理无损。</summary>
+    /// <summary>
+    /// 应用启动时清理残留 .grass-tmp 临时产物。原文件永不被原地破坏，因此清理无损。
+    /// 只删写入停止超过 10 分钟的：刚崩溃 Core 的半成品可能正被重生的实例继续使用，
+    /// 启动即删会把别人的活干掉；新鲜文件留给下一轮。
+    /// </summary>
     public int CleanupResidualTempFiles()
     {
         var n = 0;
         if (!Directory.Exists(Path)) return 0;
+        var cutoff = DateTime.UtcNow - TimeSpan.FromMinutes(10);
         foreach (var f in Directory.EnumerateFiles(Path, "*" + TransactionalDiskOps.TempSuffix, SearchOption.AllDirectories))
         {
-            File.Delete(f);
-            n++;
+            // commit 副本事务的暂存不能当垃圾删：overlay 可能已指向它（删了链就断）。
+            // 由 RepairStagedOverlays → FinishCommitTempFiles 收尾换名
+            if (f.EndsWith(TransactionalDiskOps.CommitTempSuffix, StringComparison.Ordinal)) continue;
+            try
+            {
+                if (File.GetLastWriteTimeUtc(f) >= cutoff) continue;
+                File.Delete(f);
+                n++;
+            }
+            catch (IOException)
+            {
+                // 被占用 = 有人正在写：留给下一轮
+            }
+            catch (UnauthorizedAccessException)
+            {
+                // 逐文件兜底：一个文件清不掉不阻断其余清理
+            }
         }
+        // OVA 导出的工作目录（temp/ova-<guid>/，含全盘 VMDK 转换件）：导出中崩
+        // 溃/被杀时 finally 不再有机会跑，残留可达整台 VM 的磁盘体积且没有任何
+        // 组件回收——"交给系统清理"是谎言。同样遵守 10 分钟新鲜度门槛
+        var tempDir = System.IO.Path.Combine(Path, TempDir);
+        if (Directory.Exists(tempDir))
+        {
+            foreach (var d in Directory.EnumerateDirectories(tempDir, "ova-*"))
+            {
+                try
+                {
+                    if (Directory.GetLastWriteTimeUtc(d) >= cutoff) continue;
+                    Directory.Delete(d, recursive: true);
+                    n++;
+                }
+                catch (IOException)
+                {
+                    // 被占用 = 导出可能仍在进行：留给下一轮
+                }
+                catch (UnauthorizedAccessException) { /* 逐目录兜底 */ }
+            }
+        }
+        // 孤儿 suspend.state（挂起标记已不在、RAM 大小的废弃镜像——挂起失败回滚
+        // 路径删不掉时的残渣）：启动时没有任何会话在写它；标记在场的【合法挂起】
+        // 绝不能动
+        try
+        {
+            // Load 会把损坏 state.json 静默视为新状态；此处若直接据此删除，可能
+            // 抹掉仍然合法的挂起镜像（标记只是暂时无法解析）。先严格解析：损坏
+            // 时留给 IntegrityReport/下一轮修复，绝不碰 suspend.state
+            if (File.Exists(StatePath))
+            {
+                using var stateDoc = JsonDocument.Parse(File.ReadAllText(StatePath));
+            }
+            if (GrassCore.Config.VmState.Load(this).SuspendedStatePath is null)
+            {
+                var stray = System.IO.Path.Combine(Path, "suspend.state");
+                if (File.Exists(stray))
+                {
+                    File.Delete(stray);
+                    n++;
+                }
+            }
+        }
+        catch { /* state 读写失败/损坏/占用：留待下一轮 */ }
         return n;
     }
 }

@@ -46,6 +46,7 @@ public class SuspendResumeServiceTests : IDisposable
     {
         using var fakeQmp = new FakeQmpServer();
         var migrateQueries = 0; // 闭包计数（真实时序：先 active 再 completed）
+        GrassVm.GrassVmPackage? testPkg = null; // CreateVm 之后赋值（quit 处理要用）
         fakeQmp.OnCommand = (cmd, doc) =>
         {
             // 真实 QEMU 的 migrate file: 会把完整状态写入目标文件；假服务模拟这一副作用
@@ -54,6 +55,19 @@ public class SuspendResumeServiceTests : IDisposable
                 var uri = args.TryGetProperty("uri", out var u) ? u.GetString() : null;
                 if (uri?.StartsWith("file:") == true)
                     File.WriteAllBytes(uri["file:".Length..], "saved-state"u8);
+            }
+            // 真实语义：QEMU 收到 quit 会退出进程。假 QMP 不能只停响应——
+            // 挂起流程等的是【进程退出】（之后才放锁），不等的话 10 秒超时
+            // 走"仍在退出"分支，vm.lock 不释放
+            if (cmd == "quit" && testPkg is not null)
+            {
+                try
+                {
+                    var session = RuntimeSession.Deserialize(File.ReadAllText(testPkg.SessionPath));
+                    if (session?.QemuPid > 0)
+                        Process.GetProcessById(session.QemuPid).Kill();
+                }
+                catch { /* 进程已不在：忽略 */ }
             }
             // 真实时序：migrate 命令返回时迁移才刚开始；第一次查询 active，之后 completed
             return Task.FromResult(cmd switch
@@ -92,8 +106,8 @@ public class SuspendResumeServiceTests : IDisposable
         }))).Path;
 
         var pkg = new GrassVm.GrassVmPackage(vmPath);
+        testPkg = pkg; // 让假 QMP 的 quit 处理能找到并结束假 QEMU 进程
         service.StartVm(vmPath);
-        // QMP 已在 StartVm 内完成握手（否则挂起动作会失败）
         Assert.True(File.Exists(pkg.LockPath));
 
         // 挂起：stop → migrate file: → query-migrate(completed) → quit
@@ -200,6 +214,7 @@ public class SuspendResumeServiceTests : IDisposable
 
         // 客户机内关机 / ACPI 关机最终都表现为 QEMU 进程退出：这里直接结束假进程
         var session = RuntimeSession.Deserialize(File.ReadAllText(pkg.SessionPath));
+        Assert.NotNull(session);
         Process.GetProcessById(session.QemuPid).Kill();
 
         var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
@@ -210,6 +225,49 @@ public class SuspendResumeServiceTests : IDisposable
         Assert.False(File.Exists(pkg.LockPath));
         Assert.Empty(Directory.EnumerateFiles(pkg.RuntimePath));
         Assert.Equal("stopped", service.ScanLibrary().Vms.Single(v => v.Path == vmPath).State);
+    }
+
+    [Fact]
+    public void StartVm_WithStagedSwapInterrupt_RepairsThenBoots()
+    {
+        // 换入中断现场（快照/恢复事务在"旧盘改名 → 暂存换入"之间崩溃）：工作盘
+        // 缺失、暂存 overlay 完好。启动入口必须【先修复、后磁盘预检】——预检
+        // 先跑会把可自愈的现场误报成"找不到磁盘文件"，而内部盘没有重定位
+        // 入口 = 停机状态永远开不了机的死路（恰是暂存机制要兜住的崩溃窗口）
+        using var fakeQmp = new FakeQmpServer();
+        fakeQmp.OnCommand = (_, _) => Task.FromResult("""{"return":{}}""");
+        var acceptTask = fakeQmp.AcceptAsync();
+        var launcher = new RecordingLauncher();
+        using var db = new HostDb(Path.Combine(_dir, "grass.db"));
+        var root = Path.Combine(_dir, "root5");
+        Directory.CreateDirectory(root);
+        db.SetPreference("libraryRoot", root);
+        Directory.CreateDirectory(Path.Combine(_dir, "fw"));
+        File.WriteAllText(Path.Combine(_dir, "fw", "OVMF_VARS.fd"), "vars-template");
+
+        var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(),
+            Path.Combine(_dir, "fw"), "11", launcher,
+            qmpTransportFactory: _ => new TcpTransport("127.0.0.1", fakeQmp.Port));
+
+        var vmPath = ((GrassCoreService.CreateVmResult)service.CreateVm(System.Text.Json.JsonSerializer.SerializeToElement(new
+        {
+            name = "SwapInterrupt", profileId = "ubuntu", diskGiB = 8, isoPath = (string?)null,
+            cpuCores = 1, memoryMiB = 1024, startAfterCreate = false,
+        }))).Path;
+        var pkg = new GrassVm.GrassVmPackage(vmPath);
+
+        // 模拟崩溃窗口：工作盘已改名成暂存 overlay（换入事务的中间态）
+        var config = new Config.ConfigStore(pkg).Load();
+        var active = GrassVm.PathPolicy.Resolve(pkg,
+            config.Devices.OfType<Config.DiskDevice>().Single().Path);
+        File.Move(active, active + SnapshotService.StagedOverlaySuffix);
+        Assert.False(File.Exists(active));
+
+        // 修复先于磁盘预检 → 换入补完 → 预检看到磁盘在场 → 正常启动
+        service.StartVm(vmPath);
+        Assert.True(File.Exists(pkg.LockPath));
+        Assert.True(File.Exists(active), "修复必须把暂存 overlay 换回工作路径");
+        Assert.False(File.Exists(active + SnapshotService.StagedOverlaySuffix));
     }
 
     [Fact]

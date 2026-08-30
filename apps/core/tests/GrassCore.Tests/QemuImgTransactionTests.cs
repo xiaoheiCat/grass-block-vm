@@ -122,9 +122,24 @@ public class QemuImgTransactionTests : IDisposable
         var pkg = GrassVmPackage.CreateNew(_dir, "Residue VM");
         var residue = Path.Combine(pkg.DisksPath, "half-written.qcow2.grass-tmp");
         File.WriteAllText(residue, "half");
+        // 只清"写入停止超过 10 分钟"的残留（新鲜文件可能正被重生实例使用）——
+        // 测试把时间戳拨回 15 分钟前
+        File.SetLastWriteTimeUtc(residue, DateTime.UtcNow - TimeSpan.FromMinutes(15));
         // 应用启动时自动删除残留 .grass-tmp，不尝试断点续传
         var removed = pkg.CleanupResidualTempFiles();
         Assert.Equal(1, removed);
         Assert.False(File.Exists(residue));
+    }
+
+    [Fact]
+    public void FreshGrassTmp_IsKeptForInFlightWriter()
+    {
+        var pkg = GrassVmPackage.CreateNew(_dir, "Fresh VM");
+        var fresh = Path.Combine(pkg.DisksPath, "being-written.qcow2.grass-tmp");
+        File.WriteAllText(fresh, "in flight");
+        // 刚写入的临时文件：可能是刚崩溃 Core 正被重生实例接手的活——不清
+        var removed = pkg.CleanupResidualTempFiles();
+        Assert.Equal(0, removed);
+        Assert.True(File.Exists(fresh));
     }
 }

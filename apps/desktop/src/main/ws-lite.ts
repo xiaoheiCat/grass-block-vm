@@ -58,6 +58,13 @@ export class WebSocketServer extends EventEmitter {
 
     socket.on('data', (chunk: Buffer) => conn.pushRaw(chunk));
     socket.on('close', () => conn.emit('close'));
+    // 升级后的 socket 必须接住 error：显示器窗口被杀时 SPICE 帧还在途 → RST，
+    // 无 error 监听的 socket 会把异常抛进主进程（未捕获异常 = 整个应用退出，
+    // 库窗口陪葬，VM 变成无头运行）。按断开处理即可
+    socket.on('error', () => {
+      this.conns.delete(conn);
+      conn.emit('close');
+    });
     if (head.length) conn.pushRaw(head);
   }
 }
@@ -149,6 +156,11 @@ class WsConnImpl extends EventEmitter implements WsConnection {
   }
 
   private writeFrame(opcode: number, payload: Buffer): void {
+    // 已销毁/已断开的 socket 写入会抛 EPIPE——SPICE 桥的回写不能因此炸主进程
+    if (this.socket.destroyed) {
+      this.closed = true;
+      return;
+    }
     const len = payload.length;
     let header: Buffer;
     if (len < 126) {
