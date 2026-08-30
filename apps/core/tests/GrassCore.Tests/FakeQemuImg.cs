@@ -23,107 +23,98 @@ public static class FakeQemuImg
             File.WriteAllText(ps1, """
                 $Rest = $args
                 $target = $Rest | Where-Object { "$_" -match '\.(qcow2|vmdk)' } | Select-Object -Last 1
-                # backing 可能是相对引用（快照链可移植性）——按 overlay 自身位置解析并
-                # 规范化（GetFullPath 消掉 ..）：真实 qemu-img info 返回干净绝对路径
+                $lat = [Text.Encoding]::GetEncoding(28591)
+                $opsLog = Join-Path $PSScriptRoot 'qemu-img.bat.chain-ops.log'
+
                 function Resolve-Backing([string]$img, [string]$b) {
-                    if ("$b" -match '^[a-zA-Z]:[\\/]' -or "$b" -match '^\\\\' -or "$b" -match '^/') { return $b }
-                    return [IO.Path]::GetFullPath((Join-Path (Split-Path -Parent $img) $b))
+                    if ("$b" -match '^[a-zA-Z]:[\\/]' -or "$b" -match '^\\\\') { return $b }
+                    $imgFull = [IO.Path]::GetFullPath($img)
+                    $imgDir = [IO.Path]::GetDirectoryName($imgFull)
+                    return [IO.Path]::GetFullPath([IO.Path]::Combine($imgDir, $b))
                 }
-                # 从镜像自身内容提取 backing（create/rebase 都把参数行追加进去了——
-                # 内容随 Move/Copy 旅行，比 sidecar 可靠）
+
                 function Get-ContentBacking([string]$img) {
                     if (-not (Test-Path $img)) { return '' }
-                    $line = [IO.File]::ReadAllLines($img) |
-                        Where-Object { $_ -match '-b (\S+)' } | Select-Object -Last 1
-                    if ($line -match '-b (\S+)') { return $Matches[1] }
+                    $latEnc = [Text.Encoding]::GetEncoding(28591)
+                    $text = $latEnc.GetString([IO.File]::ReadAllBytes($img))
+                    $lines = $text -split "`r?`n"
+                    $line = $lines | Where-Object { $_ -match '-b\s+([^\s]+)' } | Select-Object -Last 1
+                    if ($line -match '-b\s+([^\s]+)') { return $Matches[1] }
                     return ''
                 }
-                if ($Rest[0] -eq 'check') { exit 0 } # 基座体检（commit 后）：假件一律通过
+
+                if ($Rest[0] -eq 'check') { exit 0 }
                 if ($Rest[0] -eq 'info') {
-                    # 与真实 qemu-img 一致：目标不存在 → 非零退出。严格查询路径
-                    # （Delete 依赖者判定 / OVF 预检 / PlanDelete）的失败语义
-                    # 必须可被测试触达，否则 catch (QemuImgException) 分支永不执行
                     if (-not (Test-Path "$target")) {
-                        Write-Error "qemu-img: Could not open '$target': No such file or directory"
+                        [Console]::Error.WriteLine("qemu-img: Could not open '$target': No such file or directory")
                         exit 1
                     }
                     $b = Get-ContentBacking "$target"
                     if ($b) {
                         $rb = Resolve-Backing $target $b
-                        Write-Output ('{"full-backing-filename":"' + ($rb -replace '\\', '/') + '"}')
+                        [Console]::WriteLine('{"full-backing-filename":"' + ($rb -replace '\\', '/') + '"}')
                     } else {
-                        Write-Output '{}'
+                        [Console]::WriteLine('{}')
                     }
                     exit 0
                 }
                 if ($Rest[0] -eq 'commit') {
-                    # commit：overlay 必须有 backing（内容里记录）且 backing 在场
                     $backing = Get-ContentBacking "$target"
                     if (-not $backing) {
-                        Write-Error "qemu-img: '$target' does not have a backing file"
+                        [Console]::Error.WriteLine("qemu-img: '$target' does not have a backing file")
                         exit 1
                     }
                     $rbPath = Resolve-Backing $target $backing
                     if (-not (Test-Path $rbPath)) {
-                        Write-Error "qemu-img: Could not open backing image '$backing'"
+                        [Console]::Error.WriteLine("qemu-img: Could not open backing image '$backing'")
                         exit 1
                     }
-                    # 数据合并语义（与 POSIX 版一致）：overlay 【内容】并入 backing
-                    # （提交方向可被断言）；overlay 留首行 + 最新 -b 行。Latin-1 按
-                    # 字节往返，魔数不被编码层改写。只并数据行、不并 -b 指针行——
-                    # 真实 qemu-img commit 不把 overlay 的 backing 指针移植进 backing；
-                    # 移植了的话同级目录的相对路径会让 backing "自己 backing 自己"
-                    $lat = [Text.Encoding]::GetEncoding(28591)
                     $text = $lat.GetString([IO.File]::ReadAllBytes($target))
-                    $lines = $text -split "`n"
-                    $dataLines = $lines | Where-Object { $_ -notmatch '-b (\S+)' }
+                    $lines = $text -split "`r?`n"
+                    $dataLines = $lines | Where-Object { $_ -notmatch '-b\s+' }
                     [IO.File]::AppendAllText($rbPath, ($dataLines -join "`n") + "`n", $lat)
                     $first = $lines[0]
-                    $lastb = $lines | Where-Object { $_ -match '-b (\S+)' } | Select-Object -Last 1
+                    $lastb = $lines | Where-Object { $_ -match '-b\s+' } | Select-Object -Last 1
                     $out = $first + "`n"
                     if ($lastb) { $out = $out + $lastb + "`n" }
                     [IO.File]::WriteAllBytes($target, $lat.GetBytes($out))
-                    Add-Content -Path (Join-Path $PSScriptRoot 'chain-ops.log') -Value ($Rest -join ' ')
+                    [IO.File]::AppendAllText($opsLog, ($Rest -join ' ') + "`n", $lat)
                     exit 0
                 }
                 if ($Rest[0] -eq 'rebase') {
-                    # 测试注入（按本假件实例的目录判定，不污染进程全局环境变量——
-                    # xUnit 并行跑其他测试类时环境变量会串台）
                     if (Test-Path (Join-Path $PSScriptRoot 'fail-rebase.marker')) {
-                        Write-Error "qemu-img: simulated rebase failure"
+                        [Console]::Error.WriteLine("qemu-img: simulated rebase failure")
                         exit 1
                     }
                     $bi = [Array]::IndexOf($Rest, '-b')
                     if ($bi -ge 0 -and $bi + 1 -lt $Rest.Count) {
                         $newBacking = $Rest[$bi + 1]
                         if (-not (Test-Path (Resolve-Backing $target $newBacking))) {
-                            Write-Error "qemu-img: Could not open backing image '$newBacking'"
+                            [Console]::Error.WriteLine("qemu-img: Could not open backing image '$newBacking'")
                             exit 1
                         }
                     }
-                    # rebase 后 backing 指针变了：参数行追加进镜像（最新一条生效）
-                    Add-Content -Path $target -Value ($Rest -join ' ')
-                    Add-Content -Path (Join-Path $PSScriptRoot 'chain-ops.log') -Value ($Rest -join ' ')
+                    [IO.File]::AppendAllText($target, ($Rest -join ' ') + "`n", $lat)
+                    [IO.File]::AppendAllText($opsLog, ($Rest -join ' ') + "`n", $lat)
                     exit 0
                 }
-                # 与真实 qemu-img 一致：无 -u 时 backing 必须存在
                 if ($Rest[0] -eq 'create' -and ($Rest -notcontains '-u')) {
                     $bi = [Array]::IndexOf($Rest, '-b')
                     if ($bi -ge 0 -and $bi + 1 -lt $Rest.Count) {
                         $backing = $Rest[$bi + 1]
                         if (-not (Test-Path (Resolve-Backing $target $backing))) {
-                            Write-Error "qemu-img: Could not open backing image '$backing'"
+                            [Console]::Error.WriteLine("qemu-img: Could not open backing image '$backing'")
                             exit 1
                         }
                     }
                 }
                 if ($target) {
                     if ("$target" -match '\.vmdk') {
-                        [IO.File]::WriteAllText($target, "# Disk DescriptorFile`nfake-vmdk")
+                        [IO.File]::WriteAllText($target, "# Disk DescriptorFile`nfake-vmdk`n")
                     } else {
-                        [IO.File]::WriteAllBytes($target, [byte[]](0x51,0x46,0x49,0xFB))
+                        [IO.File]::WriteAllBytes($target, [byte[]](0x51,0x46,0x49,0xFB,0x0A))
                     }
-                    Add-Content -Path $target -Value ($Rest -join ' ')
+                    [IO.File]::AppendAllText($target, ($Rest -join ' ') + "`n", $lat)
                 }
                 exit 0
                 """);
