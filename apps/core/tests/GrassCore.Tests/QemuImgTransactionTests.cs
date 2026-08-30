@@ -26,17 +26,29 @@ public class QemuImgTransactionTests : IDisposable
     {
         if (OperatingSystem.IsWindows())
         {
-            var bat = Path.Combine(_dir, "qemu-img.bat");
-            File.WriteAllText(bat, """
-                @echo off
-                if /i "%1"=="commit" exit /B 0
-                if /i "%1"=="rebase" exit /B 0
-                echo %* | findstr /C:"crash-mode" >nul && exit /B 1
-                echo %* | findstr /C:"slow-mode" >nul && (ping -n 30 127.0.0.1 >nul)
-                for %%a in (%*) do set LAST=%%~a
-                echo QFI> "%LAST%"
-                exit /B 0
+            var ps1 = Path.Combine(_dir, "fake-qemu-img.ps1");
+            File.WriteAllText(ps1, """
+                $Rest = $args
+                $lat = [Text.Encoding]::GetEncoding(28591)
+                $cmdLine = $Rest -join ' '
+                if ($cmdLine -match 'crash-mode') { exit 1 }
+                if ($cmdLine -match 'slow-mode') { Start-Sleep -Seconds 30 }
+                if ($Rest[0] -eq 'commit' -or $Rest[0] -eq 'rebase' -or $Rest[0] -eq 'check') { exit 0 }
+                $target = $Rest | Where-Object { "$_" -match '\.(qcow2|vmdk)' } | Select-Object -Last 1
+                if ($target) {
+                    $parent = Split-Path -Parent $target
+                    if ($parent -and -not (Test-Path $parent)) { [IO.Directory]::CreateDirectory($parent) | Out-Null }
+                    if ("$target" -match '\.vmdk') {
+                        [IO.File]::WriteAllText($target, "# Disk DescriptorFile`nfake-vmdk`n")
+                    } else {
+                        [IO.File]::WriteAllBytes($target, [byte[]](0x51,0x46,0x49,0xFB))
+                    }
+                    [IO.File]::AppendAllText($target, $cmdLine + "`n", $lat)
+                }
+                exit 0
                 """);
+            var bat = Path.Combine(_dir, "qemu-img.bat");
+            File.WriteAllText(bat, $"@chcp 65001 >nul\r\n@powershell -NoProfile -ExecutionPolicy Bypass -File \"{ps1}\" %*\r\n");
             return bat;
         }
         var sh = Path.Combine(_dir, "qemu-img");
