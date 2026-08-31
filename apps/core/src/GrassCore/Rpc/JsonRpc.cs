@@ -44,7 +44,8 @@ public sealed class JsonRpcConnection
         if (len <= 0 || len > 64 * 1024 * 1024) throw new IOException("非法帧长度。");
         var buf = new byte[len];
         if (!await ReadExactAsync(buf, ct)) return null;
-        return JsonDocument.Parse(buf).RootElement;
+        using var doc = JsonDocument.Parse(buf);
+        return doc.RootElement.Clone();
     }
 
     private async Task<bool> ReadExactAsync(byte[] buffer, CancellationToken ct)

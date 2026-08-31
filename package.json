@@ -10,19 +10,13 @@
   },
   "scripts": {
     "dev": "pnpm --filter @grassvm/desktop dev",
-    "build": "pnpm -r build",
+    "build": "pnpm --filter @grassvm/desktop build && dotnet build apps/core/GrassCore.slnx",
     "typecheck": "pnpm -r typecheck",
-    "test": "pnpm -r test",
+    "test": "pnpm --filter @grassvm/desktop test && dotnet test apps/core/GrassCore.slnx",
     "lint": "pnpm -r lint",
     "core:test": "sh -c 'cd apps/core && dotnet test'"
   },
   "devDependencies": {
     "prettier": "^3.4.2"
-  },
-  "pnpm": {
-    "onlyBuiltDependencies": [
-      "electron",
-      "esbuild"
-    ]
   }
 }

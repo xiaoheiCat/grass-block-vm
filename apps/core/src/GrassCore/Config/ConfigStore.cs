@@ -27,6 +27,8 @@ public sealed class ConfigMigrationChain
 
     public void Register(IConfigMigration step)
     {
+        if (step.From < 0 || step.To != step.From + 1 || step.To > VmConfiguration.CurrentSchemaVersion)
+            throw new ArgumentException($"迁移步骤必须严格递进且不超过当前版本：{step.From}->{step.To}。", nameof(step));
         if (_steps.Values.Any(s => s.To == step.To || s.From == step.From))
             throw new InvalidOperationException($"重复注册迁移步骤 {step.From}->{step.To}");
         _steps.Add(step.From, step);
@@ -48,8 +50,12 @@ public sealed class ConfigMigrationChain
             if (!_steps.TryGetValue(version, out var step))
                 throw new InvalidOperationException($"缺少 schema v{version} 的迁移步骤。");
             text = step.Migrate(text);
+            if (step.To != version + 1)
+                throw new InvalidOperationException($"迁移步骤未递进：{version}->{step.To}。");
             version = step.To;
         }
+        if (version != VmConfiguration.CurrentSchemaVersion)
+            throw new InvalidOperationException($"配置迁移未到达当前版本：{version}。");
         return text;
     }
 }

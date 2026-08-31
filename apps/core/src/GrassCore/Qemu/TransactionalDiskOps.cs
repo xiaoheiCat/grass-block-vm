@@ -327,7 +327,10 @@ public sealed class TransactionalDiskOps
                 ? r
                 : Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(imageFile))!, r));
         }
-        return backing is not null && File.Exists(backing) ? backing : null;
+        if (backing is null) return null;
+        if (!File.Exists(backing))
+            throw new QemuImgException($"磁盘 backing 文件缺失：{backing}");
+        return backing;
     }
 
     private static void DeleteIfExists(string p)

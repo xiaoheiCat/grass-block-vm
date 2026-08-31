@@ -78,6 +78,8 @@ public sealed class CloneService(TransactionalDiskOps diskOps)
         // KeyNotFoundException（与 Restore/Delete/PlanDelete 的措辞一致）
         if (!tree.TryGet(snapshotUuid, out var snap) || snap is null)
             throw new GrassCoreException("快照不存在，请刷新列表。");
+        if (Path.GetFileName(snapshotUuid) != snapshotUuid || snapshotUuid is "." or "..")
+            throw new GrassCoreException("快照标识不合法。");
         var parentDir = Path.GetDirectoryName(source.Path)!;
         var target = GrassVmPackage.CreateNew(parentDir, newName);
         try
@@ -108,7 +110,12 @@ public sealed class CloneService(TransactionalDiskOps diskOps)
             foreach (var disk in config.Devices.OfType<DiskDevice>().ToList())
             {
                 if (disk.IsExternal || !overlayRefs.TryGetValue(disk.DeviceId, out var overlayRef)) continue;
-                var backingFile = Path.Combine(source.SnapshotsPath, snapshotUuid, overlayRef.Replace('/', Path.DirectorySeparatorChar));
+                var snapshotDir = Path.GetFullPath(Path.Combine(source.SnapshotsPath, snapshotUuid));
+                var backingFile = Path.GetFullPath(Path.Combine(snapshotDir, overlayRef.Replace('/', Path.DirectorySeparatorChar)));
+                if (!backingFile.StartsWith(snapshotDir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
+                    || !File.Exists(backingFile)
+                    || (File.GetAttributes(backingFile) & FileAttributes.ReparsePoint) != 0)
+                    throw new GrassCoreException("快照磁盘引用无效，已拒绝创建链接克隆。");
                 var ext = Path.GetExtension(disk.Path);
                 var overlayPath = Path.Combine(target.DisksPath, disk.DeviceId + (string.IsNullOrEmpty(ext) ? ".qcow2" : ext));
                 // QCOW2 overlay：backing 指向父快照的 overlay（外部链）。
@@ -160,14 +167,14 @@ public sealed class CloneService(TransactionalDiskOps diskOps)
         {
             if (cd.IsoPath is null) continue;
             var src = PathPolicy.Resolve(source, cd.IsoPath);
-            if (!src.StartsWith(source.Path + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            if (!PathPolicy.IsInsidePackage(source, cd.IsoPath))
                 continue; // 包外介质：保持原引用
             if (!File.Exists(src))
             {
                 cd.IsoPath = null; // 介质已被清理：空光驱，不复制死引用
                 continue;
             }
-            var dst = Path.Combine(target.Path, "isovol", Path.GetFileName(src));
+            var dst = Path.Combine(target.Path, "isovol", cd.DeviceId + "-" + Path.GetFileName(src));
             Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
             File.Copy(src, dst, overwrite: true); // 两个光驱共用同一介质：幂等覆盖
             cd.IsoPath = PathPolicy.NormalizeReference(target, dst);

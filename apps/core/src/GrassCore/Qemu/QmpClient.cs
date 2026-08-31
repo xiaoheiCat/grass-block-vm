@@ -17,7 +17,10 @@ public sealed class WindowsNamedPipeTransport : IQmpTransport
     private readonly NamedPipeClientStream _pipe;
     public WindowsNamedPipeTransport(string pipeName)
     {
-        _pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+        var name = pipeName.StartsWith(@"\\.\pipe\", StringComparison.OrdinalIgnoreCase)
+            ? pipeName[@"\\.\pipe\".Length..]
+            : pipeName;
+        _pipe = new NamedPipeClientStream(".", name, PipeDirection.InOut, PipeOptions.Asynchronous);
         _pipe.Connect(5000);
     }
     public Stream Stream => _pipe;

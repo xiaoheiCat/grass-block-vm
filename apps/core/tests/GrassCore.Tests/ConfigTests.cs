@@ -82,6 +82,16 @@ public class ConfigMigrationTests : IDisposable
         Assert.Contains("较新版本", ex.Message);
     }
 
+    [Fact]
+    public void Register_RejectsNonSequentialMigration()
+    {
+        var chain = new ConfigMigrationChain();
+
+        Assert.Throws<ArgumentException>(() => chain.Register(new InvalidMigration(1, 1)));
+        Assert.Throws<ArgumentException>(() => chain.Register(new InvalidMigration(1, 3)));
+        Assert.Throws<ArgumentException>(() => chain.Register(new InvalidMigration(2, 1)));
+    }
+
     /// <summary>测试用 v0→v1：memoryMB 改名 memoryMiB。</summary>
     private sealed class V0ToV1Migration : IConfigMigration
     {
@@ -111,6 +121,13 @@ public class ConfigMigrationTests : IDisposable
         public int From => 0;
         public int To => 1;
         public string Migrate(string json) => throw new JsonException("boom");
+    }
+
+    private sealed class InvalidMigration(int from, int to) : IConfigMigration
+    {
+        public int From => from;
+        public int To => to;
+        public string Migrate(string json) => json;
     }
 }
 

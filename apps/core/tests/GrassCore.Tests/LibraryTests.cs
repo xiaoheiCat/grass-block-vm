@@ -39,6 +39,15 @@ public class PathPolicyTests : IDisposable
     }
 
     [Fact]
+    public void Resolve_RejectsRelativePathEscapingPackage()
+    {
+        var pkg = GrassVmPackage.CreateNew(_dir, "Path VM4");
+
+        Assert.False(PathPolicy.IsInsidePackage(pkg, "../outside.qcow2"));
+        Assert.Throws<ArgumentException>(() => PathPolicy.Resolve(pkg, "../outside.qcow2"));
+    }
+
+    [Fact]
     public void Relocation_StillValid_WhenPathExists()
     {
         var f = Path.Combine(_dir, "here.vmdk");

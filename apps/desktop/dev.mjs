@@ -13,7 +13,11 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const here = dirname(fileURLToPath(import.meta.url));
-const electronBin = resolve(here, 'node_modules', 'electron', 'dist', 'Electron.app', 'Contents', 'MacOS', 'Electron');
+const electronBin = process.platform === 'darwin'
+  ? resolve(here, 'node_modules', 'electron', 'dist', 'Electron.app', 'Contents', 'MacOS', 'Electron')
+  : process.platform === 'win32'
+    ? resolve(here, 'node_modules', 'electron', 'dist', 'electron.exe')
+    : resolve(here, 'node_modules', 'electron', 'dist', 'electron');
 
 function run(cmd, args, opts = {}) {
   console.log(`> ${cmd} ${args.join(' ')}`);

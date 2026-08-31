@@ -12,8 +12,9 @@ public static class PathPolicy
     {
         var full = System.IO.Path.GetFullPath(chosenPath);
         var root = package.Path;
-        if (full.StartsWith(root + System.IO.Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
-            full.StartsWith(root + System.IO.Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+        var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (full.StartsWith(root + System.IO.Path.DirectorySeparatorChar, cmp) ||
+            full.StartsWith(root + System.IO.Path.AltDirectorySeparatorChar, cmp))
         {
             var rel = System.IO.Path.GetRelativePath(root, full);
             return rel.Replace('\\', '/');
@@ -24,11 +25,62 @@ public static class PathPolicy
     /// <summary>把存储的引用解析为绝对路径（包内相对路径基于包根解析）。</summary>
     public static string Resolve(GrassVmPackage package, string storedRef) =>
         System.IO.Path.IsPathRooted(storedRef)
-            ? storedRef
-            : System.IO.Path.GetFullPath(System.IO.Path.Combine(package.Path, storedRef.Replace('/', System.IO.Path.DirectorySeparatorChar)));
+            ? ResolveExternalOrPackagePath(package, storedRef)
+            : ResolvePackagePath(package, storedRef);
 
-    public static bool IsInsidePackage(GrassVmPackage package, string storedRef) =>
-        !System.IO.Path.IsPathRooted(storedRef);
+    public static bool IsInsidePackage(GrassVmPackage package, string storedRef)
+    {
+        if (System.IO.Path.IsPathRooted(storedRef)) return false;
+        try
+        {
+            _ = ResolvePackagePath(package, storedRef);
+            return true;
+        }
+        catch (ArgumentException) { return false; }
+        catch (IOException) { return false; }
+    }
+
+    private static string ResolvePackagePath(GrassVmPackage package, string storedRef)
+    {
+        var root = EnsureTrailingSeparator(System.IO.Path.GetFullPath(package.Path));
+        var full = System.IO.Path.GetFullPath(System.IO.Path.Combine(root, storedRef.Replace('/', System.IO.Path.DirectorySeparatorChar)));
+        var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (!full.StartsWith(root, cmp))
+            throw new ArgumentException("包内资源路径不能越出 .grassvm 包目录。", nameof(storedRef));
+        if (HasReparsePointBetween(root, full))
+            throw new ArgumentException("包内资源不能通过符号链接或目录联接访问。", nameof(storedRef));
+        return full;
+    }
+
+    private static string ResolveExternalOrPackagePath(GrassVmPackage package, string storedRef)
+    {
+        var full = Path.GetFullPath(storedRef);
+        var root = EnsureTrailingSeparator(Path.GetFullPath(package.Path));
+        var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (full.StartsWith(root, cmp))
+        {
+            var relative = Path.GetRelativePath(package.Path, full);
+            return ResolvePackagePath(package, relative);
+        }
+        return full;
+    }
+
+    private static bool HasReparsePointBetween(string root, string path)
+    {
+        var current = new DirectoryInfo(path);
+        var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        while (current is not null && !string.Equals(current.FullName, root.TrimEnd(Path.DirectorySeparatorChar), cmp))
+        {
+            if ((current.Attributes & FileAttributes.ReparsePoint) != 0) return true;
+            current = current.Parent;
+        }
+        return false;
+    }
+
+    private static string EnsureTrailingSeparator(string path) =>
+        path.EndsWith(System.IO.Path.DirectorySeparatorChar) || path.EndsWith(System.IO.Path.AltDirectorySeparatorChar)
+            ? path
+            : path + System.IO.Path.DirectorySeparatorChar;
 }
 
 /// <summary>外部资源重定位结果：能唯一匹配的资源自动迁移；多个候选或无法匹配时让用户决策。</summary>

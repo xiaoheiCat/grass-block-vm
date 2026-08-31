@@ -565,7 +565,8 @@ public sealed class OvfImporter(TransactionalDiskOps diskOps, string? ovmfVarsTe
             // 只差大小写的兄弟目录穿越在 OrdinalIgnoreCase 下会被放行
             var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
             return resolved.StartsWith(root + Path.DirectorySeparatorChar, cmp)
-                || string.Equals(resolved, root, cmp)
+                && (!File.Exists(resolved) || (File.GetAttributes(resolved) & FileAttributes.ReparsePoint) == 0)
+                && !HasReparsePointBetween(root, resolved)
                 ? resolved
                 : null;
         }
@@ -573,6 +574,17 @@ public sealed class OvfImporter(TransactionalDiskOps diskOps, string? ovmfVarsTe
         {
             return null;
         }
+    }
+
+    private static bool HasReparsePointBetween(string root, string path)
+    {
+        var current = new DirectoryInfo(path);
+        while (current is not null && !string.Equals(current.FullName, root, StringComparison.OrdinalIgnoreCase))
+        {
+            if ((current.Attributes & FileAttributes.ReparsePoint) != 0) return true;
+            current = current.Parent;
+        }
+        return false;
     }
 
     private static long ParseCapacity(string cap, string? allocationUnits)

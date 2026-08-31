@@ -58,14 +58,15 @@ public sealed class HostDb : IDisposable
         SetDefaultPreference("autostartIntervalSeconds", "10");
         if (CountNetworks() == 0)
         {
-            // 默认 Host-only 网段由 GrassCore 自动选择不冲突的 RFC1918 网段；这里选 192.168.128.0/24 起步
+            var subnet = SuggestFreeSubnet(Array.Empty<string>());
+            var prefix = subnet[..subnet.LastIndexOf('.')];
             CreateNetwork(new VirtualNetwork(
                 Id: Guid.NewGuid().ToString(),
                 Name: "Host-only",
-                Subnet: "192.168.128.0/24",
+                Subnet: subnet,
                 DhcpEnabled: true,
-                DhcpRangeStart: "192.168.128.10",
-                DhcpRangeEnd: "192.168.128.254",
+                DhcpRangeStart: prefix + ".10",
+                DhcpRangeEnd: prefix + ".254",
                 IsDefault: true));
         }
     }
@@ -134,13 +135,19 @@ public sealed class HostDb : IDisposable
         lock (_gate)
         {
             using var tx = _conn.BeginTransaction();
-            Exec("UPDATE autostart SET position = 1000000");
+            using (var reset = _conn.CreateCommand())
+            {
+                reset.Transaction = tx;
+                reset.CommandText = "UPDATE autostart SET position = 1000000";
+                reset.ExecuteNonQuery();
+            }
             var pos = 0;
             foreach (var p in orderedVmPaths)
             {
                 Locked(cmd =>
                 {
                     cmd.CommandText = "UPDATE autostart SET position = $p WHERE vm_path = $v";
+                    cmd.Transaction = tx;
                     cmd.Parameters.AddWithValue("$p", pos);
                     cmd.Parameters.AddWithValue("$v", p);
                     cmd.ExecuteNonQuery();
@@ -219,7 +226,14 @@ public sealed class HostDb : IDisposable
             var candidate = $"10.{i}.0.0/24";
             if (!existing.Contains(candidate)) return candidate;
         }
-        return $"172.16.{Random.Shared.Next(1, 254)}.0/24";
+        var used = new HashSet<string>(existing, StringComparer.OrdinalIgnoreCase);
+        for (var i = 0; i < 16; i++)
+        for (var j = 1; j < 255; j++)
+        {
+            var candidate = $"172.{i + 16}.{j}.0/24";
+            if (used.Add(candidate)) return candidate;
+        }
+        throw new InvalidOperationException("没有可用的 Host-only 网段。");
     }
 
     private int CountNetworks()

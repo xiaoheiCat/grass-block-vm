@@ -131,7 +131,7 @@ ipcMain.handle('paths:defaultLibraryDir', () =>
  *  同步占位把这个竞态关掉。 */
 const openingDisplays = new Set<string>();
 
-ipcMain.handle('display:open', async (_e, vmName: string, spicePort: number, packagePath: string) => {
+ipcMain.handle('display:open', async (_e, vmName: string, _spicePort: number, packagePath: string) => {
   // 一台 VM 同时只允许一个显示器窗口：已开则聚焦。只按包路径匹配——按标题匹配
   // 会撞上重名 VM 或库主窗口（标题也是 VM 名时聚焦错窗口，显示器"打不开"）
   const existing = [...BrowserWindow.getAllWindows()].find(
@@ -144,6 +144,11 @@ ipcMain.handle('display:open', async (_e, vmName: string, spicePort: number, pac
   if (openingDisplays.has(packagePath)) return true; // 并发的第二次点击：等第一路开完
   openingDisplays.add(packagePath);
   try {
+    const b = await createBridge();
+    const display = await b.call<{ spicePort: number }>('getDisplayInfo', { packagePath });
+    const spicePort = display.spicePort;
+    if (!Number.isInteger(spicePort) || spicePort < 1 || spicePort > 65535)
+      throw new Error('GrassCore 返回了无效的 SPICE 端口。');
     const bridge = await startSpiceBridge(spicePort);
     const bridgePort = (bridge.server.address() as net.AddressInfo).port;
     const win = createDisplayWindow(vmName, spicePort, bridgePort, packagePath, bridge.wss.token);

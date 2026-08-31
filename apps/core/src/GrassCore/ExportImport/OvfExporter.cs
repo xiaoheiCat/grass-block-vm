@@ -20,6 +20,7 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
         var config = new ConfigStore(package).Load();
         Directory.CreateDirectory(destDir);
         var vmId = Sanitize(config.Name);
+        if (string.IsNullOrEmpty(vmId)) vmId = "vm";
 
         // 先全量预检再动手转换：缺盘要在跑几百 GB 的 convert 【之前】失败，
         // 不要转换完全部在场盘才报"缺一块"
@@ -40,7 +41,8 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
             var dst = Path.Combine(destDir, href);
             // 清掉上次失败留下的半成品/旧档：convert 内部是 overwrite:false 的原子
             // 改名，对着旧目录重试导出会直接 IOException
-            if (File.Exists(dst)) File.Delete(dst);
+            if (File.Exists(dst))
+                throw new GrassCoreException($"导出目标已存在文件：{dst}。请选择空目录，避免覆盖已有档案。");
             await diskOps.ConvertAsync(src, dst, "vmdk", ct);
             diskFiles.Add((href, new FileInfo(dst).Length, disk.SizeBytes > 0 ? disk.SizeBytes : new FileInfo(dst).Length));
         }
@@ -56,13 +58,16 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
             if (!File.Exists(src)) continue; // 介质已不在：导出为空光驱（与"弹出"同语义）
             var href = $"{vmId}-cd{cdOrdinal}.iso";
             var dst = Path.Combine(destDir, href);
-            if (File.Exists(dst)) File.Delete(dst);
+            if (File.Exists(dst))
+                throw new GrassCoreException($"导出目标已存在文件：{dst}。请选择空目录，避免覆盖已有档案。");
             File.Copy(src, dst);
             isoFiles.Add((cdOrdinal, href, new FileInfo(dst).Length));
         }
 
         var ovf = BuildOvfXml(config, vmId, diskFiles, isoFiles);
         var ovfPath = Path.Combine(destDir, vmId + ".ovf");
+        if (File.Exists(ovfPath))
+            throw new GrassCoreException($"导出目标已存在文件：{ovfPath}。请选择空目录，避免覆盖已有档案。");
         await File.WriteAllTextAsync(ovfPath, ovf, new UTF8Encoding(false), ct);
         return ovfPath;
     }
@@ -71,12 +76,12 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
     public async Task<string> ExportOvaAsync(GrassVmPackage package, string ovaPath, string workDir, CancellationToken ct = default)
     {
         var dir = Path.Combine(workDir, "ova-" + Guid.NewGuid().ToString("N"));
-        await ExportAsync(package, dir, ct);
         var tempOva = ovaPath + ".grass-tmp-" + Guid.NewGuid().ToString("N");
         var backup = ovaPath + ".grass-old-" + Guid.NewGuid().ToString("N");
         var hadOld = File.Exists(ovaPath);
         try
         {
+            await ExportAsync(package, dir, ct);
             await TarFile.CreateFromDirectoryAsync(dir, tempOva, includeBaseDirectory: false, ct);
             if (hadOld) File.Move(ovaPath, backup);
             try { File.Move(tempOva, ovaPath); }

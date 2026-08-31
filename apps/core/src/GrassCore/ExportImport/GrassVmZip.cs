@@ -67,10 +67,15 @@ public static class GrassVmZip
             var prefix = Path.GetFileName(package.Path) + "/";
             using (var zip = ZipFile.Open(tempZip, ZipArchiveMode.Create))
             {
+                foreach (var dir in Directory.EnumerateDirectories(package.Path, "*", SearchOption.AllDirectories))
+                    if ((File.GetAttributes(dir) & FileAttributes.ReparsePoint) != 0)
+                        throw new GrassCoreException($"无法导出包含链接目录的虚拟机包：{dir}。");
                 foreach (var file in Directory.EnumerateFiles(package.Path, "*", SearchOption.AllDirectories))
                 {
                     var rel = Path.GetRelativePath(package.Path, file).Replace('\\', '/');
                     if (IsExcluded(rel)) continue;
+                    if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0)
+                        throw new GrassCoreException($"无法导出符号链接或目录联接：{rel}。");
                     // 包内相对路径存储（导入后在任意位置解开都保持自包含）
                     zip.CreateEntryFromFile(file, prefix + rel, CompressionLevel.Optimal);
                 }
@@ -134,6 +139,11 @@ public static class GrassVmZip
         var pkgName = first.EndsWith(GrassVmPackage.Extension, StringComparison.OrdinalIgnoreCase)
             ? first[..^GrassVmPackage.Extension.Length]
             : Path.GetFileNameWithoutExtension(zipPath);
+        if (string.IsNullOrWhiteSpace(pkgName)
+            || pkgName is "." or ".."
+            || Path.GetFileName(pkgName) != pkgName
+            || pkgName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+            throw new GrassCoreException("压缩包中的虚拟机名称不合法。");
         var target = Path.Combine(libraryRoot, pkgName + GrassVmPackage.Extension);
         if (Directory.Exists(target) || File.Exists(target))
             throw new GrassCoreException($"目标位置已存在同名虚拟机：{pkgName}。");
@@ -200,6 +210,27 @@ public static class GrassVmZip
             if (Rpc.GrassCoreService.IsInvalidVmName(pkgName) || Rpc.GrassCoreService.IsInvalidVmName(importedName))
                 throw new GrassCoreException(
                     $"虚拟机名称不合法（{importedName}）：不能为空，不能包含文件系统不允许的字符、逗号或等号。");
+            var importedConfig = new Config.ConfigStore(pkg0).Load();
+            var importedProfile = GrassCore.Profiles.OsProfileLibrary.ById(importedConfig.OsProfileId);
+            if (importedConfig.Firmware.Kind != importedProfile.Firmware)
+                throw new GrassCoreException("压缩包内的固件类型与 OS Profile 不一致，无法导入。");
+            if (importedConfig.Firmware.Kind == Config.FirmwareKind.Uefi
+                && !File.Exists(Path.Combine(pkg0.FirmwarePath, "VARS.fd")))
+                throw new GrassCoreException("压缩包缺少 UEFI 变量文件 VARS.fd，无法导入。");
+            foreach (var disk in Config.VmState.Load(pkg0).SuspendedStatePath is null
+                ? new Config.ConfigStore(pkg0).Load().Devices.OfType<DiskDevice>()
+                : Enumerable.Empty<DiskDevice>())
+            {
+                if (disk.IsExternal)
+                    throw new GrassCoreException("档案包含包外硬盘引用，请在原电脑上移入包内后再导出。");
+                _ = PathPolicy.Resolve(pkg0, disk.Path);
+            }
+            foreach (var cd in importedConfig.Devices.OfType<CdromDevice>())
+                if (cd.IsoPath is not null && Path.IsPathRooted(cd.IsoPath))
+                    throw new GrassCoreException("档案包含包外光盘引用，请在原电脑上移入包内后再导出。");
+            foreach (var folder in importedConfig.Devices.OfType<SharedFolderDevice>())
+                if (!string.IsNullOrWhiteSpace(folder.HostPath) && Path.IsPathRooted(folder.HostPath))
+                    throw new GrassCoreException("档案包含包外共享文件夹引用，请在原电脑上移除后再导出。");
             // 恢复快照工作位置（导出方写入的树拓扑语义；marker 只在档案里存在，落盘后转为 state）
             var marker = Path.Combine(staging, "snapshots", "position.marker");
             if (File.Exists(marker))

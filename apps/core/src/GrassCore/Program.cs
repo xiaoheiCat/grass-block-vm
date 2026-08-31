@@ -96,21 +96,22 @@ public static class Program
                 break; // 连接关闭
             }
             if (request is null) break;
+            var currentRequest = request.Value;
 
             pending.Add(Task.Run(() =>
             {
                 try
                 {
-                    var method = request.Value.GetProperty("method").GetString()!;
-                    var id = request.Value.TryGetProperty("id", out var idEl) ? idEl : (JsonElement?)null;
-                    JsonElement p = request.Value.TryGetProperty("params", out var pEl) ? pEl : JsonDocument.Parse("{}").RootElement;
+                    var method = currentRequest.GetProperty("method").GetString()!;
+                    var id = currentRequest.TryGetProperty("id", out var idEl) ? idEl : (JsonElement?)null;
+                    JsonElement p = currentRequest.TryGetProperty("params", out var pEl) ? pEl : JsonDocument.Parse("{}").RootElement;
                     object result = Dispatch(service, method, p);
                     if (id is not null)
                         conn.SendAsync(JsonRpcConnection.Ok(result, id.Value)).GetAwaiter().GetResult();
                 }
                 catch (Exception ex)
                 {
-                    if (request.Value.TryGetProperty("id", out var idEl2) && idEl2.ValueKind != JsonValueKind.Null)
+                    if (currentRequest.TryGetProperty("id", out var idEl2) && idEl2.ValueKind != JsonValueKind.Null)
                         conn.SendAsync(JsonRpcConnection.Error(-32000, ex.Message, idEl2)).GetAwaiter().GetResult();
                 }
             }));
@@ -163,7 +164,12 @@ public static class Program
         "executeImportOvf" => s.ExecuteImportOvf(p.GetProperty("path").GetString()!, p.GetProperty("vmName").GetString()!, p.GetProperty("allowUnsupported").GetBoolean()),
         "exportOvf" => s.ExportOvf(p.GetProperty("packagePath").GetString()!, p.GetProperty("destDir").GetString()!),
         "exportOva" => s.ExportOva(p.GetProperty("packagePath").GetString()!, p.GetProperty("ovaPath").GetString()!),
-        "createSnapshot" => s.CreateSnapshot(p.GetProperty("packagePath").GetString()!, p.GetProperty("name").GetString()!, null),
+        "createSnapshot" => s.CreateSnapshot(
+            p.GetProperty("packagePath").GetString()!,
+            p.GetProperty("name").GetString()!,
+            p.TryGetProperty("description", out var description) && description.ValueKind != JsonValueKind.Null
+                ? description.GetString()
+                : null),
         "listSnapshots" => s.ListSnapshots(p.GetProperty("packagePath").GetString()!),
         "planRestoreSnapshot" => s.PlanRestoreSnapshot(p.GetProperty("packagePath").GetString()!, p.GetProperty("uuid").GetString()!),
         "restoreSnapshot" => s.RestoreSnapshot(p.GetProperty("packagePath").GetString()!, p.GetProperty("uuid").GetString()!),

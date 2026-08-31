@@ -30,7 +30,7 @@ export function DisplayApp(): React.ReactElement {
   const query = useMemo(() => (api ? api.displayQuery() : { vm: '', port: '0' }), []);
   const vmName = query.vm ?? '';
   const [fullscreen, setFullscreen] = useState(false);
-  const [helperConnected, setHelperConnected] = useState(false);
+  const helperConnected = false;
   const [closeDialog, setCloseDialog] = useState(false);
   const [helperWarning, setHelperWarning] = useState<string | null>(null);
   const [cds, setCds] = useState<CdDrive[]>([]);
@@ -69,12 +69,6 @@ export function DisplayApp(): React.ReactElement {
       setHelperWarning(e instanceof Error ? e.message : String(e));
     }
   }, [api, packagePath, reloadCds]);
-
-  useEffect(() => {
-    // spice-client 动态接入（显示引擎作为适配层被引入；上层 UI 不直接依赖其 API 细节）
-    const t = setTimeout(() => setHelperConnected(true), 1500);
-    return () => clearTimeout(t);
-  }, []);
 
   const showHelperWarning = shouldShowHelperWarning(helperConnected);
 
@@ -135,16 +129,16 @@ export function DisplayApp(): React.ReactElement {
             </button>
           </div>
         )}
-        <button className="tool" title="USB 设备">
+        <button className="tool" title="USB 设备（暂未接入）" disabled>
           🔌
         </button>
-        <button className="tool" title="共享文件夹">
+        <button className="tool" title="共享文件夹（暂未接入）" disabled>
           📁
         </button>
         <button className="tool" title="全屏" onClick={() => setFullscreen((f) => !f)}>
           ⛶
         </button>
-        <button className="tool" title="发送 Ctrl+Alt+Del">
+        <button className="tool" title="发送 Ctrl+Alt+Del（暂未接入）" disabled>
           ⌨
         </button>
         <div className="spacer" />

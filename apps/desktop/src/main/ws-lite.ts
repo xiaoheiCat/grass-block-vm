@@ -35,7 +35,11 @@ export class WebSocketServer extends EventEmitter {
 
   private handleUpgrade(req: http.IncomingMessage, socket: net.Socket, head: Buffer): void {
     const key = req.headers['sec-websocket-key'];
-    if (!key || (req.url ?? '') !== `/${this.token}`) {
+    if (req.method !== 'GET'
+      || req.headers.upgrade?.toLowerCase() !== 'websocket'
+      || !String(req.headers.connection ?? '').toLowerCase().includes('upgrade')
+      || req.headers['sec-websocket-version'] !== '13'
+      || !key || (req.url ?? '') !== `/${this.token}`) {
       socket.destroy();
       return;
     }
@@ -88,6 +92,7 @@ class WsConnImpl extends EventEmitter implements WsConnection {
       const fin = (this.buf[0] & 0x80) !== 0;
       const opcode = this.buf[0] & 0x0f;
       const masked = (this.buf[1] & 0x80) !== 0;
+      if (!masked) { this.terminate(); return; }
       let len = this.buf[1] & 0x7f;
       let off = 2;
       if (len === 126) {
@@ -96,9 +101,14 @@ class WsConnImpl extends EventEmitter implements WsConnection {
         off = 4;
       } else if (len === 127) {
         if (this.buf.length < 10) break;
-        len = Number(this.buf.readBigUInt64BE(2));
+        const longLen = this.buf.readBigUInt64BE(2);
+        if (longLen > BigInt(16 * 1024 * 1024)) { this.terminate(); return; }
+        len = Number(longLen);
         off = 10;
       }
+      if ((opcode & 0x8) !== 0 && (!fin || len > 125)) { this.terminate(); return; }
+      if (![0x0, 0x1, 0x2, 0x8, 0x9, 0xa].includes(opcode)) { this.terminate(); return; }
+      if (len > 16 * 1024 * 1024) { this.terminate(); return; }
       const maskLen = masked ? 4 : 0;
       if (this.buf.length < off + maskLen + len) break;
       const mask = this.buf.subarray(off, off + maskLen);
@@ -115,6 +125,8 @@ class WsConnImpl extends EventEmitter implements WsConnection {
         this.socket.end();
         return;
       }
+      if ((opcode === 0x1 || opcode === 0x2) && this.fragments.length > 0) { this.terminate(); return; }
+      if (opcode === 0x0 && this.fragments.length === 0) { this.terminate(); return; }
       if (opcode === 0x9) {
         this.writeFrame(0xa, Buffer.alloc(0)); // ping → pong
         continue;
@@ -130,6 +142,7 @@ class WsConnImpl extends EventEmitter implements WsConnection {
         this.fragments.push(payload);
         if (fin) {
           const whole = Buffer.concat(this.fragments);
+          if (whole.length > 16 * 1024 * 1024) { this.terminate(); return; }
           this.fragments = [];
           this.emit('message', whole);
         }

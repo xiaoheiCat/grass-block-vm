@@ -39,6 +39,8 @@ public sealed class SnapshotTree
         Root = snapshots.Where(s => s.ParentSnapshotUuid is null).ToList();
     }
 
+    public static bool IsValidUuid(string uuid) => Guid.TryParse(uuid, out _);
+
     public IReadOnlyCollection<Snapshot> All => _byUuid.Values;
     public List<Snapshot> Root { get; }
 
@@ -54,9 +56,12 @@ public sealed class SnapshotTree
     public IReadOnlyList<Snapshot> ChainToRoot(string uuid)
     {
         var chain = new List<Snapshot>();
+        var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         Snapshot? cur = _byUuid[uuid];
         while (cur is not null)
         {
+            if (!visited.Add(cur.Uuid))
+                throw new InvalidOperationException("快照树包含循环父引用。");
             chain.Add(cur);
             cur = cur.ParentSnapshotUuid is null ? null : (TryGet(cur.ParentSnapshotUuid, out var p) ? p : null);
         }

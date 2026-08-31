@@ -114,6 +114,7 @@ export class CoreBridge extends EventEmitter {
     readable.once('end', onDown);
     readable.once('error', onDown);
     (writable as NodeJS.WritableStream & { once?: unknown }).once?.('close', onDown);
+    (writable as NodeJS.WritableStream & { once?: unknown }).once?.('error', onDown);
   }
 
   /** 拆除通道：失败所有在途请求；下次 call 自动重生 Core。忽略来自已过时通道的滞后事件。 */
@@ -155,9 +156,15 @@ export class CoreBridge extends EventEmitter {
     const frame = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id, method, params }), 'utf8');
     const len = Buffer.alloc(4);
     len.writeInt32LE(frame.length, 0);
-    this.channel.writable.write(Buffer.concat([len, frame]));
     return new Promise<T>((resolve, reject) => {
       this.pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
+      try {
+        this.channel!.writable.write(Buffer.concat([len, frame]), () => undefined);
+      } catch (error) {
+        this.pending.delete(id);
+        reject(error);
+        this.teardownChannel(this.channel, error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 }

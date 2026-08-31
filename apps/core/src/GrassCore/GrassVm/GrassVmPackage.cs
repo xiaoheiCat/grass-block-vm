@@ -39,6 +39,8 @@ public sealed class GrassVmPackage
         {
             throw new ArgumentException($"Not a {Extension} package: {path}", nameof(path));
         }
+        if (ContainsReparsePoint(Path))
+            throw new ArgumentException("虚拟机包不能通过符号链接或目录联接访问。", nameof(path));
     }
 
     /// <summary>包根目录的绝对路径。这个路径就是这台 VM 的身份。</summary>
@@ -63,6 +65,17 @@ public sealed class GrassVmPackage
     public static bool IsGrassVmDirectory(string dirPath) =>
         string.Equals(System.IO.Path.GetExtension(dirPath), Extension, StringComparison.OrdinalIgnoreCase);
 
+    public static bool ContainsReparsePoint(string path)
+    {
+        var current = new DirectoryInfo(System.IO.Path.GetFullPath(path));
+        while (current is not null)
+        {
+            if ((current.Attributes & FileAttributes.ReparsePoint) != 0) return true;
+            current = current.Parent;
+        }
+        return false;
+    }
+
     public static IEnumerable<GrassVmPackage> ScanLibraryRoot(string libraryRoot)
     {
         if (!Directory.Exists(libraryRoot)) yield break;
@@ -73,7 +86,14 @@ public sealed class GrassVmPackage
             // 一张打不开也删不掉的"幽灵卡"——扫描直接跳过
             var name = System.IO.Path.GetFileName(dir);
             if (name.StartsWith(".", StringComparison.Ordinal)) continue;
-            if (IsGrassVmDirectory(dir)) yield return new GrassVmPackage(dir);
+            if (IsGrassVmDirectory(dir))
+            {
+                GrassVmPackage? package = null;
+                try { package = new GrassVmPackage(dir); }
+                catch (ArgumentException) { }
+                catch (IOException) { }
+                if (package is not null) yield return package;
+            }
         }
     }
 
@@ -84,9 +104,14 @@ public sealed class GrassVmPackage
     public static GrassVmPackage CreateNew(string parentDir, string name)
     {
         var invalid = name.IndexOfAny(System.IO.Path.GetInvalidFileNameChars());
-        if (invalid >= 0 || string.IsNullOrWhiteSpace(name))
+        if (invalid >= 0 || string.IsNullOrWhiteSpace(name) || name.StartsWith('.')
+            || name.Contains('/') || name.Contains('\\') || name is "." or "..")
             throw new ArgumentException("VM 名称不能包含文件系统非法字符。");
-        var root = System.IO.Path.Combine(parentDir, name + Extension);
+        var parent = System.IO.Path.GetFullPath(parentDir).TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar);
+        var root = System.IO.Path.GetFullPath(System.IO.Path.Combine(parent, name + Extension));
+        var parentCmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (!string.Equals(System.IO.Path.GetDirectoryName(root), parent, parentCmp))
+            throw new ArgumentException("VM 名称必须是存档位置的直接子目录名称。");
         // 检查-再-创建之间有竞态（并发 CreateVm 都通过 Directory.Exists 检查）：
         // 先在旁边造好完整目录，再用一次原子 rename 抢注——只有一个赢家
         var staging = System.IO.Path.Combine(parentDir, $".creating-{name}-{System.IO.Path.GetRandomFileName()}{Extension}");
@@ -166,13 +191,19 @@ public sealed class GrassVmPackage
         var n = 0;
         if (!Directory.Exists(Path)) return 0;
         var cutoff = DateTime.UtcNow - TimeSpan.FromMinutes(10);
-        foreach (var f in Directory.EnumerateFiles(Path, "*" + TransactionalDiskOps.TempSuffix, SearchOption.AllDirectories))
+        foreach (var f in Directory.EnumerateFiles(Path, "*" + TransactionalDiskOps.TempSuffix, new EnumerationOptions
+        {
+            RecurseSubdirectories = true,
+            IgnoreInaccessible = true,
+            AttributesToSkip = FileAttributes.ReparsePoint,
+        }))
         {
             // commit 副本事务的暂存不能当垃圾删：overlay 可能已指向它（删了链就断）。
             // 由 RepairStagedOverlays → FinishCommitTempFiles 收尾换名
             if (f.EndsWith(TransactionalDiskOps.CommitTempSuffix, StringComparison.Ordinal)) continue;
             try
             {
+                if (ContainsReparsePoint(f)) continue;
                 if (File.GetLastWriteTimeUtc(f) >= cutoff) continue;
                 File.Delete(f);
                 n++;

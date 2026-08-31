@@ -163,7 +163,7 @@ public sealed class QemuCommandBuilder
                         // q35 内建 ich9-ahci：每控制器 6 口（ahci0.0–ahci0.5），超限必须报错而非回绕
                         if (sataPort >= 6)
                             throw new InvalidOperationException("SATA 设备数量超出上限（6）。请移除一些设备后再启动。");
-                        args.AddRange(new[] { "-device", $"ide-hd,drive={id},bus=ahci0.{sataPort},bootindex={BootIndex(BootClass.Disk)}" });
+                        args.AddRange(new[] { "-device", $"ide-hd,drive={id},bus=ide.{sataPort},bootindex={BootIndex(BootClass.Disk)}" });
                         sataPort++;
                         break;
                     case DiskBus.Ide:
@@ -199,7 +199,7 @@ public sealed class QemuCommandBuilder
                 {
                     if (sataPort >= 6)
                         throw new InvalidOperationException("SATA 设备数量超出上限（6）。请移除一些设备后再启动。");
-                    args.AddRange(new[] { "-device", $"ide-cd,drive={id},bus=ahci0.{sataPort},bootindex={BootIndex(BootClass.Cd)}" });
+                        args.AddRange(new[] { "-device", $"ide-cd,drive={id},bus=ide.{sataPort},bootindex={BootIndex(BootClass.Cd)}" });
                 }
                 else
                 {
@@ -322,7 +322,9 @@ public sealed class QemuCommandBuilder
                 var value = raw.Arguments[i + 1];
                 if (value.StartsWith('-'))
                     throw new InvalidOperationException("兼容设备参数结构不完整（设备值不能是另一个选项）。");
-                if (DeviceValueReferencesHostFile(value))
+                if (DeviceValueReferencesHostFile(value)
+                    || value.Contains("drive=", StringComparison.OrdinalIgnoreCase)
+                    )
                     throw new InvalidOperationException("兼容设备不允许引用宿主文件或物理设备（file=/path=/romfile=/host= 等）。");
             }
             args.AddRange(raw.Arguments);

@@ -341,7 +341,8 @@ public static class SnapshotService
         }
         catch
         {
-            // 修复是尽力而为：任何结构性异常都不应阻断启动路径
+            // 无法证明修复完成时必须阻断启动，避免在未知链状态上继续写盘。
+            return false;
         }
         return true;
     }
@@ -599,7 +600,15 @@ public static class SnapshotService
             if (!File.Exists(meta)) continue; // 未知目录保留但不解释
             try
             {
-                snaps.Add(JsonSerializer.Deserialize<Snapshot>(File.ReadAllText(meta), Opts)!);
+                var snapshot = JsonSerializer.Deserialize<Snapshot>(File.ReadAllText(meta), Opts);
+                if (snapshot is null) continue;
+                var dirUuid = Path.GetFileName(dir);
+                if (!SnapshotTree.IsValidUuid(snapshot.Uuid)
+                    || !string.Equals(dirUuid, snapshot.Uuid, StringComparison.OrdinalIgnoreCase)
+                    || (snapshot.ParentSnapshotUuid is not null && !SnapshotTree.IsValidUuid(snapshot.ParentSnapshotUuid))
+                    || snapshot.DiskOverlayRefs.Any(kv => !IsSafeOverlayReference(package, snapshot.Uuid, kv.Value)))
+                    continue;
+                snaps.Add(snapshot);
             }
             catch (JsonException)
             {
@@ -607,6 +616,18 @@ public static class SnapshotService
             }
         }
         return new SnapshotTree(snaps);
+    }
+
+    private static bool IsSafeOverlayReference(GrassVmPackage package, string uuid, string reference)
+    {
+        if (Path.IsPathRooted(reference)) return false;
+        var dir = Path.GetFullPath(Path.Combine(package.SnapshotsPath, uuid));
+        var path = Path.GetFullPath(Path.Combine(dir, reference.Replace('/', Path.DirectorySeparatorChar)));
+        var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (!path.StartsWith(dir + Path.DirectorySeparatorChar, cmp)) return false;
+        for (var current = new DirectoryInfo(path); current is not null && !string.Equals(current.FullName, dir, cmp); current = current.Parent)
+            if ((current.Attributes & FileAttributes.ReparsePoint) != 0) return false;
+        return true;
     }
 
     public static object List(GrassVmPackage package)
@@ -916,8 +937,7 @@ public static class SnapshotService
                 {
                     try
                     {
-                        var activeAbs = System.IO.Path.Combine(package.Path,
-                            rel.Replace('/', System.IO.Path.DirectorySeparatorChar));
+                        var activeAbs = PathPolicy.Resolve(package, rel);
                         DeleteIfExists(activeAbs + RestorePrevSuffix);
                     }
                     catch { /* 残留清理失败：无害 */ }
@@ -932,8 +952,7 @@ public static class SnapshotService
             {
                 try
                 {
-                    var activeAbs = System.IO.Path.Combine(package.Path,
-                        rel.Replace('/', System.IO.Path.DirectorySeparatorChar));
+                    var activeAbs = PathPolicy.Resolve(package, rel);
                     var prev = activeAbs + RestorePrevSuffix;
                     var staged = activeAbs + StagedOverlaySuffix;
                     if (!File.Exists(prev))
@@ -1063,8 +1082,12 @@ public static class SnapshotService
     private static string? ResolveIntent(GrassVmPackage package, Dictionary<string, string?> intent, string deviceId)
     {
         if (!intent.TryGetValue(deviceId, out var rel) || rel is null) return null;
-        var abs = System.IO.Path.Combine(package.Path, rel.Replace('/', System.IO.Path.DirectorySeparatorChar));
-        return File.Exists(abs) ? abs : null;
+        try
+        {
+            var abs = PathPolicy.Resolve(package, rel);
+            return File.Exists(abs) ? abs : null;
+        }
+        catch (ArgumentException) { return null; }
     }
 
     /// <summary>回滚救援中"数据已回工作路径、但相对 backing 还按冻结位置算（悬空）"的盘。
@@ -1132,6 +1155,8 @@ public static class SnapshotService
     public static void Delete(GrassVmPackage package, string uuid,
         GrassCore.Qemu.TransactionalDiskOps? diskOps = null)
     {
+        if (!SnapshotTree.IsValidUuid(uuid) || Path.GetFileName(uuid) != uuid)
+            throw new GrassCoreException("快照不存在。");
         var tree = LoadTree(package);
         var dir = System.IO.Path.Combine(package.SnapshotsPath, uuid);
         var deleted = tree.All.FirstOrDefault(s =>
@@ -1416,10 +1441,15 @@ public static class SnapshotService
         }
     }
 
-    private static string? FrozenPathOrNull(GrassVmPackage package, Snapshot snap, string deviceId) =>
-        snap.DiskOverlayRefs.TryGetValue(deviceId, out var rel)
-            ? System.IO.Path.Combine(package.SnapshotsPath, snap.Uuid, rel.Replace('/', System.IO.Path.DirectorySeparatorChar))
-            : null;
+    private static string? FrozenPathOrNull(GrassVmPackage package, Snapshot snap, string deviceId)
+    {
+        if (!snap.DiskOverlayRefs.TryGetValue(deviceId, out var rel)) return null;
+        var dir = Path.GetFullPath(Path.Combine(package.SnapshotsPath, snap.Uuid));
+        var path = Path.GetFullPath(Path.Combine(dir, rel.Replace('/', Path.DirectorySeparatorChar)));
+        if (!path.StartsWith(dir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            throw new GrassCoreException("快照磁盘引用越出快照目录。");
+        return path;
+    }
 
     /// <summary>扫描 Library Root 找出以此包内快照为基线的链接克隆（子 VM 的 cloneInfo 引用）。</summary>
     public static List<LinkedCloneReference> FindLinkedCloneReferences(GrassVmPackage parentPackage)
@@ -1434,7 +1464,7 @@ public static class SnapshotService
             {
                 var config = new ConfigStore(pkg).Load();
                 if (config.CloneInfo is { } ci &&
-                    string.Equals(PathPolicy.Resolve(pkg, ci.ParentVmPath), parentPackage.Path, StringComparison.OrdinalIgnoreCase))
+                    string.Equals(Path.GetFullPath(Path.Combine(pkg.Path, ci.ParentVmPath.Replace('/', Path.DirectorySeparatorChar))), parentPackage.Path, StringComparison.OrdinalIgnoreCase))
                 {
                     result.Add(new LinkedCloneReference(pkg.Name, pkg.Path, ci.ParentSnapshotUuid));
                 }

@@ -75,6 +75,7 @@ public sealed class GrassCoreService
     /// UI 才不会在长达数分钟的挂起/启动期间显示错误状态、点开注定失败的电源菜单。</summary>
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, string> _lifecycleInFlight =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly SemaphoreSlim _libraryRootGate = new(1, 1);
 
     private T WithLifecyclePhase<T>(string packagePath, string phase, Func<T> action)
     {
@@ -85,7 +86,8 @@ public sealed class GrassCoreService
 
     private T WithPackageGate<T>(string packagePath, Func<T> action)
     {
-        var gate = _pkgGates.GetOrAdd(packagePath,
+        var managedPath = ResolveManagedPackagePath(packagePath);
+        var gate = _pkgGates.GetOrAdd(managedPath,
             _ => new SemaphoreSlim(1, 1));
         gate.Wait();
         try { return action(); }
@@ -94,10 +96,28 @@ public sealed class GrassCoreService
 
     private void WithPackageGate(string packagePath, Action action)
     {
-        var gate = _pkgGates.GetOrAdd(packagePath, _ => new SemaphoreSlim(1, 1));
+        var managedPath = ResolveManagedPackagePath(packagePath);
+        var gate = _pkgGates.GetOrAdd(managedPath, _ => new SemaphoreSlim(1, 1));
         gate.Wait();
         try { action(); }
         finally { gate.Release(); }
+    }
+
+    private string ResolveManagedPackagePath(string packagePath)
+    {
+        var root = _db.LibraryRoot;
+        if (string.IsNullOrWhiteSpace(root))
+            throw new GrassCoreException("尚未设置虚拟机存档位置。");
+        var fullPackage = Path.GetFullPath(packagePath);
+        var fullRoot = Path.GetFullPath(root);
+        var prefix = fullRoot.EndsWith(Path.DirectorySeparatorChar) || fullRoot.EndsWith(Path.AltDirectorySeparatorChar)
+            ? fullRoot
+            : fullRoot + Path.DirectorySeparatorChar;
+        var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        if (!fullPackage.StartsWith(prefix, cmp)
+            || !GrassVmPackage.IsGrassVmDirectory(fullPackage))
+            throw new GrassCoreException("虚拟机必须位于当前存档位置内。");
+        return fullPackage;
     }
 
     public GrassCoreService(HostDb db, string qemuSystemPath, string qemuImgPath, string ovmfDir,
@@ -143,9 +163,23 @@ public sealed class GrassCoreService
     /// <summary>设置 Library Root。旧目录 VM 不迁移、不再出现在主界面。</summary>
     public object SetLibraryRoot(string newRoot)
     {
+        _libraryRootGate.Wait();
+        try
+        {
+        var targetRoot = Path.GetFullPath(newRoot);
+        if (GrassVmPackage.IsGrassVmDirectory(targetRoot))
+            throw new GrassCoreException("存档位置不能设置为虚拟机包目录。");
+        var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        var prefix = targetRoot.EndsWith(Path.DirectorySeparatorChar) ? targetRoot : targetRoot + Path.DirectorySeparatorChar;
+        if (_running.Keys.Any(p => !Path.GetFullPath(p).StartsWith(prefix, cmp))
+            || Volatile.Read(ref _inFlightDiskJobs) > 0
+            || !_lifecycleInFlight.IsEmpty)
+            throw new GrassCoreException("存在运行中的虚拟机，关闭后才能切换存档位置。");
         if (!Directory.Exists(newRoot)) Directory.CreateDirectory(newRoot);
-        _db.ChangeLibraryRoot(newRoot);
+        _db.ChangeLibraryRoot(targetRoot);
         return new { libraryRoot = _db.LibraryRoot };
+        }
+        finally { _libraryRootGate.Release(); }
     }
 
     // ---------- Library ----------
@@ -256,9 +290,14 @@ public sealed class GrassCoreService
         });
         if (isoPath is not null)
         {
+            var resolvedIso = PathPolicy.Resolve(pkg, isoPath);
+            if (!File.Exists(resolvedIso) || (File.GetAttributes(resolvedIso) & FileAttributes.ReparsePoint) != 0)
+                throw new GrassCoreException("安装镜像不存在或不是可用的普通文件。");
+            if (!string.Equals(Path.GetExtension(resolvedIso), ".iso", StringComparison.OrdinalIgnoreCase))
+                throw new GrassCoreException("安装镜像必须是 ISO 文件。");
             config.Devices.Add(new CdromDevice
             {
-                IsoPath = PathPolicy.NormalizeReference(pkg, isoPath),
+                IsoPath = PathPolicy.NormalizeReference(pkg, resolvedIso),
                 CreatedOrder = DeviceNamer.NextCreatedOrder(config),
             });
         }
@@ -308,8 +347,11 @@ public sealed class GrassCoreService
 
     // ---------- 启动 / 电源 ----------
 
-    public object StartVm(string packagePath) => WithPackageGate(packagePath, () =>
-        WithLifecyclePhase(packagePath, "starting", () => StartVmCore(packagePath)));
+    public object StartVm(string packagePath)
+    {
+        var managed = ResolveManagedPackagePath(packagePath);
+        return WithPackageGate(managed, () => WithLifecyclePhase(managed, "starting", () => StartVmCore(managed)));
+    }
 
     private object StartVmCore(string packagePath)
     {
@@ -326,26 +368,33 @@ public sealed class GrassCoreService
         if (_running.ContainsKey(pkg.Path))
             throw new GrassCoreException("此虚拟机已经在运行。");
 
-        // 收尾 + 预检（StartVm/ResumeVm 共用同一套次序，见 RepairThenPreflight）：
-        // ① vm.lock 先拒；② 修复"快照换入中断"残留；③ 全量预检。
+        // 先持有跨进程锁，再执行可能修改磁盘的收尾与预检。
         // 关键：②必须在磁盘预检【之前】——Create/Restore 的换入事务崩溃现场是
         // "工作盘缺失 + 暂存 overlay 完好"，那正是修复要补齐的形态；预检先跑
         // 会把可自愈的现场误报成"磁盘文件丢失"的死路（内部盘没有重定位入口）
-        var view = ToConfigView(config);
-        RepairThenPreflight(pkg, view);
-
-        // WHPX：只使用硬件虚拟化，初始化失败即阻止启动，绝不静默回退 TCG
-        if (OperatingSystem.IsWindows())
-        {
-            var whpx = WhpxCapability.CheckWindows();
-            if (!whpx.Available)
-                throw new GrassCoreException(
-                    $"此电脑无法使用硬件虚拟化（WHPX）：{whpx.UserGuidance}");
-        }
-
         var @lock = new VmLock(pkg);
         @lock.Acquire();
-        bool lockAcquired = true; // 预检通过后到这里才拥有锁；此前抛出都不属于本调用
+        bool lockAcquired = true;
+        try
+        {
+            var view = ToConfigView(config);
+            RepairThenPreflight(pkg, view, lockHeld: true);
+            if (config.Firmware.Tpm && config.DevicesOfType<TpmDevice>().Any(t => t.Enabled))
+                throw new GrassCoreException("此虚拟机需要 TPM 2.0，但当前版本尚未提供 TPM 模拟器。请安装支持 TPM 的版本后重试。");
+            if (OperatingSystem.IsWindows())
+            {
+                var whpx = WhpxCapability.CheckWindows();
+                if (!whpx.Available)
+                    throw new GrassCoreException($"此电脑无法使用硬件虚拟化（WHPX）：{whpx.UserGuidance}");
+            }
+        }
+        catch
+        {
+            @lock.Release();
+            lockAcquired = false;
+            throw;
+        }
+
         Process? proc = null;
         try
         {
@@ -405,6 +454,8 @@ public sealed class GrassCoreService
 
             var vm = new RunningVm(pkg.Path, session, proc);
             vm.Qmp = TryConnectQmp(session.QmpPipe);
+            if (vm.Qmp is null)
+                throw new GrassCoreException("QMP 控制通道未就绪，虚拟机启动已回滚，请稍后重试。");
             _running[pkg.Path] = vm;
             WatchQemuProcess(vm);
             return new { qemuPid = proc.Id, qmpPipe = cmd.QmpPipeName, sessionId };
@@ -440,8 +491,11 @@ public sealed class GrassCoreService
     }
 
     /// <summary>挂起恢复：-incoming 从保存状态回到挂起瞬间。只保证相同宿主 CPU + 同一 QEMU major。</summary>
-    public object ResumeVm(string packagePath) => WithPackageGate(packagePath, () =>
-        WithLifecyclePhase(packagePath, "starting", () => ResumeVmCore(packagePath)));
+    public object ResumeVm(string packagePath)
+    {
+        var managed = ResolveManagedPackagePath(packagePath);
+        return WithPackageGate(managed, () => WithLifecyclePhase(managed, "starting", () => ResumeVmCore(managed)));
+    }
 
     private object ResumeVmCore(string packagePath)
     {
@@ -463,11 +517,15 @@ public sealed class GrassCoreService
         if (_running.ContainsKey(pkg.Path))
             throw new GrassCoreException("此虚拟机已经在运行。");
 
-        // 与 StartVm 同一套次序（见 RepairThenPreflight）：vm.lock 先拒 → 修复
-        // 换入中断残留 → 全量预检。挂起恢复同样要磁盘/固件在位，否则 QEMU 秒退、
-        // 用户只看到"恢复没反应"；Restore 日志收不了尾同样拒绝
-        var view = ToConfigView(config);
-        RepairThenPreflight(pkg, view);
+        var @lock = new VmLock(pkg);
+        @lock.Acquire();
+        bool lockAcquired = true;
+        try
+        {
+            var view = ToConfigView(config);
+            RepairThenPreflight(pkg, view, lockHeld: true);
+        if (config.Firmware.Tpm && config.DevicesOfType<TpmDevice>().Any(t => t.Enabled))
+            throw new GrassCoreException("此虚拟机需要 TPM 2.0，但当前版本尚未提供 TPM 模拟器。请安装支持 TPM 的版本后重试。");
         if (OperatingSystem.IsWindows())
         {
             var whpx = WhpxCapability.CheckWindows();
@@ -475,9 +533,14 @@ public sealed class GrassCoreService
                 throw new GrassCoreException($"此电脑无法使用硬件虚拟化（WHPX）：{whpx.UserGuidance}");
         }
 
-        var @lock = new VmLock(pkg);
-        @lock.Acquire();
-        bool lockAcquired = true;
+        }
+        catch
+        {
+            @lock.Release();
+            lockAcquired = false;
+            throw;
+        }
+
         Process? proc = null;
         bool registered = false;
         try
@@ -500,6 +563,8 @@ public sealed class GrassCoreService
 
             var vm = new RunningVm(pkg.Path, session, proc) { ResumedFromSuspend = true };
             vm.Qmp = TryConnectQmp(session.QmpPipe);
+            if (vm.Qmp is null)
+                throw new GrassCoreException("QMP 控制通道未就绪，虚拟机恢复已回滚，请稍后重试。");
             _running[pkg.Path] = vm;
             registered = true;
             WatchQemuProcess(vm);
@@ -876,6 +941,7 @@ public sealed class GrassCoreService
     /// </summary>
     internal static bool IsInvalidVmName(string name) =>
         string.IsNullOrWhiteSpace(name)
+        || name.StartsWith('.')
         || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0
         || name.Contains(',')
         || name.Contains('=');
@@ -902,22 +968,24 @@ public sealed class GrassCoreService
 
     private QmpClient? TryConnectQmp(string pipeName)
     {
-        QmpClient? client = null;
-        try
+        for (var attempt = 0; attempt < 12; attempt++)
         {
-            var transport = _qmpTransportFactory(pipeName);
-            if (transport is null) return null;
-            client = new QmpClient(transport);
-            // 在线程池线程完成握手（避免捕获调用方上下文死锁）；QEMU 启动窗口内可能未就绪 → 限时等待
-            Task.Run(() => client.ConnectAsync()).WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
-            return client;
+            QmpClient? client = null;
+            try
+            {
+                var transport = _qmpTransportFactory(pipeName);
+                if (transport is null) return null;
+                client = new QmpClient(transport);
+                Task.Run(() => client.ConnectAsync()).WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
+                return client;
+            }
+            catch
+            {
+                client?.Dispose();
+                if (attempt < 11) Thread.Sleep(TimeSpan.FromMilliseconds(Math.Min(1000, 100 + attempt * 100)));
+            }
         }
-        catch
-        {
-            // 未就绪/超时：释放本次失败的连接（调用方后续会重试），不累积泄漏句柄
-            client?.Dispose();
-            return null;
-        }
+        return null;
     }
 
     private QmpClient RequireQmp(string packagePath)
@@ -938,8 +1006,11 @@ public sealed class GrassCoreService
         return vm.Qmp ?? throw new GrassCoreException("QMP 控制通道不可用（QEMU 可能仍在启动），请稍后重试。");
     }
 
-    public object PowerAction(string packagePath, string action) =>
-        WithPackageGate(packagePath, () => PowerActionCore(packagePath, action));
+    public object PowerAction(string packagePath, string action)
+    {
+        var managed = ResolveManagedPackagePath(packagePath);
+        return WithPackageGate(managed, () => PowerActionCore(managed, action));
+    }
 
     private object PowerActionCore(string packagePath, string action)
     {
@@ -1239,8 +1310,11 @@ public sealed class GrassCoreService
     }
 
     /// <summary>CD/DVD 热插拔（唯一允许运行中修改的设备）：换镜像 / 弹出。</summary>
-    public object ChangeMedium(string packagePath, string deviceId, string? isoPath) =>
-        WithPackageGate(packagePath, () => ChangeMediumCore(packagePath, deviceId, isoPath));
+    public object ChangeMedium(string packagePath, string deviceId, string? isoPath)
+    {
+        var managed = ResolveManagedPackagePath(packagePath);
+        return WithPackageGate(managed, () => ChangeMediumCore(managed, deviceId, isoPath));
+    }
 
     private object ChangeMediumCore(string packagePath, string deviceId, string? isoPath)
     {
@@ -1249,6 +1323,10 @@ public sealed class GrassCoreService
         var cd = config.Devices.OfType<CdromDevice>().SingleOrDefault(d => d.DeviceId == deviceId)
                  ?? throw new GrassCoreException("找不到这台虚拟机的 CD/DVD 设备。");
         var resolved = isoPath is null ? null : PathPolicy.Resolve(pkg, isoPath);
+        if (resolved is not null && (!File.Exists(resolved)
+            || (File.GetAttributes(resolved) & FileAttributes.ReparsePoint) != 0
+            || !string.Equals(Path.GetExtension(resolved), ".iso", StringComparison.OrdinalIgnoreCase)))
+            throw new GrassCoreException("光盘镜像必须是存在且可读取的普通 ISO 文件。");
         var qmp = RequireQmp(packagePath);
         if (resolved is null)
             qmp.EjectMediumAsync("cd" + cd.CreatedOrder).GetAwaiter().GetResult();
@@ -1265,7 +1343,8 @@ public sealed class GrassCoreService
     /// <summary>显示器窗口连接信息：-spice port=0 自动分配后的真实端口（经 QMP query-spice）。</summary>
     public object GetDisplayInfo(string packagePath)
     {
-        var qmp = RequireQmp(packagePath);
+        var managedPath = ResolveManagedPackagePath(packagePath);
+        var qmp = RequireQmp(managedPath);
         var port = qmp.QuerySpicePortAsync().GetAwaiter().GetResult();
         return new { spicePort = port };
     }
@@ -1283,7 +1362,7 @@ public sealed class GrassCoreService
     /// <summary>读取完整配置（设置页数据源；直接返回 JSON 对象而非字符串）。</summary>
     public object GetConfig(string packagePath)
     {
-        var pkg = new GrassVmPackage(packagePath);
+        var pkg = new GrassVmPackage(ResolveManagedPackagePath(packagePath));
         var config = new ConfigStore(pkg).LoadAndUpgrade();
         return System.Text.Json.JsonSerializer.Deserialize<System.Text.Json.JsonElement>(
             ConfigJson.Serialize(config));
@@ -1293,7 +1372,11 @@ public sealed class GrassCoreService
     /// 保存配置：仅关机状态允许（运行中唯一可改的是 CD/DVD，走 changeMedium）。
     /// 值域钳制：CPU 1..宿主核数，内存 512MB..宿主一半，磁盘/设备数量上限。
     /// </summary>
-    public object UpdateConfig(string packagePath, string configJson) => WithPackageGate(packagePath, () => UpdateConfigCore(packagePath, configJson));
+    public object UpdateConfig(string packagePath, string configJson)
+    {
+        var managed = ResolveManagedPackagePath(packagePath);
+        return WithPackageGate(managed, () => UpdateConfigCore(managed, configJson));
+    }
 
     private object UpdateConfigCore(string packagePath, string configJson)
     {
@@ -1334,8 +1417,18 @@ public sealed class GrassCoreService
         if (IsInvalidVmName(config.Name))
             throw new GrassCoreException(
                 "名称包含文件系统或 QEMU 不允许的字符（含逗号、等号）。");
+        var profile = OsProfileLibrary.ById(config.OsProfileId);
+        if (config.Firmware.Kind != profile.Firmware)
+            throw new GrassCoreException("固件类型必须与 OS Profile 保持一致。");
         if (config.Devices.Count > 16)
             throw new GrassCoreException("设备数量超出上限（16）。");
+
+        foreach (var disk in config.Devices.OfType<DiskDevice>())
+            ValidateResourcePath(pkg, disk.Path, requireFile: true, "硬盘");
+        foreach (var cd in config.Devices.OfType<CdromDevice>())
+            if (cd.IsoPath is not null) ValidateIsoPath(pkg, cd.IsoPath);
+        foreach (var folder in config.Devices.OfType<SharedFolderDevice>())
+            ValidateResourcePath(pkg, folder.HostPath, requireFile: false, "共享文件夹");
 
         new ConfigStore(pkg).Save(config);
         return new { saved = true, cpuCores = config.CpuCores, memoryMiB = config.MemoryMiB };
@@ -1343,8 +1436,28 @@ public sealed class GrassCoreService
 
     private static long GetTotalHostMemoryMiB() => Library.HostResources.TotalMemoryMiB();
 
+    private static void ValidateIsoPath(GrassVmPackage package, string storedPath)
+    {
+        var path = PathPolicy.Resolve(package, storedPath);
+        if (!File.Exists(path) || (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0
+            || !string.Equals(Path.GetExtension(path), ".iso", StringComparison.OrdinalIgnoreCase))
+            throw new GrassCoreException("光盘镜像必须是存在且可读取的普通 ISO 文件。");
+    }
+
+    private static void ValidateResourcePath(GrassVmPackage package, string storedPath, bool requireFile, string label)
+    {
+        var path = PathPolicy.Resolve(package, storedPath);
+        var exists = requireFile ? File.Exists(path) : Directory.Exists(path);
+        if (!exists || GrassVmPackage.ContainsReparsePoint(path))
+            throw new GrassCoreException($"{label}路径不存在或包含不受支持的符号链接。");
+    }
+
     /// <summary>扩容硬盘（只能扩大；qemu-img resize 事务化执行 + 魔数校验保持链完整）。</summary>
-    public object ResizeDisk(string packagePath, string deviceId, long newGiB) => WithPackageGate(packagePath, () => ResizeDiskCore(packagePath, deviceId, newGiB));
+    public object ResizeDisk(string packagePath, string deviceId, long newGiB)
+    {
+        var managed = ResolveManagedPackagePath(packagePath);
+        return WithPackageGate(managed, () => ResizeDiskCore(managed, deviceId, newGiB));
+    }
 
     private object ResizeDiskCore(string packagePath, string deviceId, long newGiB)
     {
@@ -1392,7 +1505,11 @@ public sealed class GrassCoreService
             throw new GrassCoreException("此虚拟机有一个未完成的恢复操作正在收尾（磁盘可能被占用）。请关闭占用它的程序后重试。");
     }
 
-    public object FullClone(string packagePath, string newName) => WithPackageGate(packagePath, () => FullCloneCore(packagePath, newName));
+    public object FullClone(string packagePath, string newName)
+    {
+        var managed = ResolveManagedPackagePath(packagePath);
+        return WithPackageGate(managed, () => FullCloneCore(managed, newName));
+    }
 
     private object FullCloneCore(string packagePath, string newName)
     {
@@ -1405,7 +1522,11 @@ public sealed class GrassCoreService
         return new { path = target.Path, name = target.Name };
     }
 
-    public object LinkedClone(string packagePath, string snapshotUuid, string newName) => WithPackageGate(packagePath, () => LinkedCloneCore(packagePath, snapshotUuid, newName));
+    public object LinkedClone(string packagePath, string snapshotUuid, string newName)
+    {
+        var managed = ResolveManagedPackagePath(packagePath);
+        return WithPackageGate(managed, () => LinkedCloneCore(managed, snapshotUuid, newName));
+    }
 
     private object LinkedCloneCore(string packagePath, string snapshotUuid, string newName)
     {
@@ -1420,7 +1541,14 @@ public sealed class GrassCoreService
 
     // ---------- 导入导出（导出前必须关机）----------
 
-    public object ExportZip(string packagePath, string zipPath) => WithPackageGate(packagePath, () => ExportZipCore(packagePath, zipPath));
+    public object ExportZip(string packagePath, string zipPath)
+    {
+        var managed = ResolveManagedPackagePath(packagePath);
+        var output = Path.GetFullPath(zipPath);
+        if (output.StartsWith(managed + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            throw new GrassCoreException("导出档案必须保存到虚拟机包目录之外。");
+        return WithPackageGate(managed, () => ExportZipCore(managed, output));
+    }
 
     private object ExportZipCore(string packagePath, string zipPath)
     {
@@ -1625,7 +1753,21 @@ public sealed class GrassCoreService
     }
 
     /// <summary>OVF 目录导出（当前有效状态；OVA 打包由导出器完成）。</summary>
-    public object ExportOvf(string packagePath, string destDir) => WithPackageGate(packagePath, () => ExportOvfCore(packagePath, destDir));
+    public object ExportOvf(string packagePath, string destDir)
+    {
+        var managed = ResolveManagedPackagePath(packagePath);
+        var output = Path.GetFullPath(destDir);
+        if (IsInsideGrassVmPackage(output))
+            throw new GrassCoreException("导出目录必须位于虚拟机包目录之外。");
+        return WithPackageGate(managed, () => ExportOvfCore(managed, output));
+    }
+
+    private static bool IsInsideGrassVmPackage(string path)
+    {
+        for (var current = new DirectoryInfo(path); current is not null; current = current.Parent)
+            if (GrassVmPackage.IsGrassVmDirectory(current.FullName)) return true;
+        return false;
+    }
 
     private object ExportOvfCore(string packagePath, string destDir)
     {
@@ -1636,8 +1778,14 @@ public sealed class GrassCoreService
         return new { ovf = ovfPath };
     }
 
-    public object ExportOva(string packagePath, string ovaPath) =>
-        WithPackageGate(packagePath, () => ExportOvaCore(packagePath, ovaPath));
+    public object ExportOva(string packagePath, string ovaPath)
+    {
+        var managed = ResolveManagedPackagePath(packagePath);
+        var output = Path.GetFullPath(ovaPath);
+        if (IsInsideGrassVmPackage(output))
+            throw new GrassCoreException("导出档案必须保存到虚拟机包目录之外。");
+        return WithPackageGate(managed, () => ExportOvaCore(managed, output));
+    }
 
     private object ExportOvaCore(string packagePath, string ovaPath)
     {
@@ -1650,7 +1798,11 @@ public sealed class GrassCoreService
 
     // ---------- 快照 ----------
 
-    public object CreateSnapshot(string packagePath, string name, string? description) => WithPackageGate(packagePath, () => CreateSnapshotCore(packagePath, name, description));
+    public object CreateSnapshot(string packagePath, string name, string? description)
+    {
+        var managed = ResolveManagedPackagePath(packagePath);
+        return WithPackageGate(managed, () => CreateSnapshotCore(managed, name, description));
+    }
 
     private object CreateSnapshotCore(string packagePath, string name, string? description)
     {
@@ -1662,17 +1814,24 @@ public sealed class GrassCoreService
         return new { uuid = snap.Uuid };
     }
 
-    public object ListSnapshots(string packagePath) => SnapshotService.List(new GrassVmPackage(packagePath));
+    public object ListSnapshots(string packagePath) => SnapshotService.List(new GrassVmPackage(ResolveManagedPackagePath(packagePath)));
 
     /// <summary>恢复前预览：把 Core 的警告（配置回滚、包外盘不回滚等）交给 UI 在确认框里如实展示。</summary>
     public object PlanRestoreSnapshot(string packagePath, string uuid)
     {
-        var pkg = new GrassVmPackage(packagePath);
-        var plan = SnapshotPlanner.PlanRestore(SnapshotService.LoadTree(pkg), uuid);
+        var pkg = new GrassVmPackage(ResolveManagedPackagePath(packagePath));
+        var tree = SnapshotService.LoadTree(pkg);
+        if (!tree.TryGet(uuid, out _))
+            throw new GrassCoreException("快照不存在，请刷新列表。");
+        var plan = SnapshotPlanner.PlanRestore(tree, uuid);
         return new { warnings = plan.Warnings };
     }
 
-    public object RestoreSnapshot(string packagePath, string uuid) => WithPackageGate(packagePath, () => RestoreSnapshotCore(packagePath, uuid));
+    public object RestoreSnapshot(string packagePath, string uuid)
+    {
+        var managed = ResolveManagedPackagePath(packagePath);
+        return WithPackageGate(managed, () => RestoreSnapshotCore(managed, uuid));
+    }
 
     private object RestoreSnapshotCore(string packagePath, string uuid)
     {
@@ -1685,7 +1844,7 @@ public sealed class GrassCoreService
 
     public object PlanDeleteSnapshot(string packagePath, string uuid)
     {
-        var pkg = new GrassVmPackage(packagePath);
+        var pkg = new GrassVmPackage(ResolveManagedPackagePath(packagePath));
         var tree = SnapshotService.LoadTree(pkg);
         // 陈旧 UUID（列表刷新前被别处删掉）→ 产品化措辞，而不是裸 KeyNotFound。
         // 必须放在 PlanDelete 之前——规划器内部同样按 uuid 索引
@@ -1802,7 +1961,11 @@ public sealed class GrassCoreService
         };
     }
 
-    public object DeleteSnapshot(string packagePath, string uuid) => WithPackageGate(packagePath, () => DeleteSnapshotCore(packagePath, uuid));
+    public object DeleteSnapshot(string packagePath, string uuid)
+    {
+        var managed = ResolveManagedPackagePath(packagePath);
+        return WithPackageGate(managed, () => DeleteSnapshotCore(managed, uuid));
+    }
 
     private object DeleteSnapshotCore(string packagePath, string uuid)
     {
@@ -1816,7 +1979,7 @@ public sealed class GrassCoreService
 
     public object SetAutostart(string packagePath, bool enabled)
     {
-        var pkg = new GrassVmPackage(packagePath);
+        var pkg = new GrassVmPackage(ResolveManagedPackagePath(packagePath));
         if (!File.Exists(pkg.ConfigPath))
             throw new GrassCoreException("虚拟机不存在。");
         // 宿主级属性（不写入 .grassvm，迁移不继承）；路径规范化，防止相对/绝对混用
@@ -1826,14 +1989,15 @@ public sealed class GrassCoreService
 
     public object RemoveAutostart(string packagePath)
     {
-        var pkg = new GrassVmPackage(packagePath);
+        var pkg = new GrassVmPackage(ResolveManagedPackagePath(packagePath));
         _db.RemoveAutostart(Path.GetFullPath(pkg.Path));
         return new { path = pkg.Path, removed = true };
     }
 
     public object SetAutostartOrder(string[] orderedVmPaths)
     {
-        _db.SetAutostartOrder(orderedVmPaths.Select(p => Path.GetFullPath(p)));
+        var managed = orderedVmPaths.Select(ResolveManagedPackagePath).ToArray();
+        _db.SetAutostartOrder(managed);
         return new { count = orderedVmPaths.Length };
     }
 
@@ -1877,9 +2041,9 @@ public sealed class GrassCoreService
     /// ③ 全量预检（资源/锁/显示设备/NVRAM/磁盘在位）。放在修复之后：先跑的话
     ///    会把可自愈的现场误报成"磁盘文件丢失"，而内部盘没有重定位入口——死路。
     /// </summary>
-    private void RepairThenPreflight(GrassVmPackage pkg, VmConfigView view)
+    private void RepairThenPreflight(GrassVmPackage pkg, VmConfigView view, bool lockHeld = false)
     {
-        if (File.Exists(pkg.LockPath))
+        if (!lockHeld && File.Exists(pkg.LockPath))
             throw new GrassCoreException(
                 "此虚拟机已被占用（vm.lock 存在）。只有在确认它没有在其他实例或其他电脑上运行时，才能解除锁定。");
         if (!SnapshotService.RepairStagedOverlays(pkg, new Qemu.TransactionalDiskOps(_qemuImgPath)))
@@ -1957,53 +2121,36 @@ public sealed class QemuProcessLauncher(string qemuSystemPath) : IQemuProcessLau
         };
         foreach (var a in cmd.Args) psi.ArgumentList.Add(a);
         var proc = Process.Start(psi) ?? throw new GrassCoreException("无法启动 QEMU。");
-        // QEMU stderr → logs/qemu.log：诊断早期退出（WHPX 初始化失败/固件缺失等）的唯一线索；
-        // 同时持续排水，避免输出塞满管道把 QEMU 卡死
+        var logLock = new object();
+        var logPath = Path.Combine(cmd.PackageRoot ?? ".", GrassVmPackage.LogsDir, "qemu.log");
         try
         {
-            var logDir = System.IO.Path.Combine(cmd.PackageRoot ?? ".", GrassVmPackage.LogsDir);
-            Directory.CreateDirectory(logDir);
-            var logPath = System.IO.Path.Combine(logDir, "qemu.log");
-            // 会话起点截断（>2MB 时无条件截断）：诊断要的是最近一次启动的早期输出，
-            // 无限追加会让 .grassvm 包静默膨胀（搬家/拷贝的是这个目录）
-            try
+            Directory.CreateDirectory(Path.GetDirectoryName(logPath)!);
+            var fi = new FileInfo(logPath);
+            if (!fi.Exists || fi.Length > 2 * 1024 * 1024)
+                File.WriteAllText(logPath, $"--- session {DateTimeOffset.Now:O} ---{Environment.NewLine}");
+        }
+        catch { }
+        void Drain(StreamReader reader)
+        {
+            _ = Task.Run(async () =>
             {
-                var fi = new FileInfo(logPath);
-                if (!fi.Exists || fi.Length > 2 * 1024 * 1024)
-                    File.WriteAllText(logPath, $"--- session {DateTimeOffset.Now:O} ---\n");
-            }
-            catch { /* 截断失败不影响日志追加 */ }
-            // 两个排水回调在不同线程池线程上并发写入日志。使用 FileShare.ReadWrite
-            // 避免 Windows 上的共享冲突，并在异常时静默捕获，防止未捕获异常击穿进程
-            var logLock = new object();
-            void AppendLog(string? line)
-            {
-                if (line is null) return;
                 try
                 {
-                    lock (logLock)
+                    while (await reader.ReadLineAsync() is { } line)
                     {
-                        using var fs = new FileStream(logPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite);
-                        using var writer = new StreamWriter(fs, System.Text.Encoding.UTF8);
-                        writer.WriteLine(line);
+                        try
+                        {
+                            lock (logLock) File.AppendAllText(logPath, LogRedactor.Redact(line) + Environment.NewLine);
+                        }
+                        catch { }
                     }
                 }
-                catch
-                {
-                    // 日志写入失败（如测试清理或临时锁竞争）静默吞掉，绝对不能让 DataReceived 抛出未捕获异常
-                }
-            }
-            proc.OutputDataReceived += (_, e) => AppendLog(e.Data);
-            proc.ErrorDataReceived += (_, e) => AppendLog(e.Data);
-            try { proc.BeginOutputReadLine(); }
-            catch { /* stdout 排水失败不影响 stderr 排水 */ }
-            try { proc.BeginErrorReadLine(); }
-            catch { /* 日志/排水失败不影响 QEMU 运行 */ }
+                catch { }
+            });
         }
-        catch
-        {
-            // 日志失败不影响 QEMU 运行
-        }
+        Drain(proc.StandardOutput);
+        Drain(proc.StandardError);
         return proc;
     }
 }
