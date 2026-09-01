@@ -29,6 +29,7 @@ public sealed class GrassCoreService
     private readonly IQemuProcessLauncher _launcher;
     private readonly System.Collections.Concurrent.ConcurrentDictionary<string, RunningVm> _running =
         new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _machineIdGate = new();
 
     /// <summary>是否有运行中的 VM（Core 空闲退出判定用）。</summary>
     public bool HasRunningVms => !_running.IsEmpty;
@@ -68,14 +69,14 @@ public sealed class GrassCoreService
         get
         {
             if (_machineIdCached is not null) return _machineIdCached;
-            var id = _db.GetPreference("machineId");
-            if (id is null)
+            lock (_machineIdGate)
             {
-                id = Guid.NewGuid().ToString("N");
-                _db.SetPreference("machineId", id);
+                if (_machineIdCached is not null) return _machineIdCached;
+                // INSERT OR IGNORE + 同一事务内回读，避免两个并发启动线程各自
+                // 生成 machineId 后互相覆盖，导致其中一台 VM 的会话无法接管。
+                _machineIdCached = _db.GetOrCreatePreference("machineId", () => Guid.NewGuid().ToString("N"));
+                return _machineIdCached;
             }
-            _machineIdCached = id;
-            return id;
         }
     }
 

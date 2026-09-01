@@ -131,12 +131,29 @@ ipcMain.handle('core:call', async (_e, method: string, params?: unknown) => {
 const displayBridges = new Map<number, { server: http.Server; wss: WebSocketServer }>();
 /** 已打开的显示器窗口（包路径 → 窗口）：一台 VM 只允许一个显示器 */
 const openDisplays = new Map<number, string>();
+/** 已经由渲染层完成电源选择的关闭请求，绕过下一次 close 事件。 */
+const displayCloseAllowed = new Set<number>();
 
 // 默认存档位置：用户 Documents 下 Grass Block VM（渲染层沙箱拿不到 USERPROFILE，
 // 只能由主进程解析后交给首运行引导卡片）
 ipcMain.handle('paths:defaultLibraryDir', () =>
   path.join(app.getPath('documents'), 'Grass Block VM'),
 );
+
+ipcMain.handle('display:set-fullscreen', (event, enabled: boolean) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win || win.isDestroyed()) throw new Error('显示器窗口已关闭。');
+  win.setFullScreen(Boolean(enabled));
+  return win.isFullScreen();
+});
+
+ipcMain.handle('display:close-confirmed', (event) => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (!win || win.isDestroyed()) return false;
+  displayCloseAllowed.add(win.id);
+  win.close();
+  return true;
+});
 
 /** 正在打开中的显示器（包路径集合）：双击"打开显示器"会并发进来两次 invoke，
  *  异步桥启动让两个都通过"没有已开窗口"的检查——各开一扇窗+各起一座桥。
@@ -166,8 +183,16 @@ ipcMain.handle('display:open', async (_e, vmName: string, _spicePort: number, pa
     const win = createDisplayWindow(vmName, spicePort, display.spicePassword, bridgePort, packagePath, bridge.wss.token);
     openDisplays.set(win.id, packagePath);
     displayBridges.set(win.id, bridge);
+    win.on('close', (event) => {
+      if (displayCloseAllowed.delete(win.id)) return;
+      // 标题栏 X / Alt+F4 必须与工具栏关闭按钮走同一套四选一流程，
+      // 否则用户会在没有提示的情况下把显示器关成后台运行。
+      event.preventDefault();
+      win.webContents.send('display:close-requested');
+    });
     win.on('closed', () => {
       openDisplays.delete(win.id);
+      displayCloseAllowed.delete(win.id);
       const b = displayBridges.get(win.id);
       if (b) {
         displayBridges.delete(win.id);

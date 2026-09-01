@@ -15,6 +15,17 @@ contextBridge.exposeInMainWorld('grassvm', {
     typeof window !== 'undefined'
       ? Object.fromEntries(new URLSearchParams(window.location.search))
       : {},
+  /** 显示器窗口原生全屏，连同标题栏/任务栏一起切换。 */
+  setDisplayFullscreen: (enabled: boolean) =>
+    ipcRenderer.invoke('display:set-fullscreen', enabled) as Promise<boolean>,
+  /** 接收 Windows 标题栏关闭或 Alt+F4 请求，由渲染层展示统一的电源选择。 */
+  onDisplayCloseRequested: (callback: () => void) => {
+    const listener = () => callback();
+    ipcRenderer.on('display:close-requested', listener);
+    return () => ipcRenderer.removeListener('display:close-requested', listener);
+  },
+  /** 在渲染层完成关闭选择后，允许主进程真正关闭显示器窗口。 */
+  closeDisplayWindow: () => ipcRenderer.invoke('display:close-confirmed') as Promise<boolean>,
   /** 原生文件选择（导入档案 / 安装镜像等；QEMU 不可见原则不受影响） */
   pickOpenFile: (filterName: string, extensions: string[]) =>
     ipcRenderer.invoke('dialog:pickOpen', filterName, extensions) as Promise<string | null>,

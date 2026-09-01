@@ -51,9 +51,11 @@ Section "Core Components"
 
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   CreateShortCut "$SMPROGRAMS\${APPNAME}.lnk" "$INSTDIR\Grass Block VM.exe"
-  ; Core 的自启动入口只在 --autostart 参数下执行，安装时注册当前用户登录项。
-  ; VM 是否加入自动启动清单仍由设置页写入 SQLite，这里只负责拉起 UI/Core。
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APPNAME}" '"$INSTDIR\Grass Block VM.exe" --autostart'
+  ; Core 的自启动入口只在 --autostart 参数下执行。使用 HKLM 而不是 HKCU：
+  ; 管理员安装器可能由标准用户提供管理员凭据运行，此时 HKCU 会落到管理员
+  ; 账户，原请求安装的用户登录后永远不会拉起 UI。HKLM Run 在每个登录用户
+  ; 的上下文执行，Core 再从该用户自己的 SQLite 自动启动清单读取 VM。
+  WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "${APPNAME}" '"$INSTDIR\Grass Block VM.exe" --autostart'
 SectionEnd
 
 Function .onInit
@@ -99,7 +101,7 @@ Section "Uninstall"
     ExecWait 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\remove-tap-adapter.ps1" -AdapterName "${TAP_ADAPTER_NAME}"'
   Delete "$INSTDIR\remove-tap-adapter.ps1"
   Delete "$SMPROGRAMS\${APPNAME}.lnk"
-  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APPNAME}"
+  DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "${APPNAME}"
   RMDir /r "$INSTDIR"
   ; %USERPROFILE%\Documents\Grass Block VM 下的 .grassvm 默认保留
 SectionEnd

@@ -14,6 +14,9 @@ interface GrassApi {
   coreCall<T = unknown>(method: string, params?: unknown): Promise<T>;
   displayQuery(): Record<string, string>;
   pickOpenFile(filterName: string, extensions: string[]): Promise<string | null>;
+  setDisplayFullscreen?(enabled: boolean): Promise<boolean>;
+  onDisplayCloseRequested?(callback: () => void): () => void;
+  closeDisplayWindow?(): Promise<boolean>;
 }
 const api: GrassApi | undefined = (window as unknown as { grassvm?: GrassApi }).grassvm;
 
@@ -89,11 +92,16 @@ export function DisplayApp(): React.ReactElement {
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setFullscreen(false);
+      if (event.key === 'Escape' && fullscreen) {
+        void api?.setDisplayFullscreen?.(false);
+        setFullscreen(false);
+      }
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+  }, [fullscreen]);
+
+  useEffect(() => api?.onDisplayCloseRequested?.(() => setCloseDialog(true)), [api]);
 
   // 光驱实况（💿 按钮）：OVF 导入可能带来多个光驱——按设备逐个管理，不静默只动第一个
   const packagePath = query.path ?? '';
@@ -271,7 +279,15 @@ export function DisplayApp(): React.ReactElement {
         <button className="tool" title="共享文件夹（暂未接入）" disabled>
           📁
         </button>
-        <button className="tool" title={fullscreen ? '退出全屏（Esc）' : '全屏'} onClick={() => setFullscreen((f) => !f)}>
+        <button className="tool" title={fullscreen ? '退出全屏（Esc）' : '全屏'} onClick={async () => {
+          const next = !fullscreen;
+          try {
+            const actual = api?.setDisplayFullscreen ? await api.setDisplayFullscreen(next) : next;
+            setFullscreen(actual);
+          } catch (e) {
+            setHelperWarning(e instanceof Error ? e.message : String(e));
+          }
+        }}>
           ⛶
         </button>
         <button
@@ -308,7 +324,8 @@ export function DisplayApp(): React.ReactElement {
                 return;
               }
             }
-            window.close();
+            if (api?.closeDisplayWindow) await api.closeDisplayWindow();
+            else window.close();
           }}
         />
       )}

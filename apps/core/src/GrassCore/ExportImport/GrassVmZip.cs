@@ -238,6 +238,11 @@ public static class GrassVmZip
             {
                 if (disk.IsExternal)
                     throw new GrassCoreException("档案包含包外硬盘引用，请在原电脑上移入包内后再导出。");
+                // IsExternal 只按字符串是否带根判断；恶意档案可以把 ../ 写成
+                // 看似相对的包内引用。显式验证最终路径仍在导入包根内，再解析和
+                // 检查 backing 链，防止启动时把包外磁盘当成可写内部盘。
+                if (!PathPolicy.IsInsidePackage(pkg0, disk.Path))
+                    throw new GrassCoreException("档案内硬盘路径越出虚拟机包目录，已拒绝导入。");
                 var image = PathPolicy.Resolve(pkg0, disk.Path);
                 if (!File.Exists(image) || (File.GetAttributes(image) & FileAttributes.ReparsePoint) != 0)
                     throw new GrassCoreException($"档案缺少磁盘文件或磁盘文件是链接：{disk.Path}。导入已回滚。");

@@ -96,6 +96,26 @@ public sealed class HostDb : IDisposable
         });
     }
 
+    /// <summary>并发首次初始化偏好时只允许一个候选值写入，随后读取数据库中的规范值。</summary>
+    public string GetOrCreatePreference(string key, Func<string> factory)
+    {
+        string value = "";
+        Locked(cmd =>
+        {
+            cmd.CommandText = "INSERT OR IGNORE INTO preferences(key,value) VALUES($k,$v)";
+            cmd.Parameters.AddWithValue("$k", key);
+            cmd.Parameters.AddWithValue("$v", factory());
+            cmd.ExecuteNonQuery();
+
+            cmd.Parameters.Clear();
+            cmd.CommandText = "SELECT value FROM preferences WHERE key = $k";
+            cmd.Parameters.AddWithValue("$k", key);
+            value = cmd.ExecuteScalar() as string
+                ?? throw new InvalidOperationException($"偏好 {key} 初始化失败。");
+        });
+        return value;
+    }
+
     private void SetDefaultPreference(string key, string? value)
     {
         if (GetPreference(key) is null && value is not null) SetPreference(key, value);
