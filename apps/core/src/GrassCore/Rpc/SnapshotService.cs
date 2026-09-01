@@ -684,6 +684,7 @@ public static class SnapshotService
         var activeVarsPath = System.IO.Path.Combine(package.FirmwarePath, "VARS.fd");
         var varsPrev = activeVarsPath + RestorePrevSuffix;
         var varsSwapped = false;
+        var varsCreated = false;
         if (diskOps is not null)
         {
             // 预检（与 Create 同标准）：工作文件缺失要在【写任何事务状态之前】发现——
@@ -707,6 +708,7 @@ public static class SnapshotService
             // "state 里的 pending 已清空"——单一事实来源，恢复到当前位置也能区分
             // （只看"位置 == 目标"在那里有歧义）。
             var txId = Guid.NewGuid().ToString("N");
+            var varsExisted = File.Exists(activeVarsPath);
             var pendingState = VmState.Load(package);
             pendingState.PendingRestoreTxId = txId;
             pendingState.Save(package);
@@ -716,7 +718,7 @@ public static class SnapshotService
                 .Where(d => d is not null)
                 .Select(d => GrassCore.GrassVm.PathPolicy.Resolve(package, d!.Path))
                 .ToList();
-            WriteRestoreJournal(package, uuid, planned, vars: true, txId);
+            WriteRestoreJournal(package, uuid, planned, vars: true, txId, varsExisted);
             try
             {
                 foreach (var (deviceId, frozenRel) in snap.DiskOverlayRefs)
@@ -751,6 +753,7 @@ public static class SnapshotService
                 if (File.Exists(frozenVars) && !File.Exists(activeVarsPath))
                 {
                     Directory.CreateDirectory(package.FirmwarePath);
+                    varsCreated = true;
                     CopyAtomic(frozenVars, activeVarsPath);
                 }
                 else if (File.Exists(frozenVars) && File.Exists(activeVarsPath))
@@ -802,6 +805,11 @@ public static class SnapshotService
                     try { CopyAtomic(varsPrev, activeVarsPath); }
                     catch { rescueFailed = true; }
                 }
+                else if (varsCreated)
+                {
+                    try { DeleteIfExists(activeVarsPath); }
+                    catch { rescueFailed = true; }
+                }
                 // 全部救回才删日志；有任何一步失败就留着——修复入口会按日志重放回滚。
                 // pending 同步清除（同步回滚成功 = 事务完结）
                 if (!rescueFailed)
@@ -846,11 +854,13 @@ public static class SnapshotService
     /// 有歧义（目标本来就是当前位置）——用 state.PendingRestoreTxId 配对才能区分。</summary>
     public sealed record RestoreJournal(
         string TargetSnapshotUuid, List<string> ActiveDiskRels, bool Vars,
-        string? PreRestoreConfigJson = null, string? TxId = null);
+        string? PreRestoreConfigJson = null, string? TxId = null,
+        bool VarsExisted = true);
 
     private static readonly JsonSerializerOptions JournalOpts = new() { PropertyNameCaseInsensitive = true };
 
-    private static void WriteRestoreJournal(GrassVmPackage package, string uuid, List<string> activeAbsPaths, bool vars, string txId)
+    private static void WriteRestoreJournal(GrassVmPackage package, string uuid, List<string> activeAbsPaths,
+        bool vars, string txId, bool varsExisted)
     {
         Directory.CreateDirectory(package.SnapshotsPath);
         var rels = activeAbsPaths
@@ -864,7 +874,7 @@ public static class SnapshotService
         }
         catch { /* 读不到就少一层回滚保险，磁盘层仍然完整 */ }
         AtomicFile.WriteJsonValidated(RestoreJournalPath(package),
-            JsonSerializer.Serialize(new RestoreJournal(uuid, rels, vars, preConfig, txId), JournalOpts));
+            JsonSerializer.Serialize(new RestoreJournal(uuid, rels, vars, preConfig, txId, varsExisted), JournalOpts));
     }
 
     private static void DeleteRestoreJournal(GrassVmPackage package)
@@ -956,7 +966,9 @@ public static class SnapshotService
                     catch { /* 残留清理失败：无害 */ }
                 }
                 if (journal.Vars)
+                {
                     DeleteIfExists(System.IO.Path.Combine(package.FirmwarePath, "VARS.fd" + RestorePrevSuffix));
+                }
                 File.Delete(journalPath);
                 return true;
             }
@@ -998,7 +1010,18 @@ public static class SnapshotService
             {
                 var varsAbs = System.IO.Path.Combine(package.FirmwarePath, "VARS.fd");
                 var varsPrev = varsAbs + RestorePrevSuffix;
-                if (File.Exists(varsPrev))
+                if (!journal.VarsExisted)
+                {
+                    // 恢复前没有 NVRAM：未提交恢复期间新建的 active VARS 必须删除，
+                    // 否则磁盘/config 回到旧世界而固件状态仍停在快照点。
+                    try
+                    {
+                        DeleteIfExists(varsAbs);
+                        DeleteIfExists(varsPrev);
+                    }
+                    catch (IOException) { varsFailed = true; }
+                }
+                else if (File.Exists(varsPrev))
                 {
                     try
                     {
@@ -1213,6 +1236,25 @@ public static class SnapshotService
         // 大小写变体 UUID 会被树当作"在位"删掉物理层、却漏掉工作 overlay 的 rebase——链悬空
         var positionWasHere = string.Equals(state.CurrentSnapshotUuid, uuid, StringComparison.OrdinalIgnoreCase);
         var parentUuid = deleted.ParentSnapshotUuid;
+
+        // 删除/合并快照会删除或改写 backing 文件。链接克隆即使属于另一 Core，
+        // 只要其 vm.lock 存在就可能正在读取这些文件；跨包不能依赖进程内 _running
+        // 判断，必须以持久化锁保守阻止操作，避免运行中克隆被静默损坏。
+        var affectedSnapshotIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { uuid };
+        if (parentUuid is not null) affectedSnapshotIds.Add(parentUuid);
+        var descendants = new Stack<string>();
+        descendants.Push(uuid);
+        while (descendants.Count > 0)
+        {
+            foreach (var child in tree.ChildrenOf(descendants.Pop()))
+                if (affectedSnapshotIds.Add(child.Uuid)) descendants.Push(child.Uuid);
+        }
+        var runningLinkedClone = linkedClones.FirstOrDefault(lc =>
+            File.Exists(Path.Combine(lc.ChildVmPath, GrassVmPackage.LockFile))
+            && affectedSnapshotIds.Contains(lc.ParentSnapshotUuid));
+        if (runningLinkedClone is not null)
+            throw new GrassCoreException(
+                $"无法删除此快照：链接克隆“{runningLinkedClone.ChildVmName}”仍在运行。请先正常关机后重试。");
 
         // 任一设备落入"链根保留"分支 → 物理目录就不能整体删除（后代 overlay 还指着它）
         var anyDeviceKeptAsBase = false;

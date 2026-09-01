@@ -83,6 +83,7 @@ export class WebSocketServer extends EventEmitter {
 class WsConnImpl extends EventEmitter implements WsConnection {
   private static readonly MaxBufferedBytes = 32 * 1024 * 1024;
   private static readonly MaxInputBytes = 16 * 1024 * 1024;
+  private static readonly MaxFragments = 4096;
   private buf = Buffer.alloc(0);
   private closed = false;
   private bufferedBytes = 0;
@@ -93,6 +94,7 @@ class WsConnImpl extends EventEmitter implements WsConnection {
 
   /** 喂入原始字节；解析数据帧（客户端帧必须带 mask）。 */
   private fragments: Buffer[] = [];
+  private fragmentedBytes = 0;
 
   pushRaw(chunk: Buffer): void {
     if (this.closed) return;
@@ -151,13 +153,22 @@ class WsConnImpl extends EventEmitter implements WsConnection {
           this.emit('message', payload);
         } else {
           this.fragments = [payload];
+          this.fragmentedBytes = payload.length;
         }
       } else if (opcode === 0x0) {
+        // 每个 continuation 到达时都计入上限；只在 FIN 时检查会让攻击者
+        // 发送无限长的分片消息，令 fragments 数组在最终合并前耗尽内存。
+        if (this.fragments.length >= WsConnImpl.MaxFragments
+          || this.fragmentedBytes + payload.length > WsConnImpl.MaxInputBytes) {
+          this.terminate();
+          return;
+        }
         this.fragments.push(payload);
+        this.fragmentedBytes += payload.length;
         if (fin) {
           const whole = Buffer.concat(this.fragments);
-          if (whole.length > 16 * 1024 * 1024) { this.terminate(); return; }
           this.fragments = [];
+          this.fragmentedBytes = 0;
           this.emit('message', whole);
         }
       }

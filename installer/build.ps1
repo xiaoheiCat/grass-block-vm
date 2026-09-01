@@ -3,6 +3,25 @@ $ErrorActionPreference = 'Stop'
 # 生成 NSIS 消费的完整发布目录。脚本只接受显式输入路径，缺任何运行时组件都会失败，
 # 不再产生“能安装但启动不了”的半成品安装包。
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+
+function Resolve-DotnetCommand {
+  $candidates = @()
+  if ($env:DOTNET_ROOT) {
+    $candidates += Join-Path $env:DOTNET_ROOT 'dotnet.exe'
+  }
+  if ($env:LOCALAPPDATA) {
+    # dnvm 的活动 SDK 默认不写入系统 PATH；安装器发布也必须使用同一套 SDK。
+    $candidates += Join-Path $env:LOCALAPPDATA 'dnvm/dn/dotnet.exe'
+  }
+  foreach ($candidate in $candidates) {
+    if (Test-Path -LiteralPath $candidate) { return $candidate }
+  }
+  $command = Get-Command dotnet -ErrorAction SilentlyContinue
+  if ($null -ne $command) { return $command.Source }
+  throw '找不到 .NET SDK。请安装 .NET 10 SDK，或设置 DOTNET_ROOT。'
+}
+
+$dotnet = Resolve-DotnetCommand
 $packageVersion = (Get-Content -Raw (Join-Path $repo 'package.json') | ConvertFrom-Json).version
 $stage = Join-Path $PSScriptRoot 'stage'
 if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force }
@@ -13,7 +32,7 @@ pnpm --dir $repo --filter @grassvm/desktop build
 
 $coreProject = Join-Path $repo 'apps/core/src/GrassCore/GrassCore.csproj'
 $coreOut = Join-Path $stage 'resources/GrassCore'
-dotnet publish $coreProject -c Release -r win-x64 --self-contained true -o $coreOut
+& $dotnet publish $coreProject -c Release -r win-x64 --self-contained true -o $coreOut
 
 # Electron Windows runtime 不是单文件：除了 exe 还依赖 DLL、pak、locales 以及
 # resources/electron.asar/default_app.asar。先完整复制 dist，再仅重命名入口，
@@ -72,7 +91,7 @@ if (-not (Test-Path -LiteralPath $helperExe)) {
     throw "Helper 发布目录必须包含 GrassSpiceHelper.exe：$helperDir"
   }
   $helperDir = Join-Path $stage 'resources/GrassSpiceHelper'
-  dotnet publish $helperProject -c Release -r win-x64 --self-contained true -o $helperDir
+  & $dotnet publish $helperProject -c Release -r win-x64 --self-contained true -o $helperDir
   $helperExe = Join-Path $helperDir 'GrassSpiceHelper.exe'
   if (-not (Test-Path -LiteralPath $helperExe)) { throw "Helper 构建未生成 GrassSpiceHelper.exe。" }
 }

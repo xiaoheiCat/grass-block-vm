@@ -69,7 +69,9 @@ public sealed class VmLock : IDisposable
         FileStream? fs = null;
         try
         {
-            fs = new FileStream(_package.LockPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.None);
+            // 允许删除当前打开的锁文件：Release 会先在持有句柄时删除路径，
+            // 避免关闭句柄后到 Delete 之间被另一进程抢先创建同名新锁。
+            fs = new FileStream(_package.LockPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Delete);
             fs.WriteByte(0);
             fs.Flush(true);
             if (!Handles.TryAdd(_package.LockPath, fs))
@@ -113,8 +115,22 @@ public sealed class VmLock : IDisposable
             Handles.TryRemove(_package.LockPath, out _);
         }
         if (h is null) return; // 不得误删别的进程持有的锁
-        try { h?.Dispose(); } catch { }
-        if (File.Exists(_package.LockPath)) File.Delete(_package.LockPath);
+        // 句柄仍在时删除路径：Windows 将其标记为 delete-pending，Unix 直接
+        // unlink；新进程只能在路径消失后创建新锁，不会被旧 Release 删除。
+        try
+        {
+            if (File.Exists(_package.LockPath)) File.Delete(_package.LockPath);
+        }
+        catch
+        {
+            // 删除失败时继续持有原句柄和全局登记，避免句柄泄漏或让对象
+            // 误以为已释放；下次显式 Release/Dispose 再尝试。
+            _handle = h;
+            Handles.TryAdd(_package.LockPath, h);
+            return;
+        } // 保留锁文件比误删新锁更安全
+        RemoveRegisteredHandle(h);
+        try { h.Dispose(); } catch { }
     }
 
     private FileStream? TryAttachExistingHandle()
@@ -122,7 +138,7 @@ public sealed class VmLock : IDisposable
         if (!File.Exists(_package.LockPath)) return null;
         try
         {
-            var fs = new FileStream(_package.LockPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            var fs = new FileStream(_package.LockPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Delete);
             if (Handles.TryAdd(_package.LockPath, fs)) return fs;
             fs.Dispose();
             // 另一个本进程实例已经持有它：不能把对方的句柄交给本次
@@ -168,8 +184,15 @@ public sealed class VmLock : IDisposable
             // 只有本对象取得的句柄才可以在这里释放；不能从全局表拿走另一个
             // VmLock 实例的句柄，否则 UI 的“解除锁定”会误关掉本进程正在运行的 VM。
             Handles.TryRemove(_package.LockPath, out _);
+            try { if (File.Exists(_package.LockPath)) File.Delete(_package.LockPath); }
+            catch
+            {
+                _handle = h;
+                Handles.TryAdd(_package.LockPath, h);
+                return;
+            }
+            RemoveRegisteredHandle(h);
             try { h.Dispose(); } catch { }
-            if (File.Exists(_package.LockPath)) File.Delete(_package.LockPath);
             return;
         }
 
@@ -186,8 +209,23 @@ public sealed class VmLock : IDisposable
                 throw new VmLockedException("无法确认锁已失效：它仍可能由另一实例或另一台电脑持有。");
             return;
         }
+        try { if (File.Exists(_package.LockPath)) File.Delete(_package.LockPath); }
+        catch
+        {
+            _handle = h;
+            Handles.TryAdd(_package.LockPath, h);
+            return;
+        }
+        RemoveRegisteredHandle(h);
         try { h.Dispose(); } catch { }
-        if (File.Exists(_package.LockPath)) File.Delete(_package.LockPath);
+    }
+
+    private void RemoveRegisteredHandle(FileStream handle)
+    {
+        // TryAttachExistingHandle 先登记句柄；成功删除后必须撤销登记，
+        // 否则同一进程下一次 Acquire 会把已释放的 Stream 当成仍持有锁。
+        ((System.Collections.Generic.ICollection<KeyValuePair<string, FileStream>>)Handles)
+            .Remove(new KeyValuePair<string, FileStream>(_package.LockPath, handle));
     }
 }
 

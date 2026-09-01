@@ -62,7 +62,14 @@ public static class PathPolicy
             && storedRef.Length > 1
             && storedRef[0] == '/'
             && storedRef[1] != '/')
+        {
+            // 保留跨平台配置中的 POSIX 原文，但仍检查 .NET 在当前 Windows
+            // 盘符下解析到的实际候选路径，避免恰好命中 junction 时绕过父链校验。
+            var localCandidate = Path.GetFullPath(storedRef);
+            if (GrassVmPackage.ContainsReparsePoint(localCandidate))
+                throw new ArgumentException("包外资源不能通过符号链接或目录联接访问。", nameof(storedRef));
             return storedRef;
+        }
 
         var full = Path.GetFullPath(storedRef);
         var root = EnsureTrailingSeparator(Path.GetFullPath(package.Path));
@@ -72,6 +79,10 @@ public static class PathPolicy
             var relative = Path.GetRelativePath(package.Path, full);
             return ResolvePackagePath(package, relative);
         }
+        // 包外绝对路径也可能通过父目录 junction/symlink 指向用户未选择的宿主位置。
+        // 只检查最终文件属性无法防住父目录被替换的 TOCTOU/路径穿越场景。
+        if (GrassVmPackage.ContainsReparsePoint(full))
+            throw new ArgumentException("包外资源不能通过符号链接或目录联接访问。", nameof(storedRef));
         return full;
     }
 

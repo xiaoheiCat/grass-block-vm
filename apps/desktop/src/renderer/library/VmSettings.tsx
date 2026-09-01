@@ -366,8 +366,6 @@ function renderPane(d: (typeof DEVICE_ORDER)[number], locked: boolean, p: PanePr
                     }}
                   >
                     <option value="nat">NAT（默认）</option>
-                    <option value="bridged">桥接</option>
-                    <option value="hostOnly" disabled={p.networks.length === 0}>Host-only</option>
                     <option value="disconnected">断开</option>
                   </select>
                 </label>
@@ -399,7 +397,7 @@ function renderPane(d: (typeof DEVICE_ORDER)[number], locked: boolean, p: PanePr
                 )}
               </div>
             ))}
-          <p>每张网卡可独立选择：NAT（默认，开箱即用）/ 桥接 / Host-only / 断开。</p>
+          <p>当前版本支持 NAT（默认，开箱即用）或断开网络。</p>
           <button className="btn-primary" disabled={locked || !p.dirty} onClick={p.onSave}>保存网络设置</button>
         </>
       );
@@ -473,9 +471,9 @@ function RelocateResourceButton(props: {
           try {
             const picked = props.deviceType === 'sharedFolder'
               ? await api.pickDirectory()
-              : await api.pickOpenFile(
+                : await api.pickOpenFile(
                 props.deviceType === 'cdrom' ? '光盘镜像（ISO）' : '虚拟硬盘',
-                props.deviceType === 'cdrom' ? ['iso'] : ['qcow2', 'vmdk', 'vdi', 'vhd', 'vhdx', 'img'],
+                props.deviceType === 'cdrom' ? ['iso'] : ['qcow2'],
               );
             if (!picked) return;
             await api.coreCall('relocateResource', {

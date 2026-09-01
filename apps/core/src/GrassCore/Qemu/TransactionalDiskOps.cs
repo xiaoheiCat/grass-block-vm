@@ -369,7 +369,18 @@ public sealed class StartupPreflight
 
         foreach (var disk in config.Disks)
         {
-            var resolved = GrassVm.PathPolicy.Resolve(package, disk.Path);
+            string resolved;
+            try
+            {
+                resolved = GrassVm.PathPolicy.Resolve(package, disk.Path);
+            }
+            catch (ArgumentException)
+            {
+                problems.Add(new Problem(
+                    $"无法使用 {disk.DisplayName}：磁盘路径包含不受支持的符号链接或目录联接。请重新定位该文件后重试。",
+                    Fatal: true));
+                continue;
+            }
             if (!File.Exists(resolved))
             {
                 problems.Add(new Problem(
@@ -378,10 +389,28 @@ public sealed class StartupPreflight
                     $"无法使用 {disk.DisplayName}：找不到它的磁盘文件（{disk.Path}）。请恢复该文件后重试，或删除后重建这台虚拟机。",
                     Fatal: true));
             }
+            else if ((File.GetAttributes(resolved) & FileAttributes.ReparsePoint) != 0
+                || !string.Equals(Path.GetExtension(resolved), ".qcow2", StringComparison.OrdinalIgnoreCase))
+            {
+                problems.Add(new Problem(
+                    $"无法使用 {disk.DisplayName}：磁盘文件必须是普通的 QCOW2 文件。请重新定位该文件后重试。",
+                    Fatal: true));
+            }
         }
         foreach (var cd in config.Cds.Where(c => c.IsoPath is not null))
         {
-            var resolved = GrassVm.PathPolicy.Resolve(package, cd.IsoPath!);
+            string resolved;
+            try
+            {
+                resolved = GrassVm.PathPolicy.Resolve(package, cd.IsoPath!);
+            }
+            catch (ArgumentException)
+            {
+                problems.Add(new Problem(
+                    $"{cd.DisplayName} 引用的安装镜像路径包含不受支持的符号链接或目录联接，请重新选择 ISO 文件。",
+                    Fatal: true));
+                continue;
+            }
             if (!File.Exists(resolved))
                 problems.Add(new Problem(
                     // 非致命：安装镜像被用户清理（Downloads/临时目录）是常态，空
@@ -390,6 +419,11 @@ public sealed class StartupPreflight
                     // 运行后可从显示器窗口更换介质
                     $"{cd.DisplayName} 引用的安装镜像已不存在，将以空光驱启动。启动后可在显示器窗口更换介质。",
                     Fatal: false));
+            else if ((File.GetAttributes(resolved) & FileAttributes.ReparsePoint) != 0
+                || !string.Equals(Path.GetExtension(resolved), ".iso", StringComparison.OrdinalIgnoreCase))
+                problems.Add(new Problem(
+                    $"{cd.DisplayName} 引用的文件不是普通 ISO 镜像，请重新选择 ISO 文件。",
+                    Fatal: true));
         }
         return problems;
     }

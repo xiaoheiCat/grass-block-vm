@@ -40,6 +40,10 @@ public static class DeviceNamer
     /// <summary>新增设备时分配 createdOrder（全局递增，不回收）。</summary>
     public static int NextCreatedOrder(VmConfiguration config) =>
         config.Devices.Select(d => d.CreatedOrder).DefaultIfEmpty(0).Max() + 1;
+
+    /// <summary>校验导入/手工编辑的配置没有重复添加顺序。</summary>
+    public static bool HasUniqueCreatedOrders(VmConfiguration config) =>
+        config.Devices.Select(d => d.CreatedOrder).Distinct().Count() == config.Devices.Count;
 }
 
 /// <summary>配置 JSON 序列化（多态设备 + camelCase）。前端与 Core 共用同一 Schema 契约。</summary>

@@ -39,9 +39,9 @@ public static class GrassVmZip
     }
 
     /// <summary>校验 VM 处于可导出状态（必须已关机且未被占用）。</summary>
-    public static void EnsureExportable(GrassVmPackage package, bool isRunning)
+    public static void EnsureExportable(GrassVmPackage package, bool isRunning, bool lockHeld = false)
     {
-        if (isRunning || File.Exists(package.LockPath))
+        if (isRunning || (!lockHeld && File.Exists(package.LockPath)))
             throw new GrassCoreException("导出前必须先正常关机。运行中或挂起的虚拟机不允许导出。");
         // 挂起的 VM 没有 vm.lock 也不在运行，但挂起状态绑定宿主指纹，导出的档案无法在别处恢复
         if (Config.VmState.Load(package).SuspendedStatePath is not null)
@@ -223,6 +223,7 @@ public static class GrassVmZip
             if (importedConfig.SchemaVersion != VmConfiguration.CurrentSchemaVersion)
                 throw new GrassCoreException($"档案配置版本不受支持（schema {importedConfig.SchemaVersion}，当前为 {VmConfiguration.CurrentSchemaVersion}）。");
             ValidateImportedConfig(importedConfig);
+            ValidateImportedMediaPaths(pkg0, importedConfig);
             var importedProfile = GrassCore.Profiles.OsProfileLibrary.ById(importedConfig.OsProfileId);
             if (importedConfig.Firmware.Kind != importedProfile.Firmware)
                 throw new GrassCoreException("压缩包内的固件类型与 OS Profile 不一致，无法导入。");
@@ -296,19 +297,38 @@ public static class GrassVmZip
 
     private static void ValidateImportedConfig(VmConfiguration config)
     {
-        var maxCpu = Math.Max(1, Environment.ProcessorCount);
-        var maxMem = Math.Max(512L, GrassCore.Library.HostResources.TotalMemoryMiB() / 2);
-        if (config.CpuCores is < 1 or > 256 || config.CpuCores > maxCpu)
-            throw new GrassCoreException($"档案内 CPU 数量无效（当前宿主最多支持 {maxCpu} 核）。");
-        if (config.MemoryMiB < 512 || config.MemoryMiB > maxMem)
-            throw new GrassCoreException($"档案内内存超出当前宿主安全范围（最大 {maxMem} MiB）。");
+        // 导入是跨主机的配置保存操作；当前宿主资源只在启动前校验，
+        // 否则合法档案无法从大内存主机迁移到较小主机（甚至无法在 CI 中
+        // 解包 8 GiB 配置）。这里仍保留与配置模型一致的绝对安全上限，
+        // 防止恶意档案写入会导致整数溢出或不可序列化的极端值。
+        if (config.CpuCores is < 1 or > 256)
+            throw new GrassCoreException("档案内 CPU 数量无效（必须为 1 到 256）。");
+        if (config.MemoryMiB < 512 || config.MemoryMiB > 1024 * 1024)
+            throw new GrassCoreException("档案内内存超出安全范围（最大 1 TiB）。");
         if (!config.HasDisplayDevice)
             throw new GrassCoreException("档案内缺少显示设备，无法导入无头虚拟机。");
         if (config.Devices.Count > 128)
             throw new GrassCoreException("档案内设备数量超过安全上限。");
+        if (!DeviceNamer.HasUniqueCreatedOrders(config))
+            throw new GrassCoreException("档案内包含重复的设备添加顺序。");
         if (config.Devices.Select(d => d.DeviceId).Distinct(StringComparer.OrdinalIgnoreCase).Count() != config.Devices.Count)
             throw new GrassCoreException("档案内包含重复设备标识。");
         if (config.Devices.OfType<DiskDevice>().Any(d => d.SizeBytes < 0 || d.SizeBytes > 256L * 1024 * 1024 * 1024 * 1024))
             throw new GrassCoreException("档案内虚拟磁盘容量超出安全上限。");
+    }
+
+    private static void ValidateImportedMediaPaths(GrassVmPackage package, VmConfiguration config)
+    {
+        foreach (var cd in config.Devices.OfType<CdromDevice>())
+        {
+            if (cd.IsoPath is null) continue;
+            if (!string.Equals(Path.GetExtension(cd.IsoPath), ".iso", StringComparison.OrdinalIgnoreCase))
+                throw new GrassCoreException("档案内光驱引用的文件不是 ISO 镜像。");
+            try { _ = PathPolicy.Resolve(package, cd.IsoPath); }
+            catch (ArgumentException)
+            {
+                throw new GrassCoreException("档案内光驱路径包含不受支持的符号链接或目录联接。");
+            }
+        }
     }
 }

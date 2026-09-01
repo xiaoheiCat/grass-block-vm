@@ -207,6 +207,22 @@ public class VmLockTests : IDisposable
         owner.Release();
         Assert.False(File.Exists(pkg.LockPath));
     }
+
+    [Fact]
+    public void Release_AdoptsResidualLock_AndDoesNotLeaveStaleHandleRegistration()
+    {
+        var pkg = GrassVmPackage.CreateNew(_dir, "Residual Release VM");
+        File.WriteAllText(pkg.LockPath, "");
+
+        // 模拟 Core 重启后由没有原始句柄的收尾实例接管残留锁。
+        new VmLock(pkg).Release();
+        Assert.False(File.Exists(pkg.LockPath));
+
+        // 若进程内 Handles 仍登记已释放的 Stream，这里会错误地拒绝获取。
+        using var replacement = new VmLock(pkg);
+        replacement.Acquire();
+        Assert.True(replacement.IsLocked);
+    }
 }
 
 public class AtomicFileTests : IDisposable

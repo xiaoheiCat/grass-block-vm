@@ -29,6 +29,7 @@ Section "Core Components"
   ; installer/build.ps1 先生成可运行的 stage 目录（Electron + resources/app + Core/QEMU/固件/Helper）。
   ; NSIS 只消费经过校验的发布目录，避免把开发 dist 当成安装产物。
   File /r "stage\*.*"
+  File "remove-tap-adapter.ps1"
 
   ; TAP-Windows6：Grass Block VM Virtual Ethernet Adapter（桥接 / Host-only）
   ; tapinstall.exe 的第三个参数是 PNP 硬件 ID；安装后由 PowerShell 脚本
@@ -92,9 +93,11 @@ Function CheckRunningProcess
 FunctionEnd
 
 Section "Uninstall"
-  ; 移除虚拟网卡驱动（组件与主程序同生共死，但用户数据不动）
-  IfFileExists "$INSTDIR\drivers\tapinstall.exe" 0 +2
-    ExecWait '"$INSTDIR\drivers\tapinstall.exe" remove ${TAP_DRIVER_HARDWARE_ID}'
+  ; 仅移除安装器映射的 GrassVM-Tap 适配器；不能按通用 hardware-id
+  ; 删除同机 OpenVPN 等软件的全部 TAP 设备。
+  IfFileExists "$INSTDIR\remove-tap-adapter.ps1" 0 +2
+    ExecWait 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\remove-tap-adapter.ps1" -AdapterName "${TAP_ADAPTER_NAME}"'
+  Delete "$INSTDIR\remove-tap-adapter.ps1"
   Delete "$SMPROGRAMS\${APPNAME}.lnk"
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APPNAME}"
   RMDir /r "$INSTDIR"

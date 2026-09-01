@@ -194,7 +194,10 @@ public sealed class QemuCommandBuilder
                 // 打不开文件【启动即退】——"非致命"变成"永远开不了机的死路"，
                 // 显示器换介质恰恰需要一台已经跑起来的 VM
                 var isoPath = cd.IsoPath is null ? null : PathPolicy.Resolve(new GrassVmPackage(packageRoot), cd.IsoPath);
-                if (isoPath is not null && !File.Exists(isoPath)) isoPath = null;
+                if (isoPath is not null
+                    && (!File.Exists(isoPath)
+                        || !string.Equals(Path.GetExtension(isoPath), ".iso", StringComparison.OrdinalIgnoreCase)))
+                    isoPath = null;
                 var media = isoPath is null
                     ? "media=cdrom"
                     // format=raw：省略时 QEMU 会做整盘格式探测——guest 能喂给它一个

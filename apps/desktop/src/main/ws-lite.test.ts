@@ -121,4 +121,35 @@ describe('ws-lite 帧协议（SPICE 桥的地基）', () => {
       await fx.done();
     });
   });
+
+  it('分片消息累计超过上限时立即断开，不能等到 FIN 才合并', async () => {
+    await withServer(async (fx) => {
+      const received: Buffer[] = [];
+      fx.wss.on('connection', (ws) => {
+        ws.on('message', (data: Buffer) => received.push(data));
+      });
+      const sock = await upgradeAndConnect(fx.port, `/${fx.token}`);
+      const chunk = Buffer.alloc(65535, 0x5a);
+      sock.write(clientFrame(0x2, Buffer.from([0x01]), false));
+      for (let i = 0; i < 257; i++) sock.write(clientFrame(0x0, chunk, i === 256));
+      await new Promise((r) => setTimeout(r, 100));
+      expect(received).toHaveLength(0);
+      expect(fx.wss.clients.size).toBe(0);
+      sock.destroy();
+      await fx.done();
+    });
+  });
+
+  it('零长度 continuation 也受分片数量上限约束', async () => {
+    await withServer(async (fx) => {
+      fx.wss.on('connection', () => {});
+      const sock = await upgradeAndConnect(fx.port, `/${fx.token}`);
+      sock.write(clientFrame(0x2, Buffer.alloc(0), false));
+      for (let i = 0; i < 4097; i++) sock.write(clientFrame(0x0, Buffer.alloc(0), i === 4096));
+      await new Promise((r) => setTimeout(r, 100));
+      expect(fx.wss.clients.size).toBe(0);
+      sock.destroy();
+      await fx.done();
+    });
+  });
 });
