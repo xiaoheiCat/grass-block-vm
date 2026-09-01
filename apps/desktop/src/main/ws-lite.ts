@@ -18,6 +18,7 @@ export interface WsConnection extends EventEmitter {
 }
 
 export class WebSocketServer extends EventEmitter {
+  private static readonly MaxClientsPerBridge = 2;
   private readonly conns = new Set<WsConnImpl>();
 
   /** 当前连接（拆除桥时用于终止全部会话）。 */
@@ -40,6 +41,12 @@ export class WebSocketServer extends EventEmitter {
       || !String(req.headers.connection ?? '').toLowerCase().includes('upgrade')
       || req.headers['sec-websocket-version'] !== '13'
       || !key || (req.url ?? '') !== `/${this.token}`) {
+      socket.destroy();
+      return;
+    }
+    // 一个显示器只需要一个正常客户端，短暂重连最多再容纳一个；
+    // 限制连接数避免同一令牌被滥用时为每条 WS 各建一条 SPICE TCP 连接。
+    if (this.conns.size >= WebSocketServer.MaxClientsPerBridge) {
       socket.destroy();
       return;
     }
@@ -74,8 +81,11 @@ export class WebSocketServer extends EventEmitter {
 }
 
 class WsConnImpl extends EventEmitter implements WsConnection {
+  private static readonly MaxBufferedBytes = 32 * 1024 * 1024;
+  private static readonly MaxInputBytes = 16 * 1024 * 1024;
   private buf = Buffer.alloc(0);
   private closed = false;
+  private bufferedBytes = 0;
 
   constructor(private socket: net.Socket) {
     super();
@@ -87,6 +97,10 @@ class WsConnImpl extends EventEmitter implements WsConnection {
   pushRaw(chunk: Buffer): void {
     if (this.closed) return;
     this.buf = Buffer.concat([this.buf, chunk]);
+    if (this.buf.length > WsConnImpl.MaxInputBytes) {
+      this.terminate();
+      return;
+    }
     for (;;) {
       if (this.buf.length < 2) break;
       const fin = (this.buf[0] & 0x80) !== 0;
@@ -152,6 +166,10 @@ class WsConnImpl extends EventEmitter implements WsConnection {
 
   send(data: Buffer): void {
     if (this.closed) return;
+    if (this.bufferedBytes + data.length > WsConnImpl.MaxBufferedBytes) {
+      this.terminate();
+      return;
+    }
     this.writeFrame(0x2, data);
   }
 
@@ -175,6 +193,7 @@ class WsConnImpl extends EventEmitter implements WsConnection {
       return;
     }
     const len = payload.length;
+    if (opcode === 0x2) this.bufferedBytes += len;
     let header: Buffer;
     if (len < 126) {
       header = Buffer.from([0x80 | opcode, len]);
@@ -189,6 +208,9 @@ class WsConnImpl extends EventEmitter implements WsConnection {
       header[1] = 127;
       header.writeBigUInt64BE(BigInt(len), 2);
     }
-    this.socket.write(Buffer.concat([header, payload]));
+    const frame = Buffer.concat([header, payload]);
+    this.socket.write(frame, () => {
+      if (opcode === 0x2) this.bufferedBytes = Math.max(0, this.bufferedBytes - len);
+    });
   }
 }

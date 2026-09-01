@@ -15,6 +15,9 @@ namespace GrassCore.ExportImport;
 /// </summary>
 public static class GrassVmZip
 {
+    private const int MaxEntries = 100_000;
+    private const long MaxEntryBytes = 128L * 1024 * 1024 * 1024;
+    private const long MaxTotalBytes = 512L * 1024 * 1024 * 1024;
     /// <summary>导出时排除的本机痕迹与瞬态（未知文件不属于这几类的保留）。</summary>
     private static readonly string[] ExcludedRelativePaths =
     {
@@ -118,7 +121,7 @@ public static class GrassVmZip
     /// 导入 .grassvm.zip：解到 Library Root 下；同位置已存在同名包则失败（不合并、不覆盖）。
     /// 导入后 VM 保持完整快照树；包外资源引用按统一重定位流程处理。
     /// </summary>
-    public static GrassVmPackage Import(string zipPath, string libraryRoot)
+    public static GrassVmPackage Import(string zipPath, string libraryRoot, string? qemuImgPath = null)
     {
         // 损坏/截断/贴错扩展名的 zip 在 OpenRead 就抛 InvalidDataException/
         // IOException——英文原文不进错误横幅，与 OVF 路径同标准
@@ -134,6 +137,8 @@ public static class GrassVmZip
         using var zip = Open();
         if (zip.Entries.Count == 0)
             throw new GrassCoreException("这是一个空的压缩包，不是有效的虚拟机档案。");
+        if (zip.Entries.Count > MaxEntries)
+            throw new GrassCoreException($"压缩包条目数量超过安全上限（{MaxEntries:N0}）。");
         // 包名取第一个一级目录（导出时以包根内容 + 包名目录形式写入）
         var first = zip.Entries[0].FullName.Split('/')[0];
         var pkgName = first.EndsWith(GrassVmPackage.Extension, StringComparison.OrdinalIgnoreCase)
@@ -153,6 +158,7 @@ public static class GrassVmZip
         try
         {
             Directory.CreateDirectory(staging);
+            long totalBytes = 0;
             foreach (var entry in zip.Entries)
             {
                 // 前缀剥离只对真带前缀的条目做：畸形档案（首条目是名为 *.grassvm 的
@@ -174,6 +180,8 @@ public static class GrassVmZip
                 // ExtractToFile 会按"把目录当文件打开"直接抛异常。目录由下方
                 // CreateDirectory 按需创建，这里跳过即可
                 if (rel.EndsWith('/') || string.IsNullOrEmpty(entry.Name)) continue;
+                if (entry.Length > MaxEntryBytes || (totalBytes = checked(totalBytes + entry.Length)) > MaxTotalBytes)
+                    throw new GrassCoreException("压缩包解压内容超过安全配额，已拒绝导入。");
                 var dest = Path.GetFullPath(Path.Combine(staging, rel));
                 if (!dest.StartsWith(staging + Path.DirectorySeparatorChar, StringComparison.Ordinal))
                     throw new GrassCoreException("压缩包包含非法路径（zip slip），已拒绝导入。");
@@ -203,7 +211,8 @@ public static class GrassVmZip
             {
                 importedName = new Config.ConfigStore(pkg0).Load().Name;
             }
-            catch (Exception e) when (e is System.Text.Json.JsonException or InvalidOperationException or ArgumentException)
+            catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException
+                or System.Text.Json.JsonException or InvalidOperationException or ArgumentException)
             {
                 throw new GrassCoreException("压缩包内的虚拟机配置（config.json）已损坏，无法导入。");
             }
@@ -211,26 +220,31 @@ public static class GrassVmZip
                 throw new GrassCoreException(
                     $"虚拟机名称不合法（{importedName}）：不能为空，不能包含文件系统不允许的字符、逗号或等号。");
             var importedConfig = new Config.ConfigStore(pkg0).Load();
+            if (importedConfig.SchemaVersion != VmConfiguration.CurrentSchemaVersion)
+                throw new GrassCoreException($"档案配置版本不受支持（schema {importedConfig.SchemaVersion}，当前为 {VmConfiguration.CurrentSchemaVersion}）。");
+            ValidateImportedConfig(importedConfig);
             var importedProfile = GrassCore.Profiles.OsProfileLibrary.ById(importedConfig.OsProfileId);
             if (importedConfig.Firmware.Kind != importedProfile.Firmware)
                 throw new GrassCoreException("压缩包内的固件类型与 OS Profile 不一致，无法导入。");
             if (importedConfig.Firmware.Kind == Config.FirmwareKind.Uefi
                 && !File.Exists(Path.Combine(pkg0.FirmwarePath, "VARS.fd")))
                 throw new GrassCoreException("压缩包缺少 UEFI 变量文件 VARS.fd，无法导入。");
-            foreach (var disk in Config.VmState.Load(pkg0).SuspendedStatePath is null
-                ? new Config.ConfigStore(pkg0).Load().Devices.OfType<DiskDevice>()
-                : Enumerable.Empty<DiskDevice>())
+            var importedDisks = Config.VmState.Load(pkg0).SuspendedStatePath is null
+                ? new Config.ConfigStore(pkg0).Load().Devices.OfType<DiskDevice>().ToArray()
+                : Array.Empty<DiskDevice>();
+            var backingOps = string.IsNullOrWhiteSpace(qemuImgPath) ? null : new TransactionalDiskOps(qemuImgPath);
+            foreach (var disk in importedDisks)
             {
                 if (disk.IsExternal)
                     throw new GrassCoreException("档案包含包外硬盘引用，请在原电脑上移入包内后再导出。");
-                _ = PathPolicy.Resolve(pkg0, disk.Path);
+                var image = PathPolicy.Resolve(pkg0, disk.Path);
+                if (!File.Exists(image) || (File.GetAttributes(image) & FileAttributes.ReparsePoint) != 0)
+                    throw new GrassCoreException($"档案缺少磁盘文件或磁盘文件是链接：{disk.Path}。导入已回滚。");
+                if (backingOps is not null) EnsureBackingChainContained(pkg0, image, backingOps);
             }
-            foreach (var cd in importedConfig.Devices.OfType<CdromDevice>())
-                if (cd.IsoPath is not null && Path.IsPathRooted(cd.IsoPath))
-                    throw new GrassCoreException("档案包含包外光盘引用，请在原电脑上移入包内后再导出。");
-            foreach (var folder in importedConfig.Devices.OfType<SharedFolderDevice>())
-                if (!string.IsNullOrWhiteSpace(folder.HostPath) && Path.IsPathRooted(folder.HostPath))
-                    throw new GrassCoreException("档案包含包外共享文件夹引用，请在原电脑上移除后再导出。");
+            // 包外 ISO/共享目录按产品契约保留绝对路径；跨机导入后由启动前重定位/能力
+            // 检查提示失效，不把合法的 .grassvm.zip 往返变成“无法导入”。外部硬盘仍
+            // 必须拒绝，因为它参与写时快照链且当前没有安全的重定位流程。
             // 恢复快照工作位置（导出方写入的树拓扑语义；marker 只在档案里存在，落盘后转为 state）
             var marker = Path.Combine(staging, "snapshots", "position.marker");
             if (File.Exists(marker))
@@ -252,5 +266,49 @@ public static class GrassVmZip
             throw;
         }
         return new GrassVmPackage(target);
+    }
+
+    private static void EnsureBackingChainContained(GrassVmPackage package, string image, TransactionalDiskOps ops)
+    {
+        var root = Path.GetFullPath(package.Path).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        var seen = new HashSet<string>(OperatingSystem.IsWindows()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal);
+        var current = image;
+        for (var depth = 0; depth < 64; depth++)
+        {
+            current = Path.GetFullPath(current);
+            if (!seen.Add(current))
+                throw new GrassCoreException($"磁盘 backing 链存在循环引用：{Path.GetFileName(image)}。");
+            var backing = ops.QueryBackingFileStrict(current);
+            if (backing is null) return;
+            var full = Path.GetFullPath(backing);
+            if (!full.StartsWith(root, cmp)
+                || !File.Exists(full)
+                || (File.GetAttributes(full) & FileAttributes.ReparsePoint) != 0
+                || GrassVmPackage.ContainsReparsePoint(full))
+                throw new GrassCoreException($"磁盘 {Path.GetFileName(image)} 的 backing 指向包外或链接文件，已拒绝导入。");
+            current = full;
+        }
+        throw new GrassCoreException($"磁盘 backing 链超过 64 层，已拒绝导入。");
+    }
+
+    private static void ValidateImportedConfig(VmConfiguration config)
+    {
+        var maxCpu = Math.Max(1, Environment.ProcessorCount);
+        var maxMem = Math.Max(512L, GrassCore.Library.HostResources.TotalMemoryMiB() / 2);
+        if (config.CpuCores is < 1 or > 256 || config.CpuCores > maxCpu)
+            throw new GrassCoreException($"档案内 CPU 数量无效（当前宿主最多支持 {maxCpu} 核）。");
+        if (config.MemoryMiB < 512 || config.MemoryMiB > maxMem)
+            throw new GrassCoreException($"档案内内存超出当前宿主安全范围（最大 {maxMem} MiB）。");
+        if (!config.HasDisplayDevice)
+            throw new GrassCoreException("档案内缺少显示设备，无法导入无头虚拟机。");
+        if (config.Devices.Count > 128)
+            throw new GrassCoreException("档案内设备数量超过安全上限。");
+        if (config.Devices.Select(d => d.DeviceId).Distinct(StringComparer.OrdinalIgnoreCase).Count() != config.Devices.Count)
+            throw new GrassCoreException("档案内包含重复设备标识。");
+        if (config.Devices.OfType<DiskDevice>().Any(d => d.SizeBytes < 0 || d.SizeBytes > 256L * 1024 * 1024 * 1024 * 1024))
+            throw new GrassCoreException("档案内虚拟磁盘容量超出安全上限。");
     }
 }

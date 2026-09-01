@@ -6,6 +6,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>latest</LangVersion>
     <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <!-- GrassCore 在 Windows 上通过 ProjectReference 使用 WMI；复制传递依赖到
+         testhost 输出目录，保证 `dotnet test` 与 publish/testhost 行为一致。 -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
 
   <ItemGroup>

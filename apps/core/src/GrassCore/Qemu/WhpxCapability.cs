@@ -21,22 +21,23 @@ public sealed class WhpxCapability
     public static Result CheckWindows()
     {
         // 层 1+2：查询 Win32_Processor 虚拟化固件启用 + HypervisorPresent
-        var hypervisorPresent = Environment.OSVersion.Version.Major >= 10 && HasHypervisor();
-        if (!hypervisorPresent)
+        var hypervisorPresent = Environment.OSVersion.Version.Major >= 10 ? HasHypervisor() : false;
+        if (hypervisorPresent == false)
         {
             return Result.Fail(
                 "此电脑未启用 Windows 虚拟机平台（WHPX）。请在“启用或关闭 Windows 功能”中打开" +
                 "“虚拟机平台”和“Windows 虚拟机监控程序平台”，并在 BIOS/UEFI 中开启 Intel VT-x / AMD-V 后重试。");
         }
-        if (!CpuVirtualizationFirmwareEnabled())
-        {
-            return Result.Fail("处理器未在固件中启用虚拟化（Intel VT-x / AMD-V）。请进入 BIOS/UEFI 开启后重试。");
-        }
+        // 当 HypervisorPresent=true 时，Windows 已经成功启动了 Hyper-V/WHPX；
+        // 这比 Win32_Processor.VirtualizationFirmwareEnabled 更可靠。后者在
+        // VBS、嵌套虚拟化和部分 Intel 固件上会稳定返回 false，即使 WHPX 可用，
+        // 再用它拦截会把可运行的主机误报成“BIOS 未开启”。若 HypervisorPresent
+        // 为 false，上面的分支已经拒绝启动，因此不再重复使用这个易误报字段。
         return Result.Ok();
     }
 
     [SupportedOSPlatform("windows")]
-    private static bool HasHypervisor()
+    private static bool? HasHypervisor()
     {
         try
         {
@@ -46,8 +47,14 @@ public sealed class WhpxCapability
                 if (o["HypervisorPresent"] is bool b) return b;
             }
         }
-        catch { /* 查询失败按 false 处理，交给 QEMU 初始化结果 */ }
-        return false;
+        catch
+        {
+            // WMI 在受限服务、沙箱或未提升的测试宿主中可能拒绝访问。
+            // “查询不到”不能等同于“明确关闭”：最终是否可用由 QEMU
+            // 的 -accel whpx 实际初始化决定，避免把可运行主机误报为不可用。
+            return null;
+        }
+        return null;
     }
 
     [SupportedOSPlatform("windows")]

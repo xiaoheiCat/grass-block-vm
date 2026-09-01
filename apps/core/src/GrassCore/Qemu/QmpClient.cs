@@ -80,12 +80,12 @@ public sealed class QmpClient : IDisposable
     public async Task ConnectAsync(CancellationToken ct = default)
     {
         ThrowIfDisposed();
-        var greeting = await ReadMessageAsync(ct).ConfigureAwait(false);
+        using var greeting = await ReadMessageAsync(ct).ConfigureAwait(false);
         if (!greeting.RootElement.TryGetProperty("QMP", out _))
             throw new QmpException("对端不是 QMP 服务（缺少 greeting）。");
         // 读循环从这里接管接收侧（greeting 之后的全部消息）
         _readLoop = Task.Run(ReadLoopAsync);
-        var resp = await ExecuteRawAsync(new { execute = "qmp_capabilities" }, ct).ConfigureAwait(false);
+        using var resp = await ExecuteRawAsync(new { execute = "qmp_capabilities" }, ct).ConfigureAwait(false);
         if (resp.RootElement.TryGetProperty("error", out _))
             throw new QmpException("qmp_capabilities 被拒绝。");
     }
@@ -96,10 +96,12 @@ public sealed class QmpClient : IDisposable
         var payload = args is null
             ? (object)new { execute = command }
             : new Dictionary<string, object?> { ["execute"] = command, ["arguments"] = args };
-        var resp = await ExecuteRawAsync(payload, ct).ConfigureAwait(false);
+        using var resp = await ExecuteRawAsync(payload, ct).ConfigureAwait(false);
         if (resp.RootElement.TryGetProperty("error", out var err))
             throw new QmpException($"QMP {command} 失败：{err.GetProperty("desc").GetString()}");
-        return resp.RootElement.TryGetProperty("return", out var ret) ? ret : default;
+        // JsonDocument 在本方法内拥有底层缓冲；返回前 clone，避免调用方拿到
+        // 文档释放后的悬空 JsonElement，同时让每条 QMP 命令都及时回收缓冲。
+        return resp.RootElement.TryGetProperty("return", out var ret) ? ret.Clone() : default;
     }
 
     /// <summary>注册事件处理（BLOCK_JOB_COMPLETED / SPICE_CONNECTED / DEVICE_DELETED …）。</summary>
@@ -249,6 +251,13 @@ public sealed class QmpException(string message) : Exception(message);
 /// <summary>QMP 高层操作（产品语义 → QMP 命令）。</summary>
 public static class QmpOps
 {
+    /// <summary>向客户机发送 Ctrl+Alt+Delete（Windows 登录/安全界面）。</summary>
+    public static Task<JsonElement> SendCtrlAltDelAsync(this QmpClient qmp, CancellationToken ct = default) =>
+        qmp.ExecuteAsync("send-key", new
+        {
+            keys = new[] { new { type = "qcode", data = "ctrl" }, new { type = "qcode", data = "alt" }, new { type = "qcode", data = "delete" } },
+        }, ct);
+
     /// <summary>SPICE 实际监听端口（-spice port=0 自动分配后查询）。</summary>
     public static async Task<int> QuerySpicePortAsync(this QmpClient qmp, CancellationToken ct = default)
     {
@@ -263,6 +272,10 @@ public static class QmpOps
     /// <summary>强制关机 = 用户在电源菜单选择并二次确认后才允许调用。</summary>
     public static Task<JsonElement> ForceQuitAsync(this QmpClient qmp, CancellationToken ct = default) =>
         qmp.ExecuteAsync("quit", null, ct);
+
+    /// <summary>Core 重启接管时为 SPICE 设置新的随机 ticket，避免凭据落盘。</summary>
+    public static Task<JsonElement> SetSpicePasswordAsync(this QmpClient qmp, string password, CancellationToken ct = default) =>
+        qmp.ExecuteAsync("set_password", new { protocol = "spice", password }, ct);
 
     /// <summary>挂起第一步：暂停虚拟机（保存状态前的稳定点）。</summary>
     public static Task<JsonElement> StopAsync(this QmpClient qmp, CancellationToken ct = default) =>

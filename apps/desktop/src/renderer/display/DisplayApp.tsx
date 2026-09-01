@@ -8,7 +8,7 @@
  */
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import type { CloseDisplayChoice } from '../../shared/contract';
-import { helperTooltip, shouldShowHelperWarning } from './helper-state';
+import { helperTooltip, shouldShowHelperWarning, type HelperState } from './helper-state';
 
 interface GrassApi {
   coreCall<T = unknown>(method: string, params?: unknown): Promise<T>;
@@ -16,6 +16,55 @@ interface GrassApi {
   pickOpenFile(filterName: string, extensions: string[]): Promise<string | null>;
 }
 const api: GrassApi | undefined = (window as unknown as { grassvm?: GrassApi }).grassvm;
+
+type SpiceConnection = {
+  stop(): void;
+  agent_connected?: boolean;
+  file_xfer_start?: (file: File) => void;
+};
+
+declare global {
+  interface Window {
+    SpiceMainConn?: new (options: {
+      uri: string;
+      password?: string;
+      screen_id?: string;
+      message_id?: string;
+      onerror?: (error: Error) => void;
+      onagent?: (connection: unknown) => void;
+    }) => SpiceConnection;
+    /** spice-html5 的 resize/file-transfer 适配层使用的全局连接与事件函数。 */
+    spice_connection?: SpiceConnection;
+    handle_resize?: (event: Event) => void;
+    handle_file_dragover?: (event: DragEvent) => void;
+    handle_file_drop?: (event: DragEvent) => void;
+  }
+}
+
+const SPICE_SCRIPTS = [
+  'spicearraybuffer.js', 'enums.js', 'atKeynames.js', 'utils.js', 'png.js', 'lz.js', 'quic.js',
+  'bitmap.js', 'spicedataview.js', 'spicetype.js', 'spicemsg.js', 'wire.js', 'spiceconn.js',
+  'display.js', 'main.js', 'inputs.js', 'webm.js', 'playback.js', 'simulatecursor.js', 'cursor.js',
+  'thirdparty/jsbn.js', 'thirdparty/rsa.js', 'thirdparty/prng4.js', 'thirdparty/rng.js',
+  'thirdparty/sha1.js', 'ticket.js', 'resize.js', 'filexfer.js',
+] as const;
+let spiceClientPromise: Promise<void> | null = null;
+
+function loadSpiceClient(): Promise<void> {
+  if (window.SpiceMainConn) return Promise.resolve();
+  if (spiceClientPromise) return spiceClientPromise;
+  // spice-html5 自带的 spice.css 面向独立示例页，包含全局 `* { margin: 0 }`
+  // 和 body 背景/字体规则；直接注入会覆盖 Grass Block VM 的工具栏与主题。
+  // 协议脚本本身不依赖这些样式，显示器所需样式由应用 styles.css 提供。
+  spiceClientPromise = SPICE_SCRIPTS.reduce((chain, file) => chain.then(() => new Promise<void>((resolve, reject) => {
+    const script = document.createElement('script');
+    script.src = new URL(`../spice-html5/${file}`, document.baseURI).href;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error(`无法加载 SPICE 客户端资源：${file}`));
+    document.head.appendChild(script);
+  })), Promise.resolve());
+  return spiceClientPromise;
+}
 
 interface ConfigView {
   devices: Array<{ deviceId: string; deviceType: string; isoPath?: string | null }>;
@@ -30,11 +79,21 @@ export function DisplayApp(): React.ReactElement {
   const query = useMemo(() => (api ? api.displayQuery() : { vm: '', port: '0' }), []);
   const vmName = query.vm ?? '';
   const [fullscreen, setFullscreen] = useState(false);
-  const helperConnected = false;
+  const [helperState, setHelperState] = useState<HelperState>('detecting');
+  const [guestAgentConnected, setGuestAgentConnected] = useState(false);
+  const [spiceError, setSpiceError] = useState<string | null>(null);
   const [closeDialog, setCloseDialog] = useState(false);
   const [helperWarning, setHelperWarning] = useState<string | null>(null);
   const [cds, setCds] = useState<CdDrive[]>([]);
   const [cdMenu, setCdMenu] = useState(false);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setFullscreen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
 
   // 光驱实况（💿 按钮）：OVF 导入可能带来多个光驱——按设备逐个管理，不静默只动第一个
   const packagePath = query.path ?? '';
@@ -53,6 +112,86 @@ export function DisplayApp(): React.ReactElement {
     void reloadCds();
   }, [reloadCds]);
 
+  useEffect(() => {
+    let cancelled = false;
+    const check = async () => {
+      if (!api || !packagePath) { setHelperState('stopped'); return; }
+      try {
+        const status = await api.coreCall<{ state?: HelperState; connected?: boolean }>('getHelperStatus', { packagePath });
+        if (!cancelled)
+          setHelperState(status.connected ? 'connected' : (status.state ?? 'disconnected'));
+      } catch {
+        if (!cancelled) setHelperState('disconnected');
+      }
+    };
+    void check();
+    const timer = window.setInterval(check, 3000);
+    return () => { cancelled = true; window.clearInterval(timer); };
+  }, [api, packagePath]);
+
+  useEffect(() => {
+    let disposed = false;
+    let conn: SpiceConnection | undefined;
+    const spiceGlobals = window;
+    const screen = document.getElementById('spice-screen');
+    const onResize = (event: Event) => {
+      if (spiceGlobals.spice_connection && spiceGlobals.handle_resize)
+        spiceGlobals.handle_resize(event);
+    };
+    const onDragOver = (event: DragEvent) => {
+      spiceGlobals.handle_file_dragover?.(event);
+    };
+    const onDrop = (event: DragEvent) => {
+      spiceGlobals.handle_file_drop?.(event);
+    };
+    window.addEventListener('resize', onResize);
+    screen?.addEventListener('dragover', onDragOver);
+    screen?.addEventListener('drop', onDrop);
+    void loadSpiceClient().then(() => {
+      const Client = window.SpiceMainConn;
+      if (disposed || !query.port || !Client) return;
+      const uri = `ws://127.0.0.1:${query.port}${query.token ? `/${encodeURIComponent(query.token)}` : ''}`;
+      try {
+        conn = new Client({
+          uri,
+          password: query.password ?? '',
+          screen_id: 'spice-screen',
+          message_id: 'spice-message',
+          onerror: (error) => setSpiceError(error.message),
+          onagent: () => {
+            setGuestAgentConnected(true);
+          },
+        });
+        // spice-html5 的 resize.js/filexfer.js 通过这个全局引用找到连接；
+        // 不设置它时画面虽然能连上，但动态分辨率和拖放传文件会静默失效。
+        spiceGlobals.spice_connection = conn;
+        setSpiceError(null);
+      } catch (error) {
+        setSpiceError(error instanceof Error ? error.message : String(error));
+      }
+    }).catch((error: unknown) => {
+      if (!disposed) setSpiceError(error instanceof Error ? error.message : String(error));
+    });
+    const agentPoll = window.setInterval(() => {
+      if (!conn || typeof conn.agent_connected !== 'boolean') return;
+      if (conn.agent_connected) {
+        setGuestAgentConnected(true);
+      } else {
+        setGuestAgentConnected(false);
+      }
+    }, 1000);
+    return () => {
+      disposed = true;
+      window.clearInterval(agentPoll);
+      window.removeEventListener('resize', onResize);
+      screen?.removeEventListener('dragover', onDragOver);
+      screen?.removeEventListener('drop', onDrop);
+      if (spiceGlobals.spice_connection === conn) delete spiceGlobals.spice_connection;
+      setGuestAgentConnected(false);
+      try { conn?.stop(); } catch { /* 客户端关闭幂等 */ }
+    };
+  }, [query.port, query.token]);
+
   /** action = 'insert'（弹文件选择）或 null（取出介质） */
   const changeMedium = useCallback(async (deviceId: string, action: 'insert' | null) => {
     if (!api) return;
@@ -70,23 +209,20 @@ export function DisplayApp(): React.ReactElement {
     }
   }, [api, packagePath, reloadCds]);
 
-  const showHelperWarning = shouldShowHelperWarning(helperConnected);
+  const showHelperWarning = shouldShowHelperWarning(helperState, guestAgentConnected);
 
   return (
     <div className={`display-app ${fullscreen ? 'fullscreen' : ''}`}>
       <div className="screen-area">
         {/* spice-client 适配层接入点：连接 ws://127.0.0.1:{port}/{token}
             （token 是桥的一次性通行证——SPICE 禁票运行，路径不符的连接会被桥拒绝） */}
-        <canvas
-          id="spice-canvas"
-          width={1024}
-          height={768}
-          data-spice-port={query.port}
-          data-spice-token={query.token}
-        />
+        <div id="spice-screen" data-spice-port={query.port} data-spice-token={query.token} />
+        <div id="spice-message" className="spice-message" />
+        <div id="spice-xfer-area" className="spice-xfer-area" />
+        {spiceError && <div className="helper-hint spice-error">{spiceError}</div>}
         {showHelperWarning && (
-          <div className="helper-hint" title={helperTooltip(helperConnected) ?? undefined}>
-            <span className="helper-warn">⚠</span> 客户机帮助程序未安装
+          <div className="helper-hint" title={helperTooltip(helperState, guestAgentConnected) ?? undefined}>
+            <span className="helper-warn">⚠</span> {helperState === 'detecting' || (helperState === 'connected' && !guestAgentConnected) ? '正在检测客户机帮助程序…' : '客户机帮助程序不可用'}
           </div>
         )}
       </div>
@@ -135,10 +271,18 @@ export function DisplayApp(): React.ReactElement {
         <button className="tool" title="共享文件夹（暂未接入）" disabled>
           📁
         </button>
-        <button className="tool" title="全屏" onClick={() => setFullscreen((f) => !f)}>
+        <button className="tool" title={fullscreen ? '退出全屏（Esc）' : '全屏'} onClick={() => setFullscreen((f) => !f)}>
           ⛶
         </button>
-        <button className="tool" title="发送 Ctrl+Alt+Del（暂未接入）" disabled>
+        <button
+          className="tool"
+          title="发送 Ctrl+Alt+Del"
+          onClick={async () => {
+            if (!api || !packagePath) return;
+            try { await api.coreCall('sendCtrlAltDel', { packagePath }); }
+            catch (e) { setHelperWarning(e instanceof Error ? e.message : String(e)); }
+          }}
+        >
           ⌨
         </button>
         <div className="spacer" />

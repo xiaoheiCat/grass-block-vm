@@ -349,10 +349,10 @@ public sealed class StartupPreflight
 {
     public sealed record Problem(string UserMessage, bool Fatal);
 
-    public static List<Problem> Check(GrassVmPackage package, VmConfigView config)
+    public static List<Problem> Check(GrassVmPackage package, VmConfigView config, bool lockHeld = false)
     {
         var problems = new List<Problem>();
-        if (File.Exists(package.LockPath))
+        if (!lockHeld && File.Exists(package.LockPath))
         {
             problems.Add(new Problem(
                 "此虚拟机已被占用（vm.lock 存在）。只有在确认它没有在其他实例或其他电脑上运行时，才能解除锁定。",

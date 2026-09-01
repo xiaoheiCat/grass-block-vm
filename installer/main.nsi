@@ -1,12 +1,20 @@
-; Grass Block VM — NSIS 安装器骨架（需要 Windows 构建机上完成实机验证后启用）
+; Grass Block VM — NSIS 安装器（由 installer/build.ps1 先生成完整 stage）
 ; 逻辑要点（与 installer/README.md 的冻结决策一致）：
 ;   1. RequestExecutionLevel admin —— 一开始就整体提权，一次装齐驱动与组件
 ;   2. 升级前检测运行中的 VM（存在 GrassCore 进程即中止并提示）
 ;   3. 卸载清理 TAP 驱动；.grassvm 数据默认保留
 
 !define APPNAME "Grass Block VM"
-!define VERSION "0.1.0"
+!ifndef VERSION
+  !define VERSION "0.1.0"
+!endif
 !define COMPANY "Grass Block VM Project"
+; QemuCommandBuilder 与安装器共享这一稳定 TAP 适配器名称。tap0901 是
+; TAP-Windows6 的 PNP 硬件 ID，不是 Windows 网络连接中的友好名称。
+!define TAP_ADAPTER_NAME "GrassVM-Tap"
+!define TAP_DRIVER_HARDWARE_ID "tap0901"
+!include "LogicLib.nsh"
+!include "StrFunc.nsh"
 
 Name "${APPNAME}"
 OutFile "GrassBlockVM-Setup-${VERSION}.exe"
@@ -18,29 +26,77 @@ Page instfiles
 
 Section "Core Components"
   SetOutPath $INSTDIR
-  File /r "..\apps\desktop\dist\*.*"
-  File /r "..\apps\core\rundir\*.*"
+  ; installer/build.ps1 先生成可运行的 stage 目录（Electron + resources/app + Core/QEMU/固件/Helper）。
+  ; NSIS 只消费经过校验的发布目录，避免把开发 dist 当成安装产物。
+  File /r "stage\*.*"
 
   ; TAP-Windows6：Grass Block VM Virtual Ethernet Adapter（桥接 / Host-only）
-  ; tapinstall.exe 由驱动包提供；设备名与 QemuCommandBuilder 的 TapName 保持一致
-  ; ExecWait '"$INSTDIR\drivers\tapinstall.exe" install OemVista.inf TAP0901dev'
+  ; tapinstall.exe 的第三个参数是 PNP 硬件 ID；安装后由 PowerShell 脚本
+  ; 找到实际设备并重命名为 QemuCommandBuilder 使用的稳定 ifname。
+  ExecWait '"$INSTDIR\drivers\tapinstall.exe" install "$INSTDIR\drivers\OemVista.inf" ${TAP_DRIVER_HARDWARE_ID}' $0
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "虚拟网卡驱动安装失败（错误码 $0）。安装已中止。"
+    Abort
+  ${EndIf}
+
+  ; Get-NetAdapter/Rename-NetAdapter 需要管理员权限；安装器本身已整体提权。
+  ; 脚本放在插件临时目录，安装结束后由 NSIS 自动清理，不进入产品目录。
+  File "/oname=$PLUGINSDIR\ensure-tap-adapter.ps1" "ensure-tap-adapter.ps1"
+  ExecWait 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\ensure-tap-adapter.ps1" -AdapterName "${TAP_ADAPTER_NAME}" -DriverHardwareId "${TAP_DRIVER_HARDWARE_ID}"' $0
+  ${If} $0 != 0
+    MessageBox MB_OK|MB_ICONSTOP "虚拟网卡已安装，但无法映射为 ${TAP_ADAPTER_NAME}。安装已中止。"
+    Abort
+  ${EndIf}
 
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   CreateShortCut "$SMPROGRAMS\${APPNAME}.lnk" "$INSTDIR\Grass Block VM.exe"
+  ; Core 的自启动入口只在 --autostart 参数下执行，安装时注册当前用户登录项。
+  ; VM 是否加入自动启动清单仍由设置页写入 SQLite，这里只负责拉起 UI/Core。
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APPNAME}" '"$INSTDIR\Grass Block VM.exe" --autostart'
 SectionEnd
 
 Function .onInit
-  ; 有任何 VM 运行就禁止安装更新
-  FindWindow $0 "" "GrassCoreWindow"
-  IfErrors 0 +3
-    MessageBox MB_OK|MB_ICONSTOP "请先关闭或挂起所有正在运行的虚拟机，然后再运行 Grass Block VM 安装程序。"
-    Abort
+  ; GrassCore 是控制台进程，且 Core 崩溃时 QEMU 仍可能存活；两者都必须检查。
+  Push "GrassCore.exe"
+  Call CheckRunningProcess
+  Push "qemu-system-x86_64.exe"
+  Call CheckRunningProcess
+  Push "GrassSpiceHelper.exe"
+  Call CheckRunningProcess
+FunctionEnd
+
+Function un.onInit
+  ; 卸载同样不能在 VM/Helper 仍运行时移除程序目录，否则会留下半卸载状态，
+  ; 更严重的是可能删掉仍被 QEMU 使用的运行库。复用安装前的进程检查。
+  Push "GrassCore.exe"
+  Call CheckRunningProcess
+  Push "qemu-system-x86_64.exe"
+  Call CheckRunningProcess
+  Push "GrassSpiceHelper.exe"
+  Call CheckRunningProcess
+FunctionEnd
+
+Function CheckRunningProcess
+  Exch $0
+  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq $0" /FO CSV /NH'
+  Pop $1
+  Pop $2
+  ${If} $1 == 0
+    ${StrStr} $3 $2 $0
+    ${If} $3 != ""
+      MessageBox MB_OK|MB_ICONSTOP "检测到 $0 正在运行。请先关闭或挂起所有虚拟机，然后再运行 Grass Block VM 安装程序。"
+      Abort
+    ${EndIf}
+  ${EndIf}
+  Pop $0
 FunctionEnd
 
 Section "Uninstall"
   ; 移除虚拟网卡驱动（组件与主程序同生共死，但用户数据不动）
-  ; ExecWait '"$INSTDIR\drivers\tapinstall.exe" remove TAP0901dev'
+  IfFileExists "$INSTDIR\drivers\tapinstall.exe" 0 +2
+    ExecWait '"$INSTDIR\drivers\tapinstall.exe" remove ${TAP_DRIVER_HARDWARE_ID}'
   Delete "$SMPROGRAMS\${APPNAME}.lnk"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APPNAME}"
   RMDir /r "$INSTDIR"
   ; %USERPROFILE%\Documents\Grass Block VM 下的 .grassvm 默认保留
 SectionEnd

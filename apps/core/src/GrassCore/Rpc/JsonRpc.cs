@@ -11,6 +11,7 @@ namespace GrassCore.Rpc;
 /// </summary>
 public sealed class JsonRpcConnection
 {
+    public const int MaxFrameBytes = 16 * 1024 * 1024;
     private readonly Stream _stream;
 
     public JsonRpcConnection(Stream stream) => _stream = stream;
@@ -41,7 +42,9 @@ public sealed class JsonRpcConnection
         var lenBuf = new byte[4];
         if (!await ReadExactAsync(lenBuf, ct)) return null;
         var len = BitConverter.ToInt32(lenBuf);
-        if (len <= 0 || len > 64 * 1024 * 1024) throw new IOException("非法帧长度。");
+        // RPC 只承载配置/控制数据，不应允许单帧占用几十 MiB；限制在途帧大小
+        // 可避免同一用户通过命名管道反复提交超大 JSON 把 Core 推到 OOM。
+        if (len <= 0 || len > MaxFrameBytes) throw new IOException("非法帧长度。");
         var buf = new byte[len];
         if (!await ReadExactAsync(buf, ct)) return null;
         using var doc = JsonDocument.Parse(buf);
@@ -94,6 +97,7 @@ public sealed class JsonRpcConnection
 public static class Transport
 {
     public const string DefaultPipeName = "grassvm-core";
+    public const int MaxConnections = 16;
 
     /// <summary>当前活跃连接数（空闲退出判定用）。</summary>
     public static int ActiveConnections => _activeConnections;
@@ -108,7 +112,9 @@ public static class Transport
             {
                 var server = new NamedPipeServerStream(name, PipeDirection.InOut,
                     NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Byte,
-                    PipeOptions.Asynchronous);
+                    // RPC 管道承载所有 Core 写操作，必须显式限制为当前 Windows 用户，
+                    // 避免依赖系统默认 DACL 导致同机其他用户可抢占或调用固定管道名。
+                    PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
                 try
                 {
                     await server.WaitForConnectionAsync(ct);
@@ -124,8 +130,17 @@ public static class Transport
                     await Task.Delay(200, CancellationToken.None);
                     continue;
                 }
+                // 同一用户下的脚本仍可反复打开当前用户管道；限制连接总数，
+                // 避免每个连接各自拥有请求队列后耗尽线程池和内存。用原子
+                // 预占而不是“检查后再递增”，避免并发连接在检查窗口全部通过。
+                if (Interlocked.Increment(ref _activeConnections) > MaxConnections)
+                {
+                    Interlocked.Decrement(ref _activeConnections);
+                    server.Dispose();
+                    await Task.Delay(200, ct);
+                    continue;
+                }
                 var conn = new JsonRpcConnection(server);
-                Interlocked.Increment(ref _activeConnections);
                 // 释放归连接处理器所有：循环体的 await using 会在【每次迭代末】就把刚接上的
                 // 管道关掉（作用域是迭代而不是外层函数）——Core 在 Windows 上完全不可达。
                 // 任务不绑 ct：取消时应照样释放管道并递减计数（否则空闲退出计数永久虚高）。

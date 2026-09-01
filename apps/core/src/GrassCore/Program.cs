@@ -23,18 +23,47 @@ public static class Program
         // 开发/联调可用环境变量 GRASSCORE_QEMU_DIR / GRASSCORE_OVMF_DIR 覆盖（不影响产品形态）。
         var installDir = AppContext.BaseDirectory;
         var qemuDir = Environment.GetEnvironmentVariable("GRASSCORE_QEMU_DIR");
-        var qemuSystem = FindFile(qemuDir ?? installDir, "qemu-system-x86_64.exe", "qemu-system-x86_64");
-        var qemuImg = FindFile(qemuDir ?? installDir, "qemu-img.exe", "qemu-img");
+        // 安装布局中 Core 位于 resources/GrassCore，而 QEMU/firmware 位于同级 resources 下；
+        // 同时保留开发目录（直接放在 Core 目录内）的搜索兼容。
+        var resourcesDir = Directory.GetParent(installDir)?.FullName ?? installDir;
+        var qemuRoot = qemuDir ?? FindDir(resourcesDir, "QEMU") ?? installDir;
+        var qemuSystem = FindFile(qemuRoot, "qemu-system-x86_64.exe", "qemu-system-x86_64");
+        var qemuImg = FindFile(qemuRoot, "qemu-img.exe", "qemu-img");
         var ovmfEnv = Environment.GetEnvironmentVariable("GRASSCORE_OVMF_DIR");
         var ovmfDir = !string.IsNullOrEmpty(ovmfEnv) && Directory.Exists(ovmfEnv)
             ? ovmfEnv
-            : FindDir(installDir, "firmware") ?? FindDir(installDir, "share") ?? installDir;
-        var qemuMajor = Environment.GetEnvironmentVariable("GRASSCORE_QEMU_MAJOR") ?? "bundled";
+            : FindDir(resourcesDir, "firmware") ?? FindDir(installDir, "firmware")
+                ?? FindDir(installDir, "share") ?? installDir;
+        var helperRoot = FindDir(resourcesDir, "GrassSpiceHelper") ?? FindDir(installDir, "GrassSpiceHelper");
+        var helperExe = helperRoot is null ? null : FindFile(helperRoot, "GrassSpiceHelper.exe", "GrassSpiceHelper");
+        var qemuMajor = Environment.GetEnvironmentVariable("GRASSCORE_QEMU_MAJOR")
+            ?? ReadBundledQemuMajor(qemuRoot)
+            ?? "bundled";
+
+        // Named Pipe 可以允许多个 server instance；如果两个 Electron/UI 进程同时
+        // 发现 Core 不在线，单靠进程内单飞仍会孵出两个 GrassCore，各自接管同一 VM。
+        // 用用户会话级 mutex 把 Core 本身收敛为单实例；后启动者直接退出，前一个
+        // 实例继续提供既有管道。mutex 句柄持有到 Main 返回，崩溃时由 OS 自动释放。
+        Mutex? coreMutex = null;
+        if (OperatingSystem.IsWindows())
+        {
+            coreMutex = new Mutex(initiallyOwned: false, name: @"Local\GrassBlockVM.Core", createdNew: out _);
+            var ownsMutex = false;
+            try { ownsMutex = coreMutex.WaitOne(0); }
+            catch (AbandonedMutexException) { ownsMutex = true; }
+            if (!ownsMutex)
+            {
+                coreMutex.Dispose();
+                return 0;
+            }
+        }
+        using (coreMutex)
+        {
 
         var dbPath = HostDbPath();
         using var db = new HostDb(dbPath);
         var service = new GrassCoreService(db, qemuSystem ?? "qemu-system-x86_64", qemuImg ?? "qemu-img",
-            ovmfDir ?? installDir, qemuMajor);
+            ovmfDir ?? installDir, qemuMajor, helperExecutablePath: helperExe);
 
         // 启动即清理残留 .grass-tmp（应用启动时自动删除，不尝试断点续传）
         if (db.LibraryRoot is { } root)
@@ -46,7 +75,7 @@ public static class Program
         }
 
         // Core 崩溃恢复：接管仍在运行的 QEMU（不触碰 QEMU 本体；旧 Helper 无法安全复用时替换 Helper）
-        var recovery = new CoreCrashRecovery();
+        var recovery = new CoreCrashRecovery(sessionValidator: s => s.MachineId == service.CurrentMachineId);
         foreach (var r in recovery.ScanAdoptable(db.LibraryRoot ?? "."))
         {
             if (r.SessionValid)
@@ -79,6 +108,7 @@ public static class Program
 
         await Transport.RunServerAsync(conn => HandleConnectionAsync(conn, service));
         return 0;
+        }
     }
 
     private static async Task HandleConnectionAsync(JsonRpcConnection conn, GrassCoreService service)
@@ -86,6 +116,8 @@ public static class Program
         // 每个请求在线程池上执行、响应按完成顺序回写（JSON-RPC id 配对，客户端不依赖顺序）。
         // 不能串行等待：挂起大内存 VM 时 migrate 轮询可达分钟级，串行会把同一连接上的
         // scanLibrary（3 秒轮询）/ forceOff 全部堵死——用户既看不到状态也取消不了。
+        const int maxInFlight = 8;
+        using var inFlight = new SemaphoreSlim(maxInFlight, maxInFlight);
         var pending = new List<Task>();
         while (true)
         {
@@ -97,6 +129,18 @@ public static class Program
             }
             if (request is null) break;
             var currentRequest = request.Value;
+
+            // 允许长耗时挂起/导入与状态轮询并行，但绝不为单个管道无限
+            // 创建任务。达到上限时丢弃该请求并回报可重试错误，保持 Core
+            // 仍能处理已有控制请求。
+            if (!inFlight.Wait(0))
+            {
+                if (currentRequest.TryGetProperty("id", out var busyId)
+                    && busyId.ValueKind != JsonValueKind.Null)
+                    conn.SendAsync(JsonRpcConnection.Error(-32001, "请求过多，请稍后重试。", busyId))
+                        .GetAwaiter().GetResult();
+                continue;
+            }
 
             pending.Add(Task.Run(() =>
             {
@@ -114,6 +158,10 @@ public static class Program
                     if (currentRequest.TryGetProperty("id", out var idEl2) && idEl2.ValueKind != JsonValueKind.Null)
                         conn.SendAsync(JsonRpcConnection.Error(-32000, ex.Message, idEl2)).GetAwaiter().GetResult();
                 }
+                finally
+                {
+                    inFlight.Release();
+                }
             }));
             pending.RemoveAll(t => t.IsCompleted);
         }
@@ -128,16 +176,23 @@ public static class Program
         "getProfiles" => s.GetProfiles(),
         "adoptRunningVms" => s.AdoptRunningVms(),
         "getDisplayInfo" => s.GetDisplayInfo(p.GetProperty("packagePath").GetString()!),
+        "getHelperStatus" => s.GetHelperStatus(p.GetProperty("packagePath").GetString()!),
         "getHostInfo" => s.GetHostInfo(),
+        "listNetworks" => s.ListNetworks(),
         "createVm" => s.CreateVm(p),
         "startVm" => s.StartVm(p.GetProperty("packagePath").GetString()!),
         "resumeVm" => s.ResumeVm(p.GetProperty("packagePath").GetString()!),
         "powerAction" => s.PowerAction(p.GetProperty("packagePath").GetString()!, p.GetProperty("action").GetString()!),
+        "sendCtrlAltDel" => s.SendCtrlAltDel(p.GetProperty("packagePath").GetString()!),
         "changeMedium" => s.ChangeMedium(
             p.GetProperty("packagePath").GetString()!,
             p.GetProperty("deviceId").GetString()!,
             p.GetProperty("isoPath").ValueKind == JsonValueKind.Null ? null : p.GetProperty("isoPath").GetString()),
         "getConfig" => s.GetConfig(p.GetProperty("packagePath").GetString()!),
+        "relocateResource" => s.RelocateResource(
+            p.GetProperty("packagePath").GetString()!,
+            p.GetProperty("deviceId").GetString()!,
+            p.GetProperty("newPath").GetString()!),
         "runAutostart" => s.RunAutostartAsync().GetAwaiter().GetResult(),
         "setAutostart" => s.SetAutostart(p.GetProperty("packagePath").GetString()!, p.GetProperty("enabled").GetBoolean()),
         "removeAutostart" => s.RemoveAutostart(p.GetProperty("packagePath").GetString()!),
@@ -214,5 +269,16 @@ public static class Program
         var direct = Path.Combine(dir, name);
         if (Directory.Exists(direct)) return direct;
         return Directory.EnumerateDirectories(dir, name, SearchOption.AllDirectories).FirstOrDefault();
+    }
+
+    private static string? ReadBundledQemuMajor(string qemuRoot)
+    {
+        try
+        {
+            var marker = Path.Combine(qemuRoot, "qemu-major.txt");
+            var value = File.Exists(marker) ? File.ReadAllText(marker).Trim() : null;
+            return string.IsNullOrWhiteSpace(value) ? null : value;
+        }
+        catch { return null; }
     }
 }

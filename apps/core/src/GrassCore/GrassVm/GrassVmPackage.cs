@@ -70,7 +70,20 @@ public sealed class GrassVmPackage
         var current = new DirectoryInfo(System.IO.Path.GetFullPath(path));
         while (current is not null)
         {
-            if ((current.Attributes & FileAttributes.ReparsePoint) != 0) return true;
+            // DirectoryInfo 对不存在的路径返回 Attributes = -1；不能把该哨兵
+            // 值按位解释成 ReparsePoint，否则 CreateNew 在检查随机暂存目录时
+            // 会把每台新 VM 都误判为通过符号链接访问。
+            // File.GetAttributes 同时覆盖文件和目录（包括断链链接），因此对
+            // 现有文件也不会漏检；不存在的暂存路径按普通路径继续检查父级。
+            try
+            {
+                if ((File.GetAttributes(current.FullName) & FileAttributes.ReparsePoint) != 0)
+                    return true;
+            }
+            catch (FileNotFoundException) { }
+            catch (DirectoryNotFoundException) { }
+            catch (UnauthorizedAccessException) { return true; }
+            catch (IOException) { return true; }
             current = current.Parent;
         }
         return false;
@@ -136,13 +149,29 @@ public sealed class GrassVmPackage
     public void EnsureStructure()
     {
         Directory.CreateDirectory(Path);
-        Directory.CreateDirectory(DisksPath);
-        Directory.CreateDirectory(SnapshotsPath);
-        Directory.CreateDirectory(FirmwarePath);
-        Directory.CreateDirectory(ArtworkPath);
-        Directory.CreateDirectory(LogsPath);
-        Directory.CreateDirectory(TempPath);
-        Directory.CreateDirectory(RuntimePath);
+        EnsurePlainDirectory(DisksPath, DisksDir);
+        EnsurePlainDirectory(SnapshotsPath, SnapshotsDir);
+        EnsurePlainDirectory(FirmwarePath, FirmwareDir);
+        EnsurePlainDirectory(ArtworkPath, ArtworkDir);
+        EnsurePlainDirectory(LogsPath, LogsDir);
+        EnsurePlainDirectory(TempPath, TempDir);
+        EnsurePlainDirectory(RuntimePath, RuntimeDir);
+    }
+
+    private static void EnsurePlainDirectory(string path, string label)
+    {
+        try
+        {
+            var attrs = File.GetAttributes(path);
+            if ((attrs & FileAttributes.ReparsePoint) != 0)
+                throw new IOException($"固定目录 {label}/ 不能是符号链接或目录联接。");
+            if ((attrs & FileAttributes.Directory) == 0)
+                throw new IOException($"固定目录 {label}/ 被同名文件占用。");
+            return;
+        }
+        catch (FileNotFoundException) { }
+        catch (DirectoryNotFoundException) { }
+        Directory.CreateDirectory(path);
     }
 
     /// <summary>
@@ -159,11 +188,34 @@ public sealed class GrassVmPackage
         }
         foreach (var (dir, label) in new[]
         {
-                 (DisksPath, DisksDir), (SnapshotsPath, SnapshotsDir), (FirmwarePath, FirmwareDir),
-                 (ArtworkPath, ArtworkDir), (LogsPath, LogsDir), (TempPath, TempDir), (RuntimePath, RuntimeDir),
-             })
+            (DisksPath, DisksDir), (SnapshotsPath, SnapshotsDir), (FirmwarePath, FirmwareDir),
+            (ArtworkPath, ArtworkDir), (LogsPath, LogsDir), (TempPath, TempDir), (RuntimePath, RuntimeDir),
+        })
         {
-            if (!Directory.Exists(dir)) report.SafeRepairs.Add(new SafeRepair($"缺少 {label}/ 目录", () => Directory.CreateDirectory(dir)));
+            try
+            {
+                var attrs = File.GetAttributes(dir);
+                if ((attrs & FileAttributes.ReparsePoint) != 0)
+                    report.FatalProblems.Add($"固定目录 {label}/ 是符号链接或目录联接，已拒绝访问。");
+                else if ((attrs & FileAttributes.Directory) == 0)
+                    report.FatalProblems.Add($"固定目录 {label}/ 被同名文件占用。");
+            }
+            catch (FileNotFoundException)
+            {
+                report.SafeRepairs.Add(new SafeRepair($"缺少 {label}/ 目录", () => EnsurePlainDirectory(dir, label)));
+            }
+            catch (DirectoryNotFoundException)
+            {
+                report.SafeRepairs.Add(new SafeRepair($"缺少 {label}/ 目录", () => EnsurePlainDirectory(dir, label)));
+            }
+            catch (IOException)
+            {
+                report.FatalProblems.Add($"无法检查固定目录 {label}/ 的属性。");
+            }
+            catch (UnauthorizedAccessException)
+            {
+                report.FatalProblems.Add($"无法检查固定目录 {label}/ 的属性。");
+            }
         }
         if (File.Exists(StatePath))
         {

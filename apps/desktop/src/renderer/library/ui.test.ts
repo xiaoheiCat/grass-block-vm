@@ -158,5 +158,8 @@ describe('helper-state：客户机帮助程序安静原则', () => {
     const tip = helperTooltip(false)!;
     expect(tip).toContain('自动调整分辨率');
     expect(tip).toContain('共享剪贴板');
+    expect(shouldShowHelperWarning('connected', false)).toBe(true);
+    expect(helperTooltip('connected', false)).toContain('Guest Tools');
+    expect(helperTooltip('disconnected')).toContain('已安装');
   });
 });

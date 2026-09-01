@@ -11,6 +11,16 @@ import http from 'node:http';
 import { WebSocketServer } from './ws-lite';
 import { CoreBridge } from './core-bridge';
 
+// UI 也收敛为单实例：Core 端虽然有跨进程 mutex，但第二个 Electron 若继续
+// 留下会产生重复 Library/Display 窗口和重复轮询。第二次启动只把已有窗口置前。
+const isPrimaryInstance = app.requestSingleInstanceLock();
+if (!isPrimaryInstance) app.quit();
+else app.on('second-instance', () => {
+  const win = BrowserWindow.getAllWindows().find((candidate) => !candidate.isDestroyed());
+  win?.show();
+  win?.focus();
+});
+
 let bridge: CoreBridge | null = null;
 // 单飞：并发首调（启动风暴里 statusList + 每个 VM 卡片的并行 RPC）共享同一次
 // 连接尝试——否则会孵出多个 GrassCore 进程
@@ -22,7 +32,8 @@ async function createBridge(): Promise<CoreBridge> {
   bridgeConnecting = (async () => {
     const isDevPackaged = app.isPackaged
       ? path.join(process.resourcesPath, 'GrassCore', 'GrassCore.exe')
-      : path.join(__dirname, '..', '..', 'core-rundir', 'GrassCore.exe');
+      : (process.env.GRASSCORE_DEV_EXE
+        ?? path.join(__dirname, '..', '..', 'core-rundir', process.platform === 'win32' ? 'GrassCore.exe' : 'GrassCore'));
     const b = new CoreBridge(isDevPackaged);
     await b.ensureRunning();
     return b;
@@ -58,6 +69,7 @@ function createLibraryWindow(): void {
 function createDisplayWindow(
   vmName: string,
   spicePort: number,
+  spicePassword: string,
   bridgePort: number,
   packagePath: string,
   token: string,
@@ -79,7 +91,7 @@ function createDisplayWindow(
   // 前者给 spice-client 连接用，后者仅作展示/诊断
   win.loadFile(path.join(__dirname, '..', 'renderer', 'display', 'index.html'), {
     // 电源动作需要包路径（Core 按包路径寻址）；名称仅用于展示
-    query: { vm: vmName, port: String(bridgePort), spicePort: String(spicePort), path: packagePath, token },
+    query: { vm: vmName, port: String(bridgePort), spicePort: String(spicePort), password: spicePassword, path: packagePath, token },
   });
   return win;
 }
@@ -145,13 +157,13 @@ ipcMain.handle('display:open', async (_e, vmName: string, _spicePort: number, pa
   openingDisplays.add(packagePath);
   try {
     const b = await createBridge();
-    const display = await b.call<{ spicePort: number }>('getDisplayInfo', { packagePath });
+    const display = await b.call<{ spicePort: number; spicePassword: string }>('getDisplayInfo', { packagePath });
     const spicePort = display.spicePort;
     if (!Number.isInteger(spicePort) || spicePort < 1 || spicePort > 65535)
       throw new Error('GrassCore 返回了无效的 SPICE 端口。');
     const bridge = await startSpiceBridge(spicePort);
     const bridgePort = (bridge.server.address() as net.AddressInfo).port;
-    const win = createDisplayWindow(vmName, spicePort, bridgePort, packagePath, bridge.wss.token);
+    const win = createDisplayWindow(vmName, spicePort, display.spicePassword, bridgePort, packagePath, bridge.wss.token);
     openDisplays.set(win.id, packagePath);
     displayBridges.set(win.id, bridge);
     win.on('closed', () => {
@@ -190,6 +202,7 @@ app.on('window-all-closed', () => {
 });
 
 app.whenReady().then(async () => {
+  if (!isPrimaryInstance) return;
   createLibraryWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createLibraryWindow();

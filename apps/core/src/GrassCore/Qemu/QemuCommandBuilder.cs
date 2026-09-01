@@ -41,8 +41,14 @@ public sealed class QemuCommandBuilder
     /// <summary>TPM 模拟器宿主是否就绪（默认否：宿主进程随 Windows 实机阶段交付）。</summary>
     public bool TpmHostReady { get; init; }
 
-    public QemuCommandLine Build(string packageRoot, string? runtimeSessionId = null, string? incomingStateFile = null)
+    public QemuCommandLine Build(string packageRoot, string? runtimeSessionId = null, string? incomingStateFile = null,
+        string? spicePassword = null)
     {
+        // Builder 实例可能被设置预览、重试或测试复用；bootindex 只描述本次
+        // Build 的设备序列，不能把上一次构建的计数带入下一次，否则同一配置
+        // 的命令行会随调用次数漂移。
+        _bootSeq.Clear();
+        _unrankedSlot.Clear();
         var sessionId = runtimeSessionId ?? RandomHex(12);
         var args = new List<string>
         {
@@ -69,7 +75,7 @@ public sealed class QemuCommandBuilder
             AddDevice(args, device, packageRoot, ref nextDiskPort);
         }
         AddRawDevices(args);
-        AddDisplayAndSpice(args);
+        AddDisplayAndSpice(args, string.IsNullOrWhiteSpace(spicePassword) ? RandomHex(24) : spicePassword);
 
         // 挂起恢复：从保存的完整运行状态（内存/CPU/设备）回到挂起瞬间的唯一方式。
         // 注意 -incoming 的值是普通字符串（迁移 URI），不经 QemuOpts 解析、不按逗号
@@ -160,7 +166,8 @@ public sealed class QemuCommandBuilder
                 switch (_profile.SystemDiskBus)
                 {
                     case DiskBus.Sata:
-                        // q35 内建 ich9-ahci：每控制器 6 口（ahci0.0–ahci0.5），超限必须报错而非回绕
+                        // q35 内建 ich9-ahci：QEMU 对外暴露为 ide.0–ide.5 六个 SATA 端口，
+                        // 超限必须报错而非回绕。
                         if (sataPort >= 6)
                             throw new InvalidOperationException("SATA 设备数量超出上限（6）。请移除一些设备后再启动。");
                         args.AddRange(new[] { "-device", $"ide-hd,drive={id},bus=ide.{sataPort},bootindex={BootIndex(BootClass.Disk)}" });
@@ -221,11 +228,13 @@ public sealed class QemuCommandBuilder
                 var netdev = net.Mode switch
                 {
                     NetworkMode.Nat => $"user,id={id}",
-                    // 桥接 / Host-only：TAP-Windows6 适配器（安装器已部署 Grass Block VM Virtual Ethernet Adapter）
-                    // 桥接目标宿主网卡默认"自动选择"，用户可手动指定；该选择保存在宿主级配置中
-                    NetworkMode.Bridged => $"tap,id={id},ifname={TapName(net)},script=no,downscript=no",
+                    // 桥接 / Host-only：使用安装器创建并重命名的固定 TAP 适配器。
+                    // BridgeAdapter 是宿主物理网卡选择，不能直接作为 ifname；
+                    // 旧实现按 DeviceId 生成 GrassVM-Tap-*，但安装器只创建了
+                    // tap0901，因此 QEMU 启动时会因找不到适配器而失败。
+                    NetworkMode.Bridged => $"tap,id={id},ifname={TapNetwork.AdapterName},script=no,downscript=no",
                     NetworkMode.HostOnly when !string.IsNullOrWhiteSpace(net.VirtualNetworkId)
-                        => $"tap,id={id},ifname={TapName(net)},script=no,downscript=no",
+                        => $"tap,id={id},ifname={TapNetwork.AdapterName},script=no,downscript=no",
                     NetworkMode.HostOnly => throw new InvalidOperationException("Host-only 网卡未选择虚拟网络。请先选择一个宿主虚拟网络。"),
                     _ => throw new InvalidOperationException(),
                 };
@@ -258,20 +267,6 @@ public sealed class QemuCommandBuilder
                 // 共享文件夹走 SPICE WebDAV（Guest 帮助程序能力），不是 QEMU 启动参数
                 break;
         }
-    }
-
-    // TAP 适配器名必须跨进程稳定（安装器按这个名字部署；string.GetHashCode 每进程随机化不可用）
-    private static string TapName(NetworkDevice net)
-    {
-        var selection = net.Mode switch
-        {
-            NetworkMode.Bridged => net.BridgeAdapter ?? "auto",
-            NetworkMode.HostOnly => net.VirtualNetworkId ?? throw new InvalidOperationException("Host-only 网卡未选择虚拟网络。"),
-            _ => "none",
-        };
-        var identity = $"{net.Mode}:{selection}:{net.DeviceId}";
-        var hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(identity));
-        return $"GrassVM-Tap-{BitConverter.ToString(hash, 0, 2).Replace("-", "")}";
     }
 
     /// <summary>同类设备内递增序号（每设备 bootindex 必须唯一：QEMU 在 realize 时拒绝重复值）。</summary>
@@ -397,15 +392,21 @@ public sealed class QemuCommandBuilder
         "-readconfig", "-writeconfig", "-option-rom", "-set", "-mem-path",
     };
 
-    private void AddDisplayAndSpice(List<string> args)
+    private void AddDisplayAndSpice(List<string> args, string? spicePassword)
     {
         // 每台 VM 必须有显示设备；一台 VM 同时只允许一个"显示器"窗口。
         if (!Config.HasDisplayDevice)
             throw new InvalidOperationException("此虚拟机没有显示设备。Grass Block VM 不支持无显示器虚拟机。");
         // QXL 2D：Windows 旧版/新版 Guest 兼容性最好的稳定路径（3D 加速完全隐藏，不做实验性开关）
-        args.AddRange(new[] { "-device", "qxl-vga" });
-        // SPICE 只监听本机；端口自动分配（port=0），由 Core 经 QMP query-spice 获取后交给显示器窗口/桥
-        args.AddRange(new[] { "-spice", "addr=127.0.0.1,port=0,disable-ticketing=on" });
+        // 显式关闭 QEMU 默认的 std VGA，确保“一台 VM 一个显示设备”而不是
+        // qxl-vga + 默认 VGA 的双显卡组合（部分 Guest 会选错输出通道）。
+        args.AddRange(new[] { "-vga", "none", "-device", "qxl-vga" });
+        // SPICE 只监听本机；端口自动分配（port=0），由 Core 经 QMP query-spice 获取后交给显示器窗口/桥。
+        // 每次构建都必须启用 SPICE ticket，避免同机其他用户扫描回环端口后绕过
+        // Electron 的一次性 WebSocket token 直接接管画面/键鼠。生产启动路径传入
+        // 会话随机 ticket；低层预览/测试路径也生成随机 ticket，绝不回退到未认证模式。
+        var spice = $"addr=127.0.0.1,port=0,password={Esc(spicePassword!)},disable-ticketing=off";
+        args.AddRange(new[] { "-spice", spice });
         // 不加 -display 时 QEMU 会打开自己编译的默认 UI（GTK/SDL）——用户绝不能看见 QEMU。
         // SPICE 是唯一显示路径。
         args.AddRange(new[] { "-display", "none" });

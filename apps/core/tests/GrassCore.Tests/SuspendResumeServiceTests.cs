@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.Json;
 using GrassCore.Library;
 using GrassCore.Qemu;
 using GrassCore.Rpc;
@@ -28,7 +29,9 @@ public class SuspendResumeServiceTests : IDisposable
             var psi = new ProcessStartInfo
             {
                 FileName = OperatingSystem.IsWindows() ? "cmd" : "sleep",
-                Arguments = OperatingSystem.IsWindows() ? "/c pause" : "600",
+                // `pause` 在无交互 stdin 的测试宿主中会立即退出，导致启动后
+                // 进程监视测试拿到已失效 PID；timeout 不依赖控制台输入。
+                Arguments = OperatingSystem.IsWindows() ? "/c timeout /t 600 /nobreak >nul" : "600",
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 // 不继承测试宿主的输出管道（否则子进程会撑住 vstest 的 EOF 造成挂起）
@@ -148,6 +151,45 @@ public class SuspendResumeServiceTests : IDisposable
         } while (after.SuspendedStatePath is not null && DateTime.UtcNow < clearDeadline);
         Assert.Null(after.SuspendedStatePath);
         Assert.Null(after.SuspendFingerprint);
+    }
+
+    [Fact]
+    public void Suspend_MigrationFailure_CancelsMigrationBeforeContinuingVm()
+    {
+        using var fakeQmp = new FakeQmpServer();
+        fakeQmp.OnCommand = (cmd, _) => Task.FromResult(cmd switch
+        {
+            "query-migrate" => """{"return":{"status":"failed"}}""",
+            _ => """{"return":{}}""",
+        });
+        var acceptTask = fakeQmp.AcceptAsync();
+        var launcher = new RecordingLauncher();
+        using var db = new HostDb(Path.Combine(_dir, "migration-failure.db"));
+        var root = Path.Combine(_dir, "migration-failure-root");
+        var fw = Path.Combine(_dir, "migration-failure-fw");
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(fw);
+        db.SetPreference("libraryRoot", root);
+        File.WriteAllText(Path.Combine(fw, "OVMF_VARS.fd"), "vars-template");
+        var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(), fw, "11", launcher,
+            qmpTransportFactory: _ => new TcpTransport("127.0.0.1", fakeQmp.Port));
+        var vmPath = ((GrassCoreService.CreateVmResult)service.CreateVm(JsonSerializer.SerializeToElement(new
+        {
+            name = "迁移失败", profileId = "ubuntu", diskGiB = 8,
+            isoPath = (string?)null, cpuCores = 1, memoryMiB = 1024, startAfterCreate = false,
+        }))).Path;
+        var pkg = new GrassVm.GrassVmPackage(vmPath);
+        service.StartVm(vmPath);
+
+        Assert.Throws<GrassCoreException>(() => service.PowerAction(vmPath, "suspend"));
+        Assert.Contains("migrate_cancel", fakeQmp.ExecutedCommands);
+        Assert.True(SpinWait.SpinUntil(() => fakeQmp.ExecutedCommands.Contains("cont") || !File.Exists(pkg.LockPath), TimeSpan.FromSeconds(2)),
+            "迁移失败后必须发送 cont，或在 QEMU 已退出时完成锁清理");
+        if (fakeQmp.ExecutedCommands.Contains("cont"))
+        {
+            Assert.True(File.Exists(pkg.LockPath));
+            Assert.Equal("running", service.ScanLibrary().Vms.Single(v => v.Path == vmPath).State);
+        }
     }
 
     [Fact]

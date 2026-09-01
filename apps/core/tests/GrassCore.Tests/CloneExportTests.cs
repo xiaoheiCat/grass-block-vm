@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Formats.Tar;
 using System.Text;
 using GrassCore.Clone;
 using GrassCore.Config;
@@ -35,6 +36,9 @@ public class CloneExportTests : IDisposable
     private async Task<GrassVmPackage> CreateVmWithDiskAsync(string name)
     {
         var pkg = GrassVmPackage.CreateNew(_root, name);
+        // Windows 11 使用 UEFI；有效的 .grassvm 包必须随附可复制的变量文件，
+        // 否则完整档案导入会被正确拒绝为不完整固件状态。
+        File.WriteAllText(Path.Combine(pkg.FirmwarePath, "VARS.fd"), "vars-template");
         var config = OsProfileLibrary.CreateDefaultConfig("windows-11", name);
         var diskPath = Path.Combine(pkg.DisksPath, "system.qcow2");
         await Ops().CreateSparseQcow2Async(diskPath, 80L * 1024 * 1024 * 1024);
@@ -140,10 +144,11 @@ public class CloneExportTests : IDisposable
     {
         var src = await CreateVmWithDiskAsync("运行中");
         // 运行中 → vm.lock 存在
-        new VmLock(src).Acquire();
+        var vmLock = new VmLock(src);
+        vmLock.Acquire();
         Assert.Throws<GrassCoreException>(() => GrassVmZip.EnsureExportable(src, isRunning: false));
         Assert.Throws<GrassCoreException>(() => GrassVmZip.EnsureExportable(src, isRunning: true));
-        new VmLock(src).Release();
+        vmLock.Release();
         GrassVmZip.EnsureExportable(src, isRunning: false); // 关机后允许
     }
 
@@ -172,6 +177,33 @@ public class CloneExportTests : IDisposable
     }
 
     [Fact]
+    public void Ovf_ExtractOva_RejectsCaseSensitiveTraversal()
+    {
+        // Linux/macOS 区分大小写：../BASE/… 不能因为大小写折叠而被误判为
+        // 位于 base 目录内。Windows 上大小写本来就不改变目录身份，跳过该回归。
+        if (OperatingSystem.IsWindows()) return;
+
+        var baseDir = Path.Combine(_dir, "base");
+        var siblingDir = Path.Combine(_dir, "BASE");
+        Directory.CreateDirectory(baseDir);
+        Directory.CreateDirectory(siblingDir);
+        var ova = Path.Combine(_dir, "case-traversal.ova");
+        using (var output = File.Create(ova))
+        using (var writer = new TarWriter(output, TarEntryFormat.Pax, leaveOpen: false))
+        {
+            var entry = new PaxTarEntry(TarEntryType.RegularFile, "../BASE/escaped.txt")
+            {
+                DataStream = new MemoryStream("escaped"u8.ToArray()),
+            };
+            writer.WriteEntry(entry);
+            entry.DataStream?.Dispose();
+        }
+
+        Assert.Throws<GrassCoreException>(() => OvfImporter.ExtractOva(ova, baseDir));
+        Assert.False(File.Exists(Path.Combine(siblingDir, "escaped.txt")));
+    }
+
+    [Fact]
     public async Task Ovf_RoundTrip_CDAndNetworkMode_Survive()
     {
         // 往返保真：CD/DVD 设备（含介质）与"断开"网卡模式都不能丢——
@@ -179,11 +211,11 @@ public class CloneExportTests : IDisposable
         // 网卡不带模式扩展的话"断开"往返一次就变回 NAT
         var src = await CreateVmWithDiskAsync("光驱机");
         var config = new ConfigStore(src).Load();
-        var iso = Path.Combine(_dir, "install.iso");
+        var iso = Path.Combine(src.Path, "install.iso");
         File.WriteAllBytes(iso, "ISO-DATA"u8.ToArray());
         config.Devices.Add(new CdromDevice
         {
-            IsoPath = iso, // 包外绝对引用（导出只拷介质、不搬原文件）
+            IsoPath = PathPolicy.NormalizeReference(src, iso), // 包内介质可安全随 OVF 导出
             CreatedOrder = 30,
         });
         config.Devices.Add(new CdromDevice { IsoPath = null, CreatedOrder = 31 }); // 空光驱

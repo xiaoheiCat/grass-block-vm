@@ -86,7 +86,7 @@ public sealed class CloneService(TransactionalDiskOps diskOps)
         {
             var config = ConfigJson.Deserialize(snap.FullConfigSnapshot);
             config.Name = newName;
-            // 设备 ID 全部换新：与完整克隆一致。DeviceId 决定派生 MAC/TAP 名——沿用父包 ID
+            // 设备 ID 全部换新：与完整克隆一致。DeviceId 决定派生 MAC——沿用父包 ID
             // 会让克隆与父 VM 同 MAC（"同时运行父与克隆"正是链接克隆的存在意义）。
             var idRemap = new Dictionary<string, string>();
             foreach (var dev in config.Devices)

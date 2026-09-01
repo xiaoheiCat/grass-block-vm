@@ -8,12 +8,16 @@ out/
 build/
 apps/core/**/bin/
 apps/core/**/obj/
+apps/helper/bin/
+apps/helper/obj/
+apps/desktop/core-rundir/
 *.user
 
 # Local .NET SDK & caches (developer-managed, not committed)
 /.dotnet/
 /.dotnet-home/
 /.nuget/
+/.nuget-appdata/
 /.local/
 **/.local/
 /Library/

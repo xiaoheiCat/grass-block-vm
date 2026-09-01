@@ -173,6 +173,40 @@ public class VmLockTests : IDisposable
         Assert.False(l.IsLocked);
         l.Acquire(); // 可以重新接管
     }
+
+    [Fact]
+    public void ForceUnlockByUser_DoesNotReleaseAnotherInstanceHandle()
+    {
+        var pkg = GrassVmPackage.CreateNew(_dir, "Active VM");
+        var owner = new VmLock(pkg);
+        owner.Acquire();
+
+        // 解锁 RPC 会新建 VmLock；它不能拿走当前进程中真正持有者的句柄。
+        var other = new VmLock(pkg);
+        Assert.Throws<VmLockedException>(() => other.ForceUnlockByUser());
+        Assert.True(File.Exists(pkg.LockPath));
+        Assert.Throws<VmLockedException>(() => new VmLock(pkg).Acquire());
+
+        owner.Release();
+        Assert.False(File.Exists(pkg.LockPath));
+    }
+
+    [Fact]
+    public void ReleaseWithoutHandle_DoesNotReleaseAnotherInstanceHandle()
+    {
+        var pkg = GrassVmPackage.CreateNew(_dir, "Active VM Release");
+        var owner = new VmLock(pkg);
+        owner.Acquire();
+
+        // 生命周期清理可能由没有句柄的临时 VmLock 实例触发；它不能从全局表
+        // 拿走真正持有者的句柄，否则会误删仍在使用中的 vm.lock。
+        new VmLock(pkg).Release();
+        Assert.True(File.Exists(pkg.LockPath));
+        Assert.Throws<VmLockedException>(() => new VmLock(pkg).Acquire());
+
+        owner.Release();
+        Assert.False(File.Exists(pkg.LockPath));
+    }
 }
 
 public class AtomicFileTests : IDisposable

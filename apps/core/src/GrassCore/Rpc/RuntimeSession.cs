@@ -25,6 +25,12 @@ public sealed class RuntimeSession
     /// 库可能在 NAS/同步盘上被另一台电脑持有，别机的 PID 在本机必然"不存在"，
     /// 按"死了"清 runtime/放锁会把别人正在运行的 VM 解锁（双开=盘损坏）。</summary>
     public string? MachineId { get; set; }
+    /// <summary>启动意图：Core 在 QEMU 启动后、PID 回写前崩溃时用于候选进程匹配。</summary>
+    public string? QemuExecutablePath { get; set; }
+    public string? CommandLineFingerprint { get; set; }
+    /// <summary>本次 SPICE 会话 ticket。仅存在于 Core 进程内存，不写入 session.json。</summary>
+    [JsonIgnore]
+    public string? SpicePassword { get; set; }
 
     private static readonly JsonSerializerOptions Opts = new()
     {
@@ -56,10 +62,13 @@ public sealed class CoreCrashRecovery
     public sealed record ReadoptResult(GrassVm.GrassVmPackage Package, RuntimeSession Session, bool QemuAlive, bool SessionValid);
 
     private readonly Func<int, bool> _isProcessAlive;
+    private readonly Func<RuntimeSession, bool>? _sessionValidator;
 
-    public CoreCrashRecovery(Func<int, bool>? isProcessAlive = null)
+    public CoreCrashRecovery(Func<int, bool>? isProcessAlive = null,
+        Func<RuntimeSession, bool>? sessionValidator = null)
     {
         _isProcessAlive = isProcessAlive ?? DefaultIsAlive;
+        _sessionValidator = sessionValidator;
     }
 
     private static bool DefaultIsAlive(int pid)
@@ -91,7 +100,8 @@ public sealed class CoreCrashRecovery
                 continue;
             }
             var alive = _isProcessAlive(session.QemuPid);
-            results.Add(new ReadoptResult(pkg, session, alive, SessionValid: alive));
+            var valid = alive && (_sessionValidator?.Invoke(session) ?? true);
+            results.Add(new ReadoptResult(pkg, session, alive, SessionValid: valid));
         }
         return results;
     }

@@ -22,7 +22,9 @@ public class QemuCommandBuilderTests : IDisposable
     public void Dispose() { try { Directory.Delete(_dir, recursive: true); } catch { } }
 
     private static string[] Build(VmConfiguration config, string packagePath, string sessionId = "abc123")
-        => new QemuCommandBuilder(config, Path.Combine(packagePath, "fw")).Build(packagePath, sessionId).Args.ToArray();
+        => new QemuCommandBuilder(config, Path.Combine(packagePath, "fw"))
+            .Build(packagePath, sessionId, spicePassword: "test-spice-password")
+            .Args.ToArray();
 
     [Fact]
     public void Windows11Profile_UsesSataDisk_E1000Nic_UefiTpm_SecureBoot()
@@ -37,13 +39,14 @@ public class QemuCommandBuilderTests : IDisposable
         Assert.Contains("-accel whpx", j);                       // 只使用硬件虚拟化
         Assert.DoesNotContain("tcg", j);                         // 绝不回退 TCG
         Assert.Contains("-cpu max", j);                          // 尽可能使用宿主 CPU 能力
-        Assert.Contains("ide-hd,drive=disk10,bus=ahci0.0", j);   // Windows 系统盘默认 SATA/AHCI
+        Assert.Contains("ide-hd,drive=disk10,bus=ide.0", j);     // Windows 系统盘默认 SATA/AHCI
         Assert.DoesNotContain("virtio-blk", j);
         Assert.Contains("-device e1000,netdev=net", j);          // Windows 原生可识别网卡
         Assert.Contains("OVMF_CODE.secboot.fd", j);              // Secure Boot 固件
         // TPM 参数依赖 GrassCore 先拉起模拟器宿主（Windows 实机阶段交付）；
         // 宿主未就绪时跳过（配置里的意图保留），否则 QEMU 初始化即失败
         Assert.DoesNotContain("tpm-tis", j);
+        Assert.Contains("-vga none", j);                        // 禁止 QEMU 默认再补一张 std VGA
         Assert.Contains("-display none", j);                     // 用户永远看不见 QEMU 自己的窗口
         Assert.Contains("-rtc base=localtime", j);               // Windows 期望本地时间 RTC
     }
@@ -102,9 +105,24 @@ public class QemuCommandBuilderTests : IDisposable
 
         // 默认启动顺序 硬盘 → CD/DVD → 网络启动（区段 bootindex：硬盘 101…、
         // 光驱 201…、网络 301…；空槽位无影响）
-        Assert.Contains("ide-hd,drive=disk10,bus=ahci0.0,bootindex=101", j);
-        Assert.Contains("ide-cd,drive=cd11,bus=ahci0.1,bootindex=201", j);
+        Assert.Contains("ide-hd,drive=disk10,bus=ide.0,bootindex=101", j);
+        Assert.Contains("ide-cd,drive=cd11,bus=ide.1,bootindex=201", j);
         Assert.Contains(",bootindex=301", j); // 网络
+    }
+
+    [Fact]
+    public void Build_ReusedBuilder_IsDeterministic()
+    {
+        var config = OsProfileLibrary.CreateDefaultConfig("ubuntu", "Reusable Builder");
+        config.Devices.Add(new DiskDevice { Path = "disks/system.qcow2", SizeBytes = 8, CreatedOrder = 10 });
+        config.Devices.Add(new DiskDevice { Path = "disks/data.qcow2", SizeBytes = 8, CreatedOrder = 11 });
+        var builder = new QemuCommandBuilder(config, Path.Combine(_pkg.Path, "fw"));
+
+        var first = builder.Build(_pkg.Path, "stable-session", spicePassword: "test-spice-password");
+        var second = builder.Build(_pkg.Path, "stable-session", spicePassword: "test-spice-password");
+
+        Assert.Equal(first.Args, second.Args);
+        Assert.Equal(first.QmpPipeName, second.QmpPipeName);
     }
 
     [Fact]
@@ -133,7 +151,20 @@ public class QemuCommandBuilderTests : IDisposable
         Assert.Equal(@"\\.\pipe\grassvm-qmp-session99", cmd.QmpPipeName);
         Assert.Contains("-chardev pipe,id=qmpchar,path=grassvm-qmp-session99", j); // path=（name= 会让 QEMU 解析即退出）
         Assert.Contains("-mon chardev=qmpchar,mode=control", j);
-        Assert.Contains("addr=127.0.0.1,port=0,disable-ticketing=on", j); // SPICE 只监听本机
+        Assert.Contains("addr=127.0.0.1,port=0,password=", j); // SPICE 只监听本机且启用 ticket
+        Assert.Contains("disable-ticketing=off", j);
+    }
+
+    [Fact]
+    public void ProductionSpice_UsesPerSessionTicket()
+    {
+        var config = OsProfileLibrary.CreateDefaultConfig("ubuntu", "Ticketed VM");
+        var cmd = new QemuCommandBuilder(config, Path.Combine(_pkg.Path, "fw"))
+            .Build(_pkg.Path, "session-ticket", spicePassword: "0123456789abcdef");
+        var j = string.Join(" ", cmd.Args);
+
+        Assert.Contains("addr=127.0.0.1,port=0,password=0123456789abcdef,disable-ticketing=off", j);
+        Assert.DoesNotContain("disable-ticketing=on", j);
     }
 
     [Fact]
@@ -154,9 +185,32 @@ public class QemuCommandBuilderTests : IDisposable
 
         Assert.Contains("-netdev user,id=net", j);      // 默认 NAT
         Assert.Contains("-netdev tap,id=net20", j);     // Host-only 走 TAP
+        Assert.Contains($"ifname={TapNetwork.AdapterName}", j);
+        Assert.DoesNotContain("GrassVM-Tap-", j);       // 不引用安装器未创建的动态名称
         // "断开"= 完全不生成网络参数（QEMU 没有 none 后端，-netdev none 会启动失败）
         Assert.DoesNotContain("net21", j);
         Assert.Equal(2, CountOccurrences(j, "-device virtio-net-pci"));
+    }
+
+    [Fact]
+    public void BridgedNetwork_UsesInstalledTapAdapter_NotPhysicalBridgeSelection()
+    {
+        var config = OsProfileLibrary.CreateDefaultConfig("ubuntu", "Bridged VM");
+        config.Devices.RemoveAll(d => d is NetworkDevice);
+        config.Devices.Add(new NetworkDevice
+        {
+            Mode = NetworkMode.Bridged,
+            BridgeAdapter = "Wi-Fi",
+            CreatedOrder = 20,
+        });
+
+        var j = string.Join(" ", Build(config, _pkg.Path));
+
+        // BridgeAdapter 是宿主物理网卡选择，不是 TAP 设备名称；QEMU 必须使用
+        // 安装器创建并重命名的固定适配器，否则 ifname 不存在会启动失败。
+        Assert.Contains($"-netdev tap,id=net20,ifname={TapNetwork.AdapterName}", j);
+        Assert.DoesNotContain("ifname=Wi-Fi", j);
+        Assert.DoesNotContain("GrassVM-Tap-", j);
     }
 
     [Fact]

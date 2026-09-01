@@ -54,6 +54,16 @@ public static class PathPolicy
 
     private static string ResolveExternalOrPackagePath(GrassVmPackage package, string storedRef)
     {
+        // 配置档案可能来自 Linux/macOS。Windows 的 Path.GetFullPath("/mnt/…")
+        // 会把 POSIX 根路径误解释为当前盘符下的相对路径（例如 D:\mnt\…），
+        // 破坏“包外绝对路径原样保留”的契约；单斜杠 POSIX 路径在这里保持
+        // 原文，双斜杠 UNC 路径仍按 Windows 规则解析。
+        if (OperatingSystem.IsWindows()
+            && storedRef.Length > 1
+            && storedRef[0] == '/'
+            && storedRef[1] != '/')
+            return storedRef;
+
         var full = Path.GetFullPath(storedRef);
         var root = EnsureTrailingSeparator(Path.GetFullPath(package.Path));
         var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
@@ -71,7 +81,14 @@ public static class PathPolicy
         var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
         while (current is not null && !string.Equals(current.FullName, root.TrimEnd(Path.DirectorySeparatorChar), cmp))
         {
-            if ((current.Attributes & FileAttributes.ReparsePoint) != 0) return true;
+            try
+            {
+                if ((File.GetAttributes(current.FullName) & FileAttributes.ReparsePoint) != 0) return true;
+            }
+            catch (FileNotFoundException) { }
+            catch (DirectoryNotFoundException) { }
+            catch (UnauthorizedAccessException) { return true; }
+            catch (IOException) { return true; }
             current = current.Parent;
         }
         return false;

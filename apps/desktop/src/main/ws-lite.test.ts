@@ -36,19 +36,31 @@ async function withServer(fn: (fx: Fixture) => Promise<void>): Promise<void> {
   try {
     await fn({ port, token: wss.token, wss, done: async () => {
       for (const c of wss.clients) c.terminate();
-      server.close();
-      await new Promise((r2) => setTimeout(r2, 30));
+      await closeServer(server);
     } });
   } finally {
     for (const c of wss.clients) c.terminate();
-    server.close();
+    await closeServer(server);
   }
+}
+
+function closeServer(server: http.Server): Promise<void> {
+  if (!server.listening) return Promise.resolve();
+  return new Promise((resolve) => server.close(() => resolve()));
 }
 
 function upgradeAndConnect(port: number, path: string, timeoutMs = 1500): Promise<net.Socket> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('upgrade timeout')), timeoutMs);
+    let timer: NodeJS.Timeout;
+    let settled = false;
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(error);
+    };
     const sock = net.connect(port, '127.0.0.1');
+    timer = setTimeout(() => { sock.destroy(); fail(new Error('upgrade timeout')); }, timeoutMs);
     sock.on('connect', () => {
       sock.write(
         `GET ${path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
@@ -57,13 +69,14 @@ function upgradeAndConnect(port: number, path: string, timeoutMs = 1500): Promis
     });
     sock.once('data', (chunk: Buffer) => {
       clearTimeout(timer);
-      if (chunk.toString().includes('101')) resolve(sock);
-      else reject(new Error(`expected 101, got: ${chunk.toString().split('\r\n')[0]}`));
+      if (chunk.toString().includes('101')) { settled = true; resolve(sock); }
+      else { sock.destroy(); fail(new Error(`expected 101, got: ${chunk.toString().split('\r\n')[0]}`)); }
     });
     sock.once('error', (e) => {
-      clearTimeout(timer);
-      reject(e);
+      sock.destroy();
+      fail(e);
     });
+    sock.once('close', () => { if (!settled) fail(new Error('socket closed before upgrade')); });
   });
 }
 

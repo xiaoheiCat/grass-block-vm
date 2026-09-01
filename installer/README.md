@@ -24,7 +24,9 @@
 C:\Program Files\Grass Block VM\
 ├─ Grass Block VM.exe
 ├─ resources\
-│  ├─ app.asar
+│  ├─ app\                 # 当前发布脚本使用未打包的 Electron app 目录
+│  │  ├─ package.json
+│  │  └─ dist\main + dist\renderer
 │  ├─ GrassCore\GrassCore.exe
 │  ├─ GrassSpiceHelper\GrassSpiceHelper.exe
 │  ├─ QEMU\            # qemu-system-x86_64.exe / qemu-img.exe / DLLs

@@ -10,6 +10,9 @@ import net from 'node:net';
 import { EventEmitter } from 'node:events';
 
 const PIPE_NAME = '\\\\.\\pipe\\grassvm-core';
+const MAX_FRAME_BYTES = 16 * 1024 * 1024;
+
+type BridgeChannel = { writable: NodeJS.WritableStream; readable: NodeJS.ReadableStream };
 
 export class CoreBridge extends EventEmitter {
   private proc: ChildProcess | null = null;
@@ -52,19 +55,31 @@ export class CoreBridge extends EventEmitter {
       }
     } else {
       // 开发机：stdio 直连
-      this.proc = spawn(this.coreExe, [], { stdio: ['pipe', 'pipe', 'inherit'] });
-      this.proc.on('error', () => this.teardownChannel(null, new Error('无法启动 GrassCore。')));
-      this.proc.on('exit', () => this.teardownChannel(null, new Error('GrassCore 已退出。')));
-      this.wire(this.proc.stdin!, this.proc.stdout!);
+      const proc = spawn(this.coreExe, [], { stdio: ['pipe', 'pipe', 'inherit'] });
+      this.proc = proc;
+      const channel = this.wire(proc.stdin!, proc.stdout!);
+      // 进程事件可能滞后到重连之后才到达；必须同时校验进程和通道身份，
+      // 不能用 null 无条件拆掉已经建立的新连接。
+      proc.on('error', () => {
+        if (this.proc === proc) this.teardownChannel(channel, new Error('无法启动 GrassCore。'));
+      });
+      proc.on('exit', () => {
+        if (this.proc === proc) this.teardownChannel(channel, new Error('GrassCore 已退出。'));
+      });
       await this.call('ping');
     }
   }
 
   private spawnCore() {
-    this.proc = spawn(this.coreExe, [], { stdio: 'ignore' });
+    const proc = spawn(this.coreExe, [], { stdio: 'ignore' });
+    this.proc = proc;
     // spawn 失败（路径错误/ENOENT）走 error 事件——没有监听器会变成主进程未捕获异常
-    this.proc.on('error', () => this.teardownChannel(null, new Error('无法启动 GrassCore。')));
-    this.proc.on('exit', (code) => this.emit('core-exit', code));
+    proc.on('error', () => {
+      if (this.proc === proc) this.teardownChannel(this.channel, new Error('无法启动 GrassCore。'));
+    });
+    proc.on('exit', (code) => {
+      if (this.proc === proc) this.emit('core-exit', code);
+    });
   }
 
   private async connectNamedPipe(name: string): Promise<void> {
@@ -76,7 +91,7 @@ export class CoreBridge extends EventEmitter {
     this.wire(socket, socket);
   }
 
-  private wire(writable: NodeJS.WritableStream, readable: NodeJS.ReadableStream): void {
+  private wire(writable: NodeJS.WritableStream, readable: NodeJS.ReadableStream): BridgeChannel {
     const currentChannel = { writable, readable };
     this.channel = currentChannel;
     let buf = Buffer.alloc(0);
@@ -86,7 +101,7 @@ export class CoreBridge extends EventEmitter {
         const len = buf.readInt32LE(0);
         // 帧长合法域（与 Core 端一致）：撕裂帧/脏缓冲会给出天文数字或负数——
         // 照常 slice 会乱吞缓冲，负数直接让 subarray 抛异常炸掉主进程
-        if (!(len > 0 && len <= 64 * 1024 * 1024)) {
+        if (!(len > 0 && len <= MAX_FRAME_BYTES)) {
           this.teardownChannel(currentChannel, new Error('与 GrassCore 的通信帧损坏，正在重连…'));
           return;
         }
@@ -115,11 +130,12 @@ export class CoreBridge extends EventEmitter {
     readable.once('error', onDown);
     (writable as NodeJS.WritableStream & { once?: unknown }).once?.('close', onDown);
     (writable as NodeJS.WritableStream & { once?: unknown }).once?.('error', onDown);
+    return currentChannel;
   }
 
   /** 拆除通道：失败所有在途请求；下次 call 自动重生 Core。忽略来自已过时通道的滞后事件。 */
   private teardownChannel(
-    targetChannel: { writable: NodeJS.WritableStream; readable: NodeJS.ReadableStream } | null,
+    targetChannel: BridgeChannel | null,
     reason: Error,
   ): void {
     if (targetChannel && this.channel !== targetChannel) return;

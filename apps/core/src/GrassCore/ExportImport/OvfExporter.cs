@@ -36,7 +36,8 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
         foreach (var disk in config.Devices.OfType<DiskDevice>())
         {
             idx++;
-            var src = PathPolicy.Resolve(package, disk.Path);
+            var src = ResolveSafeExportFile(package, disk.Path, "硬盘");
+            EnsureBackingChainContained(package, src);
             var href = $"{vmId}-disk{idx}.vmdk";
             var dst = Path.Combine(destDir, href);
             // 清掉上次失败留下的半成品/旧档：convert 内部是 overwrite:false 的原子
@@ -54,7 +55,7 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
         {
             cdOrdinal++;
             if (cd.IsoPath is null) continue;
-            var src = PathPolicy.Resolve(package, cd.IsoPath);
+            var src = ResolveSafeExportFile(package, cd.IsoPath, "光盘镜像");
             if (!File.Exists(src)) continue; // 介质已不在：导出为空光驱（与"弹出"同语义）
             var href = $"{vmId}-cd{cdOrdinal}.iso";
             var dst = Path.Combine(destDir, href);
@@ -72,6 +73,53 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
         return ovfPath;
     }
 
+    private static string ResolveSafeExportFile(GrassVmPackage package, string storedRef, string label)
+    {
+        string path;
+        try { path = PathPolicy.Resolve(package, storedRef); }
+        catch (Exception e) when (e is ArgumentException or IOException)
+        { throw new GrassCoreException($"{label}路径无效，无法导出。请先在设置中重新定位文件。"); }
+
+        var root = Path.GetFullPath(package.Path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+        var full = Path.GetFullPath(path);
+        var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        var insidePackage = full.StartsWith(root, cmp);
+        if (!insidePackage
+            || !File.Exists(full)
+            || (File.GetAttributes(full) & FileAttributes.ReparsePoint) != 0
+            || GrassVmPackage.ContainsReparsePoint(full))
+            throw new GrassCoreException(
+                $"{label}必须是虚拟机包内的普通文件，不能导出包外文件或符号链接。请先将资源移入包内后重试。");
+        return full;
+    }
+
+    private void EnsureBackingChainContained(GrassVmPackage package, string image)
+    {
+        var root = Path.GetFullPath(package.Path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+        var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        var seen = new HashSet<string>(OperatingSystem.IsWindows()
+            ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+        var current = image;
+        for (var depth = 0; depth < 64; depth++)
+        {
+            current = Path.GetFullPath(current);
+            if (!seen.Add(current))
+                throw new GrassCoreException("磁盘 backing 链存在循环引用，无法导出。");
+            var backing = diskOps.QueryBackingFileStrict(current);
+            if (backing is null) return;
+            var full = Path.GetFullPath(backing);
+            if (!full.StartsWith(root, cmp)
+                || !File.Exists(full)
+                || (File.GetAttributes(full) & FileAttributes.ReparsePoint) != 0
+                || GrassVmPackage.ContainsReparsePoint(full))
+                throw new GrassCoreException("磁盘 backing 链引用了包外文件或符号链接，无法安全导出。");
+            current = full;
+        }
+        throw new GrassCoreException("磁盘 backing 链过深，无法安全导出。");
+    }
+
     /// <summary>OVA = ovf + vmdk 打 tar。旧档案先保底再替换（与 zip 导出同一策略）。</summary>
     public async Task<string> ExportOvaAsync(GrassVmPackage package, string ovaPath, string workDir, CancellationToken ct = default)
     {
@@ -82,7 +130,27 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
         try
         {
             await ExportAsync(package, dir, ct);
-            await TarFile.CreateFromDirectoryAsync(dir, tempOva, includeBaseDirectory: false, ct);
+            // OVA 的第一个 tar 条目必须是 OVF descriptor，便于流式导入器在
+            // 尚未下载完大磁盘时先读到硬件描述。CreateFromDirectory 的枚举顺序
+            // 不提供此保证，显式用 TarWriter 固定 ovf → 其它资源的顺序。
+            await using (var output = File.Create(tempOva))
+            await using (var writer = new TarWriter(output, TarEntryFormat.Pax, leaveOpen: false))
+            {
+                var files = Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories)
+                    .OrderBy(path => string.Equals(Path.GetExtension(path), ".ovf", StringComparison.OrdinalIgnoreCase) ? 0 : 1)
+                    .ThenBy(path => Path.GetRelativePath(dir, path), StringComparer.OrdinalIgnoreCase);
+                foreach (var file in files)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var rel = Path.GetRelativePath(dir, file).Replace('\\', '/');
+                    var entry = new PaxTarEntry(TarEntryType.RegularFile, rel)
+                    {
+                        DataStream = File.OpenRead(file),
+                    };
+                    try { await writer.WriteEntryAsync(entry, ct); }
+                    finally { entry.DataStream?.Dispose(); }
+                }
+            }
             if (hadOld) File.Move(ovaPath, backup);
             try { File.Move(tempOva, ovaPath); }
             catch
@@ -105,10 +173,12 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
     {
         var ovfNs = XNamespace.Get("http://schemas.dmtf.org/ovf/envelope/1");
         var rasdNs = XNamespace.Get("http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_ResourceAllocationSettingData");
+        var vssdNs = XNamespace.Get("http://schemas.dmtf.org/wbem/wscim/1/cim-schema/2/CIM_VirtualSystemSettingData");
         var xsiNs = XNamespace.Get("http://www.w3.org/2001/XMLSchema-instance");
 
         var refs = new XElement(ovfNs + "References");
-        var diskSection = new XElement(ovfNs + "DiskSection");
+        var diskSection = new XElement(ovfNs + "DiskSection",
+            new XElement(ovfNs + "Info", "Virtual disk information"));
         foreach (var (href, size, capacity) in disks)
         {
             var id = "vmdk" + (disks.FindIndex(d => d.Href == href) + 1);
@@ -135,6 +205,9 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
         }
 
         var vs = new XElement(ovfNs + "VirtualSystem", new XAttribute(ovfNs + "id", vmId),
+            // OVF schema 将 VirtualSystem/Info 作为必需的第一项；补齐它可避免
+            // 严格导入器（例如部分 VMware/VirtualBox 版本）把描述当成非法结构。
+            new XElement(ovfNs + "Info", "Virtual machine"),
             new XElement(ovfNs + "Name", config.Name),
             // 系统 Profile（固件 UEFI/BIOS、SecureBoot、TPM、芯片组/总线形态的来源）：
             // 不带它的话导入端一律按 "other"（BIOS/pc/IDE）处理——UEFI 装的客户机
@@ -145,7 +218,7 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
         foreach (var (href, _, capacity) in disks)
         {
             var id = "vmdk" + (disks.FindIndex(d => d.Href == href) + 1);
-            vs.Add(Item(rasdNs, 17, "Hard Disk " + (++order),
+            vs.Add(Item(ovfNs, rasdNs, 17, "Hard Disk " + (++order),
                 new XElement(rasdNs + "HostResource", $"ovf:/disk/disk{id}"),
                 new XElement(rasdNs + "VirtualQuantity", capacity)));
         }
@@ -160,12 +233,12 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
             var hasMedium = isos.Any(i => i.CdOrdinal == cdIdx);
             if (hasMedium)
             {
-                vs.Add(Item(rasdNs, 15, "CD/DVD " + cdIdx,
+                vs.Add(Item(ovfNs, rasdNs, 15, "CD/DVD " + cdIdx,
                     new XElement(rasdNs + "HostResource", $"ovf:/file/fileiso{cdIdx}")));
             }
             else
             {
-                vs.Add(Item(rasdNs, 15, "CD/DVD " + cdIdx));
+                vs.Add(Item(ovfNs, rasdNs, 15, "CD/DVD " + cdIdx));
             }
         }
         // 网卡：数量与模式都要带——导入端对"没有网卡 Item"的档案会补一块默认 NAT，
@@ -174,14 +247,19 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
         foreach (var nic in config.Devices.OfType<NetworkDevice>())
         {
             nicIdx++;
-            vs.Add(Item(rasdNs, 10, "Ethernet " + nicIdx,
-                new XElement(GvmNs + "NetworkMode", nic.Mode.ToString())));
+            var networkItem = Item(ovfNs, rasdNs, 10, "Ethernet " + nicIdx,
+                new XElement(GvmNs + "NetworkMode", nic.Mode.ToString()));
+            if (!string.IsNullOrWhiteSpace(nic.VirtualNetworkId))
+                networkItem.Add(new XElement(GvmNs + "VirtualNetworkId", nic.VirtualNetworkId));
+            if (!string.IsNullOrWhiteSpace(nic.BridgeAdapter))
+                networkItem.Add(new XElement(GvmNs + "BridgeAdapter", nic.BridgeAdapter));
+            vs.Add(networkItem);
         }
         // USB 控制器：OVF ResourceType 21 有标准映射。只导出【启用】的——
         // 停用状态用 gvm:Usb/@enabled 表达（下方），写成启用的 Item 会被
         // 导入端原样当启用设备，往返一次就把用户关掉的 USB 悄悄打开
         if (config.Devices.OfType<UsbControllerDevice>().Any(d => d.Enabled))
-            vs.Add(Item(rasdNs, 21, "USB Controller"));
+            vs.Add(Item(ovfNs, rasdNs, 21, "USB Controller"));
         // 声卡/USB 的启停状态（OVF 没有对应资源类型）：总是写出，导入端只在
         // 元素缺失（第三方信封）时才按 Profile 默认补齐——用户关掉的设备必须
         // 保持关闭，这是"忠实保留原虚拟硬件"的一部分
@@ -189,8 +267,8 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
             new XAttribute("enabled", config.Devices.OfType<UsbControllerDevice>().FirstOrDefault()?.Enabled ?? false)));
         vs.Add(new XElement(GvmNs + "Audio",
             new XAttribute("enabled", config.Devices.OfType<GrassCore.Config.AudioDevice>().FirstOrDefault()?.Enabled ?? false)));
-        vs.Add(Item(rasdNs, 3, "Virtual CPU", new XElement(rasdNs + "VirtualQuantity", config.CpuCores)));
-        vs.Add(Item(rasdNs, 4, "Memory", new XElement(rasdNs + "AllocationUnits", "MegaBytes"),
+        vs.Add(Item(ovfNs, rasdNs, 3, "Virtual CPU", new XElement(rasdNs + "VirtualQuantity", config.CpuCores)));
+        vs.Add(Item(ovfNs, rasdNs, 4, "Memory", new XElement(rasdNs + "AllocationUnits", "MegaBytes"),
             new XElement(rasdNs + "VirtualQuantity", config.MemoryMiB)));
 
         // Raw/兼容设备：OVF 标准没有对应资源类型——用扩展元素（gvm:QemuArgs，每行一个参数）
@@ -202,12 +280,30 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
             var argsEl = new XElement(GvmNs + "QemuArgs", string.Join("\n", raw.Arguments));
             if (raw.Unsupported)
                 argsEl.Add(new XAttribute("unsupported", "true"));
-            vs.Add(Item(rasdNs, 1, string.IsNullOrEmpty(raw.Label) ? "兼容设备" : raw.Label, argsEl));
+            vs.Add(Item(ovfNs, rasdNs, 1, string.IsNullOrEmpty(raw.Label) ? "兼容设备" : raw.Label, argsEl));
+        }
+
+        // OVF 规范要求硬件 Item 位于 VirtualHardwareSection 内。自有导入器用
+        // Descendants 兼容了旧版直挂形态，但标准 VMware/VirtualBox 工具会忽略
+        // 直挂的 Item；在导出边界生成规范结构，保证跨工具互操作。
+        var hardwareItems = vs.Elements(ovfNs + "Item").ToList();
+        if (hardwareItems.Count > 0)
+        {
+            foreach (var item in hardwareItems) item.Remove();
+            vs.Add(new XElement(ovfNs + "VirtualHardwareSection",
+                new XElement(ovfNs + "Info", "Virtual hardware requirements"),
+                new XElement(ovfNs + "System",
+                    new XElement(vssdNs + "ElementName", config.Name),
+                    new XElement(vssdNs + "InstanceID", "0"),
+                    new XElement(vssdNs + "VirtualSystemIdentifier", vmId),
+                    new XElement(vssdNs + "VirtualSystemType", "qemu")),
+                hardwareItems));
         }
 
         var env = new XElement(ovfNs + "Envelope",
             new XAttribute(XNamespace.Xmlns + "ovf", ovfNs),
             new XAttribute(XNamespace.Xmlns + "rasd", rasdNs),
+            new XAttribute(XNamespace.Xmlns + "vssd", vssdNs),
             new XAttribute(XNamespace.Xmlns + "xsi", xsiNs),
             new XAttribute(XNamespace.Xmlns + "gvm", GvmNs),
             // 出处标记：导入端只信任带此标记档案的 gvm:QemuArgs（那是我们自己的
@@ -218,9 +314,10 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
         return env.ToString(SaveOptions.None);
     }
 
-    private static XElement Item(XNamespace rasdNs, int resourceType, string caption, params XElement[] extra)
+    private static XElement Item(XNamespace ovfNs, XNamespace rasdNs, int resourceType, string caption, params XElement[] extra)
     {
-        var item = new XElement(rasdNs + "Item",
+        var item = new XElement(ovfNs + "Item",
+            new XElement(rasdNs + "InstanceID", caption),
             new XElement(rasdNs + "Caption", caption),
             new XElement(rasdNs + "ResourceType", resourceType));
         foreach (var e in extra) item.Add(e);

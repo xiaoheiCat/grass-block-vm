@@ -63,4 +63,14 @@ public class TransportLoopbackTests
         }));
         Assert.All(results, r => Assert.True(r.hasCpu, $"并发序列化丢字段：{r.i}"));
     }
+
+    [Fact]
+    public async Task Receive_Rejects_Overlarge_Frame_Before_Allocating_Payload()
+    {
+        var prefix = BitConverter.GetBytes(JsonRpcConnection.MaxFrameBytes + 1);
+        await using var stream = new MemoryStream(prefix);
+        var conn = new JsonRpcConnection(stream);
+
+        await Assert.ThrowsAsync<IOException>(() => conn.ReceiveAsync());
+    }
 }

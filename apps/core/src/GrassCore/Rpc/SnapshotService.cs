@@ -367,6 +367,10 @@ public static class SnapshotService
         };
         var tree = LoadTree(package);
         var state = VmState.Load(package);
+        // 快照目录需要在任何冻结副本（包括 UEFI VARS.fd）写入前存在。
+        // diskOps=null 的元数据模式不会经过 WriteFreezeIntent/磁盘循环，
+        // 但仍必须能够保存变量状态，不能让复制因目录不存在而失败。
+        Directory.CreateDirectory(System.IO.Path.Combine(package.SnapshotsPath, snap.Uuid));
         // 父 = 当前工作位置（恢复之后的位置）；没有位置记录时退回树上最新叶。
         // 大小写语义与树一致（OrdinalIgnoreCase）
         var parent = state.CurrentSnapshotUuid is not null
@@ -626,7 +630,16 @@ public static class SnapshotService
         var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
         if (!path.StartsWith(dir + Path.DirectorySeparatorChar, cmp)) return false;
         for (var current = new DirectoryInfo(path); current is not null && !string.Equals(current.FullName, dir, cmp); current = current.Parent)
-            if ((current.Attributes & FileAttributes.ReparsePoint) != 0) return false;
+        {
+            try
+            {
+                if ((File.GetAttributes(current.FullName) & FileAttributes.ReparsePoint) != 0) return false;
+            }
+            catch (FileNotFoundException) { }
+            catch (DirectoryNotFoundException) { }
+            catch (UnauthorizedAccessException) { return false; }
+            catch (IOException) { return false; }
+        }
         return true;
     }
 

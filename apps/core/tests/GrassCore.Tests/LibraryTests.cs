@@ -211,6 +211,29 @@ public class LibraryAndHostDbTests : IDisposable
     }
 
     [Fact]
+    public void CoreCrashRecovery_RejectsForeignMachineSession_WhenValidatorProvided()
+    {
+        var root = Path.Combine(_dir, "root-machine");
+        Directory.CreateDirectory(root);
+        var pkg = GrassVmPackage.CreateNew(root, "Foreign VM");
+        new VmLock(pkg).Acquire();
+        Directory.CreateDirectory(pkg.RuntimePath);
+        File.WriteAllText(pkg.SessionPath, new RuntimeSession
+        {
+            SessionId = "foreign", QmpPipe = @"\\.\pipe\grassvm-qmp-foreign",
+            StartedAt = DateTimeOffset.UtcNow, QemuPid = 4242, MachineId = "other-machine",
+        }.Serialize());
+
+        var recovery = new CoreCrashRecovery(
+            isProcessAlive: pid => pid == 4242,
+            sessionValidator: s => s.MachineId == "this-machine");
+
+        var result = Assert.Single(recovery.ScanAdoptable(root));
+        Assert.True(result.QemuAlive);
+        Assert.False(result.SessionValid);
+    }
+
+    [Fact]
     public void IntegrityCheck_MissingDirsAreSafeRepairs_UnknownFilesUntouched()
     {
         var root = Path.Combine(_dir, "root");

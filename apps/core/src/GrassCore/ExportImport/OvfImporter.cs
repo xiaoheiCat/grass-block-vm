@@ -183,7 +183,25 @@ public sealed class OvfImporter(TransactionalDiskOps diskOps, string? ovmfVarsTe
                     var mode = NetworkMode.Nat;
                     if (modeEl is not null && Enum.TryParse<NetworkMode>(modeEl.Value.Trim(), ignoreCase: true, out var m))
                         mode = m;
-                    config.Devices.Add(new NetworkDevice { Mode = mode, CreatedOrder = ++order });
+                    var virtualNetworkId = item.Elements().FirstOrDefault(e => e.Name.LocalName == "VirtualNetworkId"
+                        && e.Name.Namespace == OvfExporter.GvmNs)?.Value.Trim();
+                    var bridgeAdapter = item.Elements().FirstOrDefault(e => e.Name.LocalName == "BridgeAdapter"
+                        && e.Name.Namespace == OvfExporter.GvmNs)?.Value.Trim();
+                    // Host-only 是宿主级资源，第三方 OVF 不可能携带本机 network id。
+                    // 不留下一个启动必崩的 HostOnly(null)：安全降级为断开并给出可见
+                    // 警告，待用户在网络设置中重新选择宿主虚拟网络。
+                    if (mode == NetworkMode.HostOnly && string.IsNullOrWhiteSpace(virtualNetworkId))
+                    {
+                        warnings.Add($"网卡 #{config.Devices.OfType<NetworkDevice>().Count() + 1} 的 Host-only 网络无法随 OVF 携带，已暂时断开；请在网络设置中重新选择宿主虚拟网络。");
+                        mode = NetworkMode.Disconnected;
+                    }
+                    config.Devices.Add(new NetworkDevice
+                    {
+                        Mode = mode,
+                        VirtualNetworkId = virtualNetworkId,
+                        BridgeAdapter = bridgeAdapter,
+                        CreatedOrder = ++order,
+                    });
                     break;
                 }
                 case ResCdDvd:
@@ -467,8 +485,46 @@ public sealed class OvfImporter(TransactionalDiskOps diskOps, string? ovmfVarsTe
     /// <summary>解 OVA（tar）到目录，返回其中的 .ovf 文档路径。</summary>
     public static string ExtractOva(string ovaPath, string destDir)
     {
+        if (GrassVmPackage.ContainsReparsePoint(destDir))
+            throw new GrassCoreException("OVA 解压目录不能通过符号链接或目录联接访问。");
         Directory.CreateDirectory(destDir);
-        TarFile.ExtractToDirectory(ovaPath, destDir, overwriteFiles: true);
+        const int maxEntries = 100_000;
+        const long maxEntryBytes = 128L * 1024 * 1024 * 1024;
+        const long maxTotalBytes = 512L * 1024 * 1024 * 1024;
+        long total = 0;
+        using var input = File.OpenRead(ovaPath);
+        using var reader = new TarReader(input);
+        TarEntry? entry;
+        var count = 0;
+        var root = Path.GetFullPath(destDir);
+        var rootPrefix = root.EndsWith(Path.DirectorySeparatorChar)
+            || root.EndsWith(Path.AltDirectorySeparatorChar)
+            ? root
+            : root + Path.DirectorySeparatorChar;
+        var pathComparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        while ((entry = reader.GetNextEntry()) is not null)
+        {
+            if (++count > maxEntries) throw new GrassCoreException("OVA 条目数量超过安全上限。");
+            var name = entry.Name.Replace('/', Path.DirectorySeparatorChar);
+            var target = Path.GetFullPath(Path.Combine(destDir, name));
+            // OVA 是不可信的 tar：路径边界必须按宿主文件系统的大小写语义检查。
+            // Linux/macOS 上若固定使用 OrdinalIgnoreCase，../BASE/evil 会被当成
+            // 位于 base 目录内；随后 ExtractToFile 可把文件写到其兄弟目录。
+            if (!target.StartsWith(rootPrefix, pathComparison))
+                throw new GrassCoreException("OVA 包含非法路径，已拒绝导入。");
+            if (entry.EntryType is TarEntryType.Directory) { Directory.CreateDirectory(target); continue; }
+            // Tar 可以携带符号链接、硬链接和设备节点。不能把这些条目交给
+            // ExtractToFile：它们可能在解包阶段重新指向 destDir 外部，或把宿主
+            // 设备暴露成普通文件。OVA 导入只接受普通文件与目录。
+            if (entry.EntryType is not TarEntryType.RegularFile)
+                throw new GrassCoreException("OVA 包含不支持的链接或特殊文件条目，已拒绝导入。");
+            if (entry.Length > maxEntryBytes || (total = checked(total + entry.Length)) > maxTotalBytes)
+                throw new GrassCoreException("OVA 解压内容超过安全配额，已拒绝导入。");
+            Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            entry.ExtractToFile(target, overwrite: true);
+        }
         var ovf = Directory.EnumerateFiles(destDir, "*.ovf", SearchOption.AllDirectories).FirstOrDefault();
         // tar 条目路径安全：ExtractToDirectory 已做路径规范化；额外校验不逃逸
         return ovf ?? throw new GrassCoreException("OVA 中找不到 .ovf 描述文件。");
@@ -559,6 +615,8 @@ public sealed class OvfImporter(TransactionalDiskOps diskOps, string? ovmfVarsTe
             // 绝对路径：直接不算档案内容（哪怕真实存在）
             if (Path.IsPathRooted(decoded)) return null;
             var root = Path.GetFullPath(baseDir);
+            if (Directory.Exists(root) && (File.GetAttributes(root) & FileAttributes.ReparsePoint) != 0)
+                return null;
             var resolved = Path.GetFullPath(Path.Combine(root, decoded));
             // 前缀比较的大小写语义跟着文件系统走：Windows/原生不区分大小写 →
             // OrdinalIgnoreCase；Linux（区分大小写）必须 Ordinal——../BASE 这种
@@ -579,9 +637,17 @@ public sealed class OvfImporter(TransactionalDiskOps diskOps, string? ovmfVarsTe
     private static bool HasReparsePointBetween(string root, string path)
     {
         var current = new DirectoryInfo(path);
-        while (current is not null && !string.Equals(current.FullName, root, StringComparison.OrdinalIgnoreCase))
+        var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        while (current is not null && !string.Equals(current.FullName, root, cmp))
         {
-            if ((current.Attributes & FileAttributes.ReparsePoint) != 0) return true;
+            try
+            {
+                if ((File.GetAttributes(current.FullName) & FileAttributes.ReparsePoint) != 0) return true;
+            }
+            catch (FileNotFoundException) { }
+            catch (DirectoryNotFoundException) { }
+            catch (UnauthorizedAccessException) { return true; }
+            catch (IOException) { return true; }
             current = current.Parent;
         }
         return false;

@@ -34,13 +34,20 @@ interface VmConfigView {
     path?: string;
     sizeBytes?: number;
     isoPath?: string | null;
+    hostPath?: string;
+    displayName?: string;
+    readOnly?: boolean;
     mode?: string;
+    virtualNetworkId?: string | null;
+    bridgeAdapter?: string | null;
     enabled?: boolean;
   }>;
 }
 
 interface GrassApi {
   coreCall<T = unknown>(method: string, params?: unknown): Promise<T>;
+  pickOpenFile(filterName: string, extensions: string[]): Promise<string | null>;
+  pickDirectory(): Promise<string | null>;
 }
 
 const api: GrassApi | undefined = (window as unknown as { grassvm?: GrassApi }).grassvm;
@@ -60,6 +67,7 @@ export function VmSettings(props: { vm: VmSummary; onClose(): void }): React.Rea
   const [cpu, setCpu] = useState(0);
   const [mem, setMem] = useState(0);
   const [hostInfo, setHostInfo] = useState<{ cpuCores: number; memoryMiB: number } | null>(null);
+  const [networks, setNetworks] = useState<Array<{ id: string; name: string; subnet: string }>>([]);
 
   useEffect(() => {
     (async () => {
@@ -70,6 +78,7 @@ export function VmSettings(props: { vm: VmSummary; onClose(): void }): React.Rea
         setCpu(c.cpuCores);
         setMem(c.memoryMiB);
         setHostInfo(await api.coreCall<{ cpuCores: number; memoryMiB: number }>('getHostInfo'));
+        setNetworks(await api.coreCall<Array<{ id: string; name: string; subnet: string }>>('listNetworks'));
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
       }
@@ -110,6 +119,13 @@ export function VmSettings(props: { vm: VmSummary; onClose(): void }): React.Rea
     setter(v);
     setDirty(true);
   };
+  const updateDevice = useCallback((deviceId: string, patch: Record<string, unknown>) => {
+    setConfig((current) => current ? {
+      ...current,
+      devices: current.devices.map((device) => device.deviceId === deviceId ? { ...device, ...patch } : device),
+    } : current);
+    setDirty(true);
+  }, []);
 
   return (
     <div className="modal-backdrop">
@@ -175,8 +191,10 @@ export function VmSettings(props: { vm: VmSummary; onClose(): void }): React.Rea
               locked: lockedNow,
               vmPath: props.vm.path,
               autostart: props.vm.hasAutostart ?? false,
+              networks,
               setCpu: edit(setCpu),
               setMem: edit(setMem),
+              updateDevice,
               onSave,
               onResized: reloadConfig,
             })}
@@ -197,8 +215,10 @@ interface PaneProps {
   locked: boolean;
   vmPath: string;
   autostart: boolean;
+  networks: Array<{ id: string; name: string; subnet: string }>;
   setCpu(v: number): void;
   setMem(v: number): void;
+  updateDevice(deviceId: string, patch: Record<string, unknown>): void;
   onSave(): void;
   /** 扩容等 Core 侧改写配置的操作完成后调用：重新拉取整份配置，避免后续保存把
    *  对话框里的旧快照（旧 sizeBytes）写回去 */
@@ -278,15 +298,25 @@ function renderPane(d: (typeof DEVICE_ORDER)[number], locked: boolean, p: PanePr
           {(p.config?.devices ?? [])
             .filter((dev) => dev.deviceType === 'disk')
             .map((dev, i) => (
-              <DiskResizeRow
-                key={dev.deviceId}
-                vmPath={p.vmPath}
-                deviceId={dev.deviceId}
-                index={i}
-                currentGiB={Math.round((dev.sizeBytes ?? 0) / 1024 / 1024 / 1024)}
-                locked={p.locked}
-                onResized={p.onResized}
-              />
+              <React.Fragment key={dev.deviceId}>
+                <DiskResizeRow
+                  vmPath={p.vmPath}
+                  deviceId={dev.deviceId}
+                  index={i}
+                  currentGiB={Math.round((dev.sizeBytes ?? 0) / 1024 / 1024 / 1024)}
+                  locked={p.locked}
+                  onResized={p.onResized}
+                />
+                {dev.path && (
+                  <RelocateResourceButton
+                    vmPath={p.vmPath}
+                    deviceId={dev.deviceId}
+                    deviceType="disk"
+                    disabled={p.locked}
+                    onDone={p.onResized}
+                  />
+                )}
+              </React.Fragment>
             ))}
           <p>硬盘容量只能扩大，不能缩小。扩大后需要在客户机内自行扩展分区。</p>
         </>
@@ -299,6 +329,14 @@ function renderPane(d: (typeof DEVICE_ORDER)[number], locked: boolean, p: PanePr
             .map((dev, i) => (
               <p key={dev.deviceId}>
                 CD/DVD #{i + 1}：{dev.isoPath ? dev.isoPath.split(/[\\/]/).pop() : '空（无介质）'}
+                {dev.isoPath && (
+                  <RelocateResourceButton
+                    vmPath={p.vmPath}
+                    deviceId={dev.deviceId}
+                    deviceType="cdrom"
+                    onDone={p.onResized}
+                  />
+                )}
               </p>
             ))}
           <p>CD/DVD 可以在运行中更换或取出镜像（即插即用）。</p>
@@ -311,11 +349,58 @@ function renderPane(d: (typeof DEVICE_ORDER)[number], locked: boolean, p: PanePr
           {(p.config?.devices ?? [])
             .filter((dev) => dev.deviceType === 'network')
             .map((dev, i) => (
-              <p key={dev.deviceId}>
-                网卡 #{i + 1}：{networkModeLabel(dev.mode)}
-              </p>
+              <div className="field" key={dev.deviceId}>
+                <label className="file-row">
+                  <span>网卡 #{i + 1}</span>
+                  <select
+                    value={dev.mode ?? 'nat'}
+                    disabled={locked}
+                    onChange={(e) => {
+                      const mode = e.target.value;
+                      const firstNetwork = p.networks[0]?.id ?? null;
+                      p.updateDevice(dev.deviceId, {
+                        mode,
+                        virtualNetworkId: mode === 'hostOnly' ? (dev.virtualNetworkId ?? firstNetwork) : null,
+                        bridgeAdapter: mode === 'bridged' ? (dev.bridgeAdapter ?? null) : null,
+                      });
+                    }}
+                  >
+                    <option value="nat">NAT（默认）</option>
+                    <option value="bridged">桥接</option>
+                    <option value="hostOnly" disabled={p.networks.length === 0}>Host-only</option>
+                    <option value="disconnected">断开</option>
+                  </select>
+                </label>
+                {dev.mode === 'hostOnly' && (
+                  <label className="file-row">
+                    <span>虚拟网络</span>
+                    <select
+                      value={dev.virtualNetworkId ?? ''}
+                      disabled={locked}
+                      onChange={(e) => p.updateDevice(dev.deviceId, { virtualNetworkId: e.target.value })}
+                    >
+                      {p.networks.map((network) => (
+                        <option key={network.id} value={network.id}>{network.name}（{network.subnet}）</option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                {dev.mode === 'bridged' && (
+                  <label className="file-row">
+                    <span>宿主网卡</span>
+                    <input
+                      type="text"
+                      value={dev.bridgeAdapter ?? ''}
+                      placeholder="留空自动选择"
+                      disabled={locked}
+                      onChange={(e) => p.updateDevice(dev.deviceId, { bridgeAdapter: e.target.value || null })}
+                    />
+                  </label>
+                )}
+              </div>
             ))}
           <p>每张网卡可独立选择：NAT（默认，开箱即用）/ 桥接 / Host-only / 断开。</p>
+          <button className="btn-primary" disabled={locked || !p.dirty} onClick={p.onSave}>保存网络设置</button>
         </>
       );
     case 'display':
@@ -339,6 +424,20 @@ function renderPane(d: (typeof DEVICE_ORDER)[number], locked: boolean, p: PanePr
       return (
         <>
           {lock}
+          {(p.config?.devices ?? [])
+            .filter((dev) => dev.deviceType === 'sharedFolder')
+            .map((dev, i) => (
+              <div className="field" key={dev.deviceId}>
+                <p>共享文件夹 #{i + 1}：{dev.hostPath || '未设置路径'}{dev.readOnly ? '（只读）' : ''}</p>
+                <RelocateResourceButton
+                  vmPath={p.vmPath}
+                  deviceId={dev.deviceId}
+                  deviceType="sharedFolder"
+                  disabled={p.locked}
+                  onDone={p.onResized}
+                />
+              </div>
+            ))}
           <p>共享文件夹默认可读写，可单独勾选只读。需要客户机帮助程序。</p>
         </>
       );
@@ -351,6 +450,53 @@ function renderPane(d: (typeof DEVICE_ORDER)[number], locked: boolean, p: PanePr
     case 'autostart':
       return <AutostartPane vmPath={p.vmPath} initial={p.autostart} />;
   }
+}
+
+/** 资源失效后的永久重定位入口：路径选择与写回都经过 Core。 */
+function RelocateResourceButton(props: {
+  vmPath: string;
+  deviceId: string;
+  deviceType: 'disk' | 'cdrom' | 'sharedFolder';
+  disabled?: boolean;
+  onDone(): void;
+}): React.ReactElement {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  return (
+    <span className="resource-relocate">
+      <button
+        className="btn-ghost"
+        disabled={props.disabled || busy}
+        onClick={async () => {
+          if (!api) return;
+          setBusy(true);
+          try {
+            const picked = props.deviceType === 'sharedFolder'
+              ? await api.pickDirectory()
+              : await api.pickOpenFile(
+                props.deviceType === 'cdrom' ? '光盘镜像（ISO）' : '虚拟硬盘',
+                props.deviceType === 'cdrom' ? ['iso'] : ['qcow2', 'vmdk', 'vdi', 'vhd', 'vhdx', 'img'],
+              );
+            if (!picked) return;
+            await api.coreCall('relocateResource', {
+              packagePath: props.vmPath,
+              deviceId: props.deviceId,
+              newPath: picked,
+            });
+            setError(null);
+            props.onDone();
+          } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        {busy ? '处理中…' : '重新定位…'}
+      </button>
+      {error && <span className="hint">{error}</span>}
+    </span>
+  );
 }
 
 /** 硬盘扩容行：resizeDisk 走 Core（QCOW2 resize，只扩大） */
