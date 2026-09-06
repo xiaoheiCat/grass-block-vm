@@ -1,0 +1,423 @@
+using System.Diagnostics;
+using System.Text.Json;
+using GrassCore.Library;
+using GrassCore.Qemu;
+using GrassCore.Rpc;
+using Xunit;
+
+namespace GrassCore.Tests;
+
+/// <summary>
+/// GrassCoreService 级别的挂起/恢复集成测试（假 QEMU 进程 + 假 QMP 服务 + 假 qemu-img）。
+/// 验证：startVm → powerAction(suspend) 的 stop/migrate/quit 序列、suspend.state 与指纹落盘、
+/// vm.lock 释放、resumeVm 的 -incoming 参数与状态清理。
+/// </summary>
+public class SuspendResumeServiceTests : IDisposable
+{
+    private readonly string _dir = Path.Combine(Path.GetTempPath(), "grassvm-tests-" + Guid.NewGuid().ToString("N"));
+
+    public SuspendResumeServiceTests() => Directory.CreateDirectory(_dir);
+    public void Dispose() { try { Directory.Delete(_dir, recursive: true); } catch { } }
+
+    private sealed class RecordingLauncher : IQemuProcessLauncher, IDisposable
+    {
+        public List<QemuCommandLine> Commands { get; } = new();
+        private readonly List<Process> _processes = new();
+        public Process Start(QemuCommandLine cmd)
+        {
+            lock (Commands) Commands.Add(cmd);
+            // 假 QEMU 进程：真实 OS 进程，保证 Process API 语义一致。
+            // Windows runner 上 cmd /c timeout 偶发因控制台/作业回收提前退出；
+            // ping 回环地址不依赖交互输入，能稳定保持指定时长。
+            var psi = new ProcessStartInfo
+            {
+                FileName = OperatingSystem.IsWindows() ? "ping.exe" : "sleep",
+                Arguments = OperatingSystem.IsWindows() ? "-n 601 127.0.0.1" : "600",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                // 不继承测试宿主的输出管道（否则子进程会撑住 vstest 的 EOF 造成挂起）
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            var process = Process.Start(psi)!;
+            // ping 会持续写标准输出；重定向后必须持续消费，否则管道缓冲区
+            // 填满会让假 QEMU 阻塞，进而使退出监视测试永久等待。
+            process.OutputDataReceived += (_, _) => { };
+            process.ErrorDataReceived += (_, _) => { };
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            lock (_processes) _processes.Add(process);
+            return process;
+        }
+
+        public void Dispose()
+        {
+            Process[] processes;
+            lock (_processes)
+            {
+                processes = _processes.ToArray();
+                _processes.Clear();
+            }
+            foreach (var process in processes)
+            {
+                try
+                {
+                    if (!process.HasExited) process.Kill(entireProcessTree: true);
+                }
+                catch (InvalidOperationException) { }
+                catch (ArgumentException) { }
+                try { process.WaitForExit(2000); } catch (InvalidOperationException) { }
+                process.Dispose();
+            }
+        }
+    }
+
+    private string CreateFakeQemuImg() => FakeQemuImg.Create(_dir);
+
+    [Fact]
+    public async Task Suspend_SavesStateAndFingerprint_ThenResumeUsesIncoming()
+    {
+        using var fakeQmp = new FakeQmpServer();
+        var migrateQueries = 0; // 闭包计数（真实时序：先 active 再 completed）
+        GrassVm.GrassVmPackage? testPkg = null; // CreateVm 之后赋值（quit 处理要用）
+        fakeQmp.OnCommand = (cmd, doc) =>
+        {
+            // 真实 QEMU 的 migrate file: 会把完整状态写入目标文件；假服务模拟这一副作用
+            if (cmd == "migrate" && doc.RootElement.TryGetProperty("arguments", out var args))
+            {
+                var uri = args.TryGetProperty("uri", out var u) ? u.GetString() : null;
+                if (uri?.StartsWith("file:") == true)
+                    File.WriteAllBytes(uri["file:".Length..], "saved-state"u8);
+            }
+            // 真实语义：QEMU 收到 quit 会退出进程。假 QMP 不能只停响应——
+            // 挂起流程等的是【进程退出】（之后才放锁），不等的话 10 秒超时
+            // 走"仍在退出"分支，vm.lock 不释放
+            if (cmd == "quit" && testPkg is not null)
+            {
+                try
+                {
+                    var session = RuntimeSession.Deserialize(File.ReadAllText(testPkg.SessionPath));
+                    if (session?.QemuPid > 0)
+                        Process.GetProcessById(session.QemuPid).Kill();
+                }
+                catch { /* 进程已不在：忽略 */ }
+            }
+            // 真实时序：migrate 命令返回时迁移才刚开始；第一次查询 active，之后 completed
+            return Task.FromResult(cmd switch
+            {
+                "query-migrate" => ++migrateQueries == 1
+                    ? """{"return":{"status":"active"}}"""
+                    : """{"return":{"status":"completed"}}""",
+                // -incoming 恢复完成的判定信号
+                "query-status" => """{"return":{"status":"running","running":true}}""",
+                _ => """{"return":{}}""",
+            });
+        };
+        var acceptTask = fakeQmp.AcceptAsync();
+
+        using var launcher = new RecordingLauncher();
+        using var db = new HostDb(Path.Combine(_dir, "grass.db"));
+        var root = Path.Combine(_dir, "root");
+        Directory.CreateDirectory(root);
+        db.SetPreference("libraryRoot", root);
+        Directory.CreateDirectory(Path.Combine(_dir, "fw"));
+        File.WriteAllText(Path.Combine(_dir, "fw", "OVMF_VARS.fd"), "vars-template");
+
+        var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(),
+            Path.Combine(_dir, "fw"), "11", launcher,
+            qmpTransportFactory: _ => new TcpTransport("127.0.0.1", fakeQmp.Port));
+
+        var vmPath = ((GrassCoreService.CreateVmResult)service.CreateVm(System.Text.Json.JsonSerializer.SerializeToElement(new
+        {
+            name = "挂起测试",
+            profileId = "ubuntu",
+            diskGiB = 16,
+            isoPath = (string?)null,
+            cpuCores = 2,
+            memoryMiB = 2048,
+            startAfterCreate = false,
+        }))).Path;
+
+        var pkg = new GrassVm.GrassVmPackage(vmPath);
+        testPkg = pkg; // 让假 QMP 的 quit 处理能找到并结束假 QEMU 进程
+        service.StartVm(vmPath);
+        Assert.True(File.Exists(pkg.LockPath));
+
+        // 挂起：stop → migrate file: → query-migrate(completed) → quit
+        service.PowerAction(vmPath, "suspend");
+        Assert.Contains("stop", fakeQmp.ExecutedCommands);
+        Assert.Contains("migrate", fakeQmp.ExecutedCommands);
+        Assert.Contains("quit", fakeQmp.ExecutedCommands);
+
+        // 挂起后：状态文件在包内、state.json 标记 + 指纹、vm.lock 已释放
+        var stateFile = Path.Combine(pkg.Path, "suspend.state");
+        Assert.True(File.Exists(stateFile));
+        var state = Config.VmState.Load(pkg);
+        Assert.NotNull(state.SuspendedStatePath);
+        Assert.False(Path.IsPathRooted(state.SuspendedStatePath!)); // 包内相对引用
+        Assert.NotNull(state.SuspendFingerprint);
+        Assert.False(File.Exists(pkg.LockPath));
+        // Library 显示"已挂起"（UI 的主操作随之变为"恢复"）
+        Assert.Equal("suspended", service.ScanLibrary().Vms.Single(v => v.Path == vmPath).State);
+
+        // 已挂起状态：直接 startVm 被拒绝（必须恢复）
+        var ex = Assert.Throws<GrassCoreException>(() => service.StartVm(vmPath));
+        Assert.Contains("恢复", ex.Message);
+
+        // 恢复：QEMU 以 -incoming file: 启动，状态标记清除
+        service.ResumeVm(vmPath);
+        var resumeCmd = launcher.Commands.Last();
+        var i = resumeCmd.Args.ToList().IndexOf("-incoming");
+        Assert.True(i >= 0, "恢复命令必须带 -incoming");
+        Assert.StartsWith("file:", resumeCmd.Args[i + 1]);
+        Assert.Contains("suspend.state", resumeCmd.Args[i + 1]);
+        // 恢复确认在后台轮询（query-status=running）后清除标记并删除状态文件
+        var clearDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+        Config.VmState after;
+        do
+        {
+            Thread.Sleep(100);
+            after = Config.VmState.Load(pkg);
+        } while (after.SuspendedStatePath is not null && DateTime.UtcNow < clearDeadline);
+        Assert.Null(after.SuspendedStatePath);
+        Assert.Null(after.SuspendFingerprint);
+    }
+
+    [Fact]
+    public void Suspend_MigrationFailure_CancelsMigrationBeforeContinuingVm()
+    {
+        using var fakeQmp = new FakeQmpServer();
+        fakeQmp.OnCommand = (cmd, _) => Task.FromResult(cmd switch
+        {
+            "query-migrate" => """{"return":{"status":"failed"}}""",
+            _ => """{"return":{}}""",
+        });
+        var acceptTask = fakeQmp.AcceptAsync();
+        using var launcher = new RecordingLauncher();
+        using var db = new HostDb(Path.Combine(_dir, "migration-failure.db"));
+        var root = Path.Combine(_dir, "migration-failure-root");
+        var fw = Path.Combine(_dir, "migration-failure-fw");
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(fw);
+        db.SetPreference("libraryRoot", root);
+        File.WriteAllText(Path.Combine(fw, "OVMF_VARS.fd"), "vars-template");
+        var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(), fw, "11", launcher,
+            qmpTransportFactory: _ => new TcpTransport("127.0.0.1", fakeQmp.Port));
+        var vmPath = ((GrassCoreService.CreateVmResult)service.CreateVm(JsonSerializer.SerializeToElement(new
+        {
+            name = "迁移失败", profileId = "ubuntu", diskGiB = 8,
+            isoPath = (string?)null, cpuCores = 1, memoryMiB = 1024, startAfterCreate = false,
+        }))).Path;
+        var pkg = new GrassVm.GrassVmPackage(vmPath);
+        service.StartVm(vmPath);
+
+        Assert.Throws<GrassCoreException>(() => service.PowerAction(vmPath, "suspend"));
+        Assert.Contains("migrate_cancel", fakeQmp.ExecutedCommands);
+        Assert.True(SpinWait.SpinUntil(() => fakeQmp.ExecutedCommands.Contains("cont") || !File.Exists(pkg.LockPath), TimeSpan.FromSeconds(2)),
+            "迁移失败后必须发送 cont，或在 QEMU 已退出时完成锁清理");
+        if (fakeQmp.ExecutedCommands.Contains("cont"))
+        {
+            Assert.True(File.Exists(pkg.LockPath));
+            Assert.Equal("running", service.ScanLibrary().Vms.Single(v => v.Path == vmPath).State);
+        }
+    }
+
+    [Fact]
+    public async Task Start_WhileSuspended_IsRejected_BeforeLockAcquire()
+    {
+        using var fakeQmp = new FakeQmpServer();
+        fakeQmp.OnCommand = (_, _) => Task.FromResult("""{"return":{}}""");
+        var acceptTask = fakeQmp.AcceptAsync(); // 本测试不实际连接（startVm 被拒绝）
+        using var launcher = new RecordingLauncher();
+        using var db = new HostDb(Path.Combine(_dir, "grass.db"));
+        var root = Path.Combine(_dir, "root2");
+        Directory.CreateDirectory(root);
+        db.SetPreference("libraryRoot", root);
+        Directory.CreateDirectory(Path.Combine(_dir, "fw"));
+        File.WriteAllText(Path.Combine(_dir, "fw", "OVMF_VARS.fd"), "vars-template");
+
+        var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(),
+            Path.Combine(_dir, "fw"), "11", launcher,
+            qmpTransportFactory: _ => new TcpTransport("127.0.0.1", fakeQmp.Port));
+
+        var vmPath = ((GrassCoreService.CreateVmResult)service.CreateVm(System.Text.Json.JsonSerializer.SerializeToElement(new
+        {
+            name = "锁测试", profileId = "ubuntu", diskGiB = 8, isoPath = (string?)null,
+            cpuCores = 1, memoryMiB = 1024, startAfterCreate = false,
+        }))).Path;
+        var pkg = new GrassVm.GrassVmPackage(vmPath);
+
+        // 人为制造挂起状态
+        var state = Config.VmState.Load(pkg);
+        state.SuspendedStatePath = "suspend.state";
+        state.Save(pkg);
+
+        Assert.Throws<GrassCoreException>(() => service.StartVm(vmPath));
+        Assert.False(File.Exists(pkg.LockPath)); // 拒绝发生在获取锁之前，不留残留锁
+    }
+
+    [Fact]
+    public void QemuProcessExit_ReleasesLockAndClearsRuntime()
+    {
+        using var fakeQmp = new FakeQmpServer();
+        fakeQmp.OnCommand = (_, _) => Task.FromResult("""{"return":{}}""");
+        var acceptTask = fakeQmp.AcceptAsync();
+        using var launcher = new RecordingLauncher();
+        using var db = new HostDb(Path.Combine(_dir, "grass.db"));
+        var root = Path.Combine(_dir, "root3");
+        Directory.CreateDirectory(root);
+        db.SetPreference("libraryRoot", root);
+        Directory.CreateDirectory(Path.Combine(_dir, "fw"));
+        File.WriteAllText(Path.Combine(_dir, "fw", "OVMF_VARS.fd"), "vars-template");
+
+        var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(),
+            Path.Combine(_dir, "fw"), "11", launcher,
+            qmpTransportFactory: _ => new TcpTransport("127.0.0.1", fakeQmp.Port));
+
+        var vmPath = ((GrassCoreService.CreateVmResult)service.CreateVm(System.Text.Json.JsonSerializer.SerializeToElement(new
+        {
+            name = "退出监视", profileId = "ubuntu", diskGiB = 8, isoPath = (string?)null,
+            cpuCores = 1, memoryMiB = 1024, startAfterCreate = false,
+        }))).Path;
+        var pkg = new GrassVm.GrassVmPackage(vmPath);
+        service.StartVm(vmPath);
+        Assert.True(File.Exists(pkg.LockPath));
+        Assert.True(File.Exists(pkg.SessionPath));
+
+        // 客户机内关机 / ACPI 关机最终都表现为 QEMU 进程退出：这里直接结束假进程
+        var session = RuntimeSession.Deserialize(File.ReadAllText(pkg.SessionPath));
+        Assert.NotNull(session);
+        Process.GetProcessById(session.QemuPid).Kill();
+
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+        while (File.Exists(pkg.LockPath) && DateTime.UtcNow < deadline)
+            Thread.Sleep(50);
+
+        // 干净关机记账：vm.lock 释放、runtime/ 清空、不再显示运行中
+        Assert.False(File.Exists(pkg.LockPath));
+        Assert.Empty(Directory.EnumerateFiles(pkg.RuntimePath));
+        Assert.Equal("stopped", service.ScanLibrary().Vms.Single(v => v.Path == vmPath).State);
+    }
+
+    [Fact]
+    public void StartVm_WithStagedSwapInterrupt_RepairsThenBoots()
+    {
+        // 换入中断现场（快照/恢复事务在"旧盘改名 → 暂存换入"之间崩溃）：工作盘
+        // 缺失、暂存 overlay 完好。启动入口必须【先修复、后磁盘预检】——预检
+        // 先跑会把可自愈的现场误报成"找不到磁盘文件"，而内部盘没有重定位
+        // 入口 = 停机状态永远开不了机的死路（恰是暂存机制要兜住的崩溃窗口）
+        using var fakeQmp = new FakeQmpServer();
+        fakeQmp.OnCommand = (_, _) => Task.FromResult("""{"return":{}}""");
+        var acceptTask = fakeQmp.AcceptAsync();
+        using var launcher = new RecordingLauncher();
+        using var db = new HostDb(Path.Combine(_dir, "grass.db"));
+        var root = Path.Combine(_dir, "root5");
+        Directory.CreateDirectory(root);
+        db.SetPreference("libraryRoot", root);
+        Directory.CreateDirectory(Path.Combine(_dir, "fw"));
+        File.WriteAllText(Path.Combine(_dir, "fw", "OVMF_VARS.fd"), "vars-template");
+
+        var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(),
+            Path.Combine(_dir, "fw"), "11", launcher,
+            qmpTransportFactory: _ => new TcpTransport("127.0.0.1", fakeQmp.Port));
+
+        var vmPath = ((GrassCoreService.CreateVmResult)service.CreateVm(System.Text.Json.JsonSerializer.SerializeToElement(new
+        {
+            name = "SwapInterrupt", profileId = "ubuntu", diskGiB = 8, isoPath = (string?)null,
+            cpuCores = 1, memoryMiB = 1024, startAfterCreate = false,
+        }))).Path;
+        var pkg = new GrassVm.GrassVmPackage(vmPath);
+
+        // 模拟崩溃窗口：工作盘已改名成暂存 overlay（换入事务的中间态）
+        var config = new Config.ConfigStore(pkg).Load();
+        var active = GrassVm.PathPolicy.Resolve(pkg,
+            config.Devices.OfType<Config.DiskDevice>().Single().Path);
+        File.Move(active, active + SnapshotService.StagedOverlaySuffix);
+        Assert.False(File.Exists(active));
+
+        // 修复先于磁盘预检 → 换入补完 → 预检看到磁盘在场 → 正常启动
+        service.StartVm(vmPath);
+        Assert.True(File.Exists(pkg.LockPath));
+        Assert.True(File.Exists(active), "修复必须把暂存 overlay 换回工作路径");
+        Assert.False(File.Exists(active + SnapshotService.StagedOverlaySuffix));
+    }
+
+    [Fact]
+    public void UpdateConfig_ClampsValuesAndRejectsWhileRunning()
+    {
+        using var fakeQmp = new FakeQmpServer();
+        fakeQmp.OnCommand = (_, _) => Task.FromResult("""{"return":{}}""");
+        var acceptTask = fakeQmp.AcceptAsync();
+        using var launcher = new RecordingLauncher();
+        using var db = new HostDb(Path.Combine(_dir, "grass.db"));
+        var root = Path.Combine(_dir, "root4");
+        Directory.CreateDirectory(root);
+        db.SetPreference("libraryRoot", root);
+        Directory.CreateDirectory(Path.Combine(_dir, "fw"));
+        File.WriteAllText(Path.Combine(_dir, "fw", "OVMF_VARS.fd"), "vars-template");
+
+        var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(),
+            Path.Combine(_dir, "fw"), "11", launcher,
+            qmpTransportFactory: _ => new TcpTransport("127.0.0.1", fakeQmp.Port));
+
+        var vmPath = ((GrassCoreService.CreateVmResult)service.CreateVm(System.Text.Json.JsonSerializer.SerializeToElement(new
+        {
+            name = "设置钳制", profileId = "ubuntu", diskGiB = 8, isoPath = (string?)null,
+            cpuCores = 1, memoryMiB = 1024, startAfterCreate = false,
+        }))).Path;
+        var pkg = new GrassVm.GrassVmPackage(vmPath);
+
+        // 超范围值被钳制到安全范围（消费级产品：宁钳制不拒绝）
+        var json = service.GetConfig(vmPath) is System.Text.Json.JsonElement el ? el.GetRawText() : null!;
+        var node = System.Text.Json.Nodes.JsonNode.Parse(json)!.AsObject();
+        node["cpuCores"] = 9999;
+        node["memoryMiB"] = 16;
+        service.UpdateConfig(vmPath, node.ToJsonString());
+        var after = new Config.ConfigStore(pkg).Load();
+        Assert.Equal(Math.Min(9999, Environment.ProcessorCount), after.CpuCores);
+        Assert.True(after.MemoryMiB >= 512);
+
+        // 非法名称拒绝
+        node["name"] = "";
+        Assert.Throws<GrassCoreException>(() => service.UpdateConfig(vmPath, node.ToJsonString()));
+
+        // 运行中拒绝修改（唯一例外 CD/DVD 走 changeMedium）
+        service.StartVm(vmPath);
+        Assert.Throws<GrassCoreException>(() => service.UpdateConfig(vmPath, json));
+    }
+
+    [Fact]
+    public void StartVm_RejectedByPreflight_DestroysNothing_OfAnExistingSession()
+    {
+        // 场景：VM 已被另一个会话锁定运行（vm.lock + session.json 在），本实例 startVm 预检拒绝。
+        // 关键断言：拒绝路径不得删除别人的锁/session（否则互斥失效 → 双开 → 磁盘损坏）。
+        using var launcher = new RecordingLauncher();
+        using var db = new HostDb(Path.Combine(_dir, "grass.db"));
+        var root = Path.Combine(_dir, "root5");
+        Directory.CreateDirectory(root);
+        db.SetPreference("libraryRoot", root);
+        Directory.CreateDirectory(Path.Combine(_dir, "fw"));
+        File.WriteAllText(Path.Combine(_dir, "fw", "OVMF_VARS.fd"), "vars-template");
+
+        var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(),
+            Path.Combine(_dir, "fw"), "11", launcher, qmpTransportFactory: _ => null);
+
+        var vmPath = ((GrassCoreService.CreateVmResult)service.CreateVm(System.Text.Json.JsonSerializer.SerializeToElement(new
+        {
+            name = "别人在用", profileId = "ubuntu", diskGiB = 8, isoPath = (string?)null,
+            cpuCores = 1, memoryMiB = 1024, startAfterCreate = false,
+        }))).Path;
+        var pkg = new GrassVm.GrassVmPackage(vmPath);
+
+        // 人为制造"另一个会话正在运行"：锁 + session
+        new GrassVm.VmLock(pkg).Acquire();
+        var sessionJson = """{"sessionId":"other","qmpPipe":"pipe","startedAt":"2026-01-01T00:00:00Z","qemuPid":4194304}""";
+        File.WriteAllText(pkg.SessionPath, sessionJson);
+
+        Assert.Throws<GrassCoreException>(() => service.StartVm(vmPath));
+
+        // 预检拒绝后：锁与 session 原封不动（属于那个运行中的会话）
+        Assert.True(File.Exists(pkg.LockPath), "vm.lock 被拒绝路径删除——互斥被破坏");
+        Assert.Equal(sessionJson, File.ReadAllText(pkg.SessionPath));
+    }
+}

@@ -1,0 +1,47 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Builds
+dist/
+out/
+build/
+apps/core/**/bin/
+apps/core/**/obj/
+apps/helper/bin/
+apps/helper/obj/
+apps/desktop/core-rundir/
+*.user
+
+# Local .NET SDK & caches (developer-managed, not committed)
+/.dotnet/
+/.dotnet-home/
+/.nuget/
+/.nuget-appdata/
+/.local/
+**/.local/
+/Library/
+dotnet-install.sh
+
+# Python venv used for PDF extraction (session artifact)
+.venv/
+
+# Logs & temp
+*.log
+*.dmp
+.grass-tmp
+temp/
+TestResults/
+**/TestResults/
+
+# macOS
+.DS_Store
+
+# Extracted text of the design PDFs (regenerable)
+Grass_Block_VM_*.txt
+
+# Editor
+.idea/
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
