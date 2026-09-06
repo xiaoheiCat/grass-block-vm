@@ -223,7 +223,11 @@ public sealed class QemuCommandBuilder
             case NetworkDevice net:
             {
                 var id = "net" + net.CreatedOrder;
-                var mac = string.IsNullOrEmpty(net.MacAddress) ? DeriveMac(net.DeviceId) : net.MacAddress;
+                var mac = string.IsNullOrEmpty(net.MacAddress)
+                    ? DeriveMac(net.DeviceId)
+                    : DeviceIdPolicy.IsValidMac(net.MacAddress)
+                        ? net.MacAddress
+                        : throw new InvalidOperationException("网卡 MAC 地址格式无效（必须是六组十六进制字节）。");
                 // "断开"= 不生成任何网络参数（QEMU 没有 none 后端；-netdev none 是非法参数，
                 // 会让 QEMU 初始化即退出）。设备保留在配置里，用户随时可以再接上。
                 if (net.Mode == NetworkMode.Disconnected)
@@ -280,26 +284,28 @@ public sealed class QemuCommandBuilder
     private int BootIndex(BootClass @class)
     {
         var i = Config.BootOrder.IndexOf(@class);
-        // 类不在 BootOrder（用户手改配置）：每类一段独立高位区间。不能用 int.MaxValue/2
-        // 当基——×100 会整型溢出回绕，撞上排位 1 的设备（QEMU 拒绝重复 bootindex）
-        int baseIndex;
+        // 类不在 BootOrder（用户手改配置）：顺延到 BootOrder 之后的独立区段，仍参与
+        // 同一套动态宽度计算，避免与排位类或其他未排名类撞上 bootindex。
+        int classRank;
         if (i >= 0)
         {
-            baseIndex = i + 1;
+            classRank = i;
         }
         else
         {
             if (!_unrankedSlot.TryGetValue(@class, out var slot))
                 slot = _unrankedSlot[@class] = _unrankedSlot.Count + 1;
-            baseIndex = 1_000_000 + slot * 1_000;
+            classRank = Config.BootOrder.Count + slot;
         }
         var n = _bootSeq.TryGetValue(@class, out var v) ? v : 0;
         _bootSeq[@class] = n + 1;
         // 同类设备的 bootindex 必须构成【连续区段】：QEMU 按数值全局排序。
-        // 旧算法给首台 1/2/3、第二台 101/201——第二块盘(101) 排到了光驱(2)和
-        // 网卡(3)之后：双盘 VM 的系统盘在第二块时，固件先试空盘、再试光驱、
-        // 再走 PXE，最后才轮到系统盘。每类一段百位区间，类内按序递增
-        return baseIndex * 100 + n + 1;
+        // 区段宽度按当前配置设备总数动态计算，不能写死为 100：服务层允许 128
+        // 个设备，同一类超过 100 个时固定百位区段会与下一类重叠，QEMU realize
+        // 将因重复 bootindex 拒绝启动。保留 100 作为小配置的稳定基数；设备总数
+        // 至少为 1，避免空配置时出现零区段。
+        var segmentWidth = Math.Max(100, Config.Devices.Count);
+        return checked((classRank + 1) * segmentWidth + n + 1);
     }
 
     private void AddRawDevices(List<string> args)

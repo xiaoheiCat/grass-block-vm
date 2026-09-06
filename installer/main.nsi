@@ -51,10 +51,9 @@ Section "Core Components"
 
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   CreateShortCut "$SMPROGRAMS\${APPNAME}.lnk" "$INSTDIR\Grass Block VM.exe"
-  ; Core 的自启动入口只在 --autostart 参数下执行。使用 HKLM 而不是 HKCU：
-  ; 管理员安装器可能由标准用户提供管理员凭据运行，此时 HKCU 会落到管理员
-  ; 账户，原请求安装的用户登录后永远不会拉起 UI。HKLM Run 在每个登录用户
-  ; 的上下文执行，Core 再从该用户自己的 SQLite 自动启动清单读取 VM。
+  ; 安装器整体提权，HKCU 可能属于提供管理员凭据的另一个用户；使用 HKLM
+  ; 确保首次安装后已有 HostDb 自启动清单可以在登录时被执行。Electron 的
+  ; --autostart 模式无界面运行清单后退出，用户是否启用 VM 仍由 Core 决定。
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "${APPNAME}" '"$INSTDIR\Grass Block VM.exe" --autostart'
 SectionEnd
 
@@ -63,6 +62,8 @@ Function .onInit
   Push "GrassCore.exe"
   Call CheckRunningProcess
   Push "qemu-system-x86_64.exe"
+  Call CheckRunningProcess
+  Push "qemu-img.exe"
   Call CheckRunningProcess
   Push "GrassSpiceHelper.exe"
   Call CheckRunningProcess
@@ -75,17 +76,21 @@ Function un.onInit
   Call CheckRunningProcess
   Push "qemu-system-x86_64.exe"
   Call CheckRunningProcess
+  Push "qemu-img.exe"
+  Call CheckRunningProcess
   Push "GrassSpiceHelper.exe"
   Call CheckRunningProcess
 FunctionEnd
 
 Function CheckRunningProcess
   Exch $0
-  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq $0" /FO CSV /NH'
+  ; tasklist 的 IMAGENAME 过滤器负责缩小结果；TABLE 输出再用进程名后的空格
+  ; 做字段边界匹配，不能用裸子串，否则 NotGrassCore.exe 会误命中 GrassCore.exe。
+  nsExec::ExecToStack 'tasklist /FI "IMAGENAME eq $0" /FO TABLE /NH'
   Pop $1
   Pop $2
   ${If} $1 == 0
-    ${StrStr} $3 $2 $0
+    ${StrStr} $3 $2 "$0 "
     ${If} $3 != ""
       MessageBox MB_OK|MB_ICONSTOP "检测到 $0 正在运行。请先关闭或挂起所有虚拟机，然后再运行 Grass Block VM 安装程序。"
       Abort
@@ -101,7 +106,9 @@ Section "Uninstall"
     ExecWait 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$INSTDIR\remove-tap-adapter.ps1" -AdapterName "${TAP_ADAPTER_NAME}"'
   Delete "$INSTDIR\remove-tap-adapter.ps1"
   Delete "$SMPROGRAMS\${APPNAME}.lnk"
+  ; 兼容早期版本可能写入的 HKLM/HKCU Run 项；新版本安装器不再创建它们。
   DeleteRegValue HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "${APPNAME}"
+  DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "${APPNAME}"
   RMDir /r "$INSTDIR"
   ; %USERPROFILE%\Documents\Grass Block VM 下的 .grassvm 默认保留
 SectionEnd

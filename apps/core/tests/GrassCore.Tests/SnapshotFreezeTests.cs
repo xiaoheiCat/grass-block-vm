@@ -58,6 +58,21 @@ public class SnapshotFreezeTests : IDisposable
     }
 
     [Fact]
+    public void Create_RejectsExternalBackingChainBeforeMovingDisk()
+    {
+        var outside = Path.Combine(_dir, "outside-base.qcow2");
+        File.WriteAllBytes(outside, "OUTSIDE-BASE"u8.ToArray());
+        File.WriteAllText(ActiveDisk, $"FAKE-OVERLAY\n-b {outside}\n");
+        var config = new ConfigStore(_pkg).Load();
+
+        var ex = Assert.Throws<GrassCoreException>(() => SnapshotService.Create(_pkg, config, "external", diskOps: Ops));
+
+        Assert.Contains("包外", ex.Message);
+        Assert.True(File.Exists(ActiveDisk));
+        Assert.Empty(SnapshotService.LoadTree(_pkg).All);
+    }
+
+    [Fact]
     public void Restore_DiscardsUnsavedWork_AndReturnsToFrozenPoint()
     {
         var config = new ConfigStore(_pkg).Load();
@@ -652,7 +667,7 @@ public class SnapshotFreezeTests : IDisposable
         // 真实的创建中断现场必有 freeze-intent.json（意向先于任何盘操作落盘）——
         // 修复用它区分"中断现场"与"链根基座删除残留"（后者 disks/ 保留但
         // intent 已被清，绝不能再当半创建处理）
-        var halfDir = Path.Combine(_pkg.SnapshotsPath, "half-created-uuid");
+        var halfDir = Path.Combine(_pkg.SnapshotsPath, Guid.NewGuid().ToString());
         var deviceId = config.Devices.OfType<GrassCore.Config.DiskDevice>().First().DeviceId;
         var frozenInHalf = Path.Combine(halfDir, "disks", $"disk-{deviceId}.qcow2");
         Directory.CreateDirectory(Path.GetDirectoryName(frozenInHalf)!);

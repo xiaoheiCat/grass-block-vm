@@ -1,3 +1,4 @@
+using GrassCore.Config;
 using GrassCore.GrassVm;
 using GrassCore.Library;
 using GrassCore.Qemu;
@@ -36,6 +37,18 @@ public class PathPolicyTests : IDisposable
         var pkg = GrassVmPackage.CreateNew(_dir, "Path VM3");
         Assert.Equal(Path.Combine(pkg.Path, "disks", "d.qcow2"), PathPolicy.Resolve(pkg, "disks/d.qcow2"));
         Assert.Equal("/mnt/data/d.qcow2", PathPolicy.Resolve(pkg, "/mnt/data/d.qcow2"));
+    }
+
+    [Fact]
+    public void IsExternal_RecognizesAbsoluteReferenceInsidePackage()
+    {
+        var pkg = GrassVmPackage.CreateNew(_dir, "Path VM Absolute");
+        var absoluteInside = Path.Combine(pkg.DisksPath, "system.qcow2");
+
+        Assert.True(Path.IsPathRooted(absoluteInside));
+        Assert.True(new DiskDevice { Path = absoluteInside }.IsExternal); // 仅字符串属性的旧语义
+        Assert.False(PathPolicy.IsExternal(pkg, absoluteInside));
+        Assert.True(PathPolicy.IsExternal(pkg, Path.Combine(_dir, "outside.qcow2")));
     }
 
     [Fact]
@@ -231,6 +244,66 @@ public class LibraryAndHostDbTests : IDisposable
         var result = Assert.Single(recovery.ScanAdoptable(root));
         Assert.True(result.QemuAlive);
         Assert.False(result.SessionValid);
+    }
+
+    [Fact]
+    public void CoreCrashRecovery_IsolatesProcessProbeFailuresPerVm()
+    {
+        var root = Path.Combine(_dir, "root-probe");
+        Directory.CreateDirectory(root);
+        var first = GrassVmPackage.CreateNew(root, "Probe Failure");
+        var second = GrassVmPackage.CreateNew(root, "Probe Success");
+        foreach (var pkg in new[] { first, second })
+        {
+            new VmLock(pkg).Acquire();
+            Directory.CreateDirectory(pkg.RuntimePath);
+            File.WriteAllText(pkg.SessionPath, new RuntimeSession
+            {
+                SessionId = pkg.Name,
+                QmpPipe = $@"\\.\pipe\grassvm-qmp-{pkg.Name}",
+                StartedAt = DateTimeOffset.UtcNow,
+                QemuPid = pkg == first ? 1 : 2,
+            }.Serialize());
+        }
+
+        var recovery = new CoreCrashRecovery(isProcessAlive: pid =>
+            pid == 1 ? throw new System.ComponentModel.Win32Exception() : true);
+        var results = recovery.ScanAdoptable(root);
+
+        Assert.Equal(2, results.Count);
+        Assert.False(results.Single(r => r.Package.Name == first.Name).SessionValid);
+        Assert.True(results.Single(r => r.Package.Name == second.Name).SessionValid);
+    }
+
+    [Fact]
+    public void CoreCrashRecovery_IsolatesValidatorFailuresPerVm()
+    {
+        var root = Path.Combine(_dir, "root-validator");
+        Directory.CreateDirectory(root);
+        foreach (var name in new[] { "Validator Failure", "Validator Success" })
+        {
+            var pkg = GrassVmPackage.CreateNew(root, name);
+            new VmLock(pkg).Acquire();
+            Directory.CreateDirectory(pkg.RuntimePath);
+            File.WriteAllText(pkg.SessionPath, new RuntimeSession
+            {
+                SessionId = name,
+                QmpPipe = $@"\\.\pipe\grassvm-qmp-{name}",
+                StartedAt = DateTimeOffset.UtcNow,
+                QemuPid = name == "Validator Failure" ? 1 : 2,
+            }.Serialize());
+        }
+
+        var recovery = new CoreCrashRecovery(
+            isProcessAlive: _ => true,
+            sessionValidator: session => session.QemuPid == 1
+                ? throw new InvalidOperationException("validator failure")
+                : true);
+        var results = recovery.ScanAdoptable(root);
+
+        Assert.Equal(2, results.Count);
+        Assert.False(results.Single(r => r.Package.Name == "Validator Failure").SessionValid);
+        Assert.True(results.Single(r => r.Package.Name == "Validator Success").SessionValid);
     }
 
     [Fact]

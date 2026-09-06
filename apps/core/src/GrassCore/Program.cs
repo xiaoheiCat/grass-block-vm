@@ -19,35 +19,40 @@ public static class Program
             return 0;
         }
 
-        // 路径解析：bundled QEMU Runtime 与固件随 Grass Block VM 整包安装（不可由用户配置，1.0 无自定义 Runtime）。
-        // 开发/联调可用环境变量 GRASSCORE_QEMU_DIR / GRASSCORE_OVMF_DIR 覆盖（不影响产品形态）。
-        var installDir = AppContext.BaseDirectory;
-        var qemuDir = Environment.GetEnvironmentVariable("GRASSCORE_QEMU_DIR");
-        // 安装布局中 Core 位于 resources/GrassCore，而 QEMU/firmware 位于同级 resources 下；
-        // 同时保留开发目录（直接放在 Core 目录内）的搜索兼容。
-        var resourcesDir = Directory.GetParent(installDir)?.FullName ?? installDir;
-        var qemuRoot = qemuDir ?? FindDir(resourcesDir, "QEMU") ?? installDir;
-        var qemuSystem = FindFile(qemuRoot, "qemu-system-x86_64.exe", "qemu-system-x86_64");
-        var qemuImg = FindFile(qemuRoot, "qemu-img.exe", "qemu-img");
-        var ovmfEnv = Environment.GetEnvironmentVariable("GRASSCORE_OVMF_DIR");
-        var ovmfDir = !string.IsNullOrEmpty(ovmfEnv) && Directory.Exists(ovmfEnv)
-            ? ovmfEnv
-            : FindDir(resourcesDir, "firmware") ?? FindDir(installDir, "firmware")
-                ?? FindDir(installDir, "share") ?? installDir;
-        var helperRoot = FindDir(resourcesDir, "GrassSpiceHelper") ?? FindDir(installDir, "GrassSpiceHelper");
-        var helperExe = helperRoot is null ? null : FindFile(helperRoot, "GrassSpiceHelper.exe", "GrassSpiceHelper");
-        var qemuMajor = Environment.GetEnvironmentVariable("GRASSCORE_QEMU_MAJOR")
-            ?? ReadBundledQemuMajor(qemuRoot)
-            ?? "bundled";
+        // 正式发布版只信任安装包内的固定布局。开发/联调覆盖必须显式开启，避免
+        // 启动用户可控的环境变量把正式版指向伪造的 QEMU、qemu-img 或固件。
+#if DEBUG
+        const bool debugBuild = true;
+#else
+        const bool debugBuild = false;
+#endif
+        var runtime = RuntimeLayout.Resolve(
+            AppContext.BaseDirectory,
+            allowDevOverrides: debugBuild || args.Contains("--dev-runtime", StringComparer.Ordinal));
+        var qemuSystem = runtime.QemuSystem;
+        var qemuImg = runtime.QemuImg;
+        var ovmfDir = runtime.FirmwareDir;
+        var helperExe = runtime.HelperExecutable;
+        var qemuMajor = runtime.QemuMajor;
+
+        // 发布版必须使用随包验证过的绝对路径。缺少组件时直接失败，不能回退到
+        // 裸文件名让 Windows 按 PATH 搜索并执行用户可控的同名程序。
+        if (qemuSystem is null || qemuImg is null)
+        {
+            Console.Error.WriteLine("GrassCore 发布目录缺少 QEMU 运行时（qemu-system-x86_64 或 qemu-img）。");
+            return 2;
+        }
 
         // Named Pipe 可以允许多个 server instance；如果两个 Electron/UI 进程同时
         // 发现 Core 不在线，单靠进程内单飞仍会孵出两个 GrassCore，各自接管同一 VM。
-        // 用用户会话级 mutex 把 Core 本身收敛为单实例；后启动者直接退出，前一个
-        // 实例继续提供既有管道。mutex 句柄持有到 Main 返回，崩溃时由 OS 自动释放。
+        // 命名管道在 Windows 上跨 Terminal Session 可见，因此互斥锁也必须使用
+        // Global 命名空间；Local 会话锁会让快速用户切换/RDP 的两个会话各自启动
+        // 一个 Core，客户端随后可能随机接入错误的服务实例。后启动者直接退出，
+        // 前一个实例继续提供既有管道。mutex 句柄持有到 Main 返回，崩溃时由 OS 自动释放。
         Mutex? coreMutex = null;
         if (OperatingSystem.IsWindows())
         {
-            coreMutex = new Mutex(initiallyOwned: false, name: @"Local\GrassBlockVM.Core", createdNew: out _);
+            coreMutex = new Mutex(initiallyOwned: false, name: @"Global\GrassBlockVM.Core", createdNew: out _);
             var ownsMutex = false;
             try { ownsMutex = coreMutex.WaitOne(0); }
             catch (AbandonedMutexException) { ownsMutex = true; }
@@ -62,8 +67,8 @@ public static class Program
 
         var dbPath = HostDbPath();
         using var db = new HostDb(dbPath);
-        var service = new GrassCoreService(db, qemuSystem ?? "qemu-system-x86_64", qemuImg ?? "qemu-img",
-            ovmfDir ?? installDir, qemuMajor, helperExecutablePath: helperExe);
+        var service = new GrassCoreService(db, qemuSystem, qemuImg,
+            ovmfDir, qemuMajor, helperExecutablePath: helperExe);
 
         // 启动即清理残留 .grass-tmp（应用启动时自动删除，不尝试断点续传）
         if (db.LibraryRoot is { } root)
@@ -198,6 +203,7 @@ public static class Program
         "removeAutostart" => s.RemoveAutostart(p.GetProperty("packagePath").GetString()!),
         "setAutostartOrder" => s.SetAutostartOrder(p.GetProperty("orderedVmPaths").EnumerateArray().Select(e => e.GetString()!).ToArray()),
         "getAutostartInterval" => s.GetAutostartInterval(),
+        "hasAutostart" => s.HasEnabledAutostart(),
         "setAutostartInterval" => s.SetAutostartInterval(p.GetProperty("intervalSeconds").GetInt32()),
         "updateConfig" => s.UpdateConfig(p.GetProperty("packagePath").GetString()!, p.GetProperty("configJson").GetString()!),
         "resizeDisk" => s.ResizeDisk(
@@ -249,8 +255,58 @@ public static class Program
         return Path.Combine(AppContext.BaseDirectory, "grass.db");
     }
 
+}
+
+internal sealed record RuntimePaths(
+    string QemuRoot,
+    string? QemuSystem,
+    string? QemuImg,
+    string FirmwareDir,
+    string? HelperRoot,
+    string? HelperExecutable,
+    string QemuMajor);
+
+internal static class RuntimeLayout
+{
+    public static RuntimePaths Resolve(
+        string installDir,
+        bool allowDevOverrides,
+        Func<string, string?>? getEnvironmentVariable = null)
+    {
+        getEnvironmentVariable ??= Environment.GetEnvironmentVariable;
+        var resourcesDir = Directory.GetParent(installDir)?.FullName ?? installDir;
+
+        // 发布目录是 resources/{GrassCore,QEMU,firmware,GrassSpiceHelper}；开发版
+        // 保留递归查找和环境变量覆盖，方便假 QEMU 联调，但只能由调用方显式开启。
+        var qemuEnv = allowDevOverrides ? getEnvironmentVariable("GRASSCORE_QEMU_DIR") : null;
+        var qemuRoot = allowDevOverrides
+            ? qemuEnv ?? FindDir(resourcesDir, "QEMU") ?? installDir
+            : Path.Combine(resourcesDir, "QEMU");
+        var qemuSystem = FindFile(qemuRoot, "qemu-system-x86_64.exe", "qemu-system-x86_64");
+        var qemuImg = FindFile(qemuRoot, "qemu-img.exe", "qemu-img");
+
+        var ovmfEnv = allowDevOverrides ? getEnvironmentVariable("GRASSCORE_OVMF_DIR") : null;
+        var firmwareDir = allowDevOverrides && !string.IsNullOrWhiteSpace(ovmfEnv)
+            ? ovmfEnv!
+            : allowDevOverrides
+                ? FindDir(resourcesDir, "firmware") ?? FindDir(installDir, "firmware")
+                    ?? FindDir(installDir, "share") ?? Path.Combine(resourcesDir, "firmware")
+                : Path.Combine(resourcesDir, "firmware");
+
+        var helperRoot = allowDevOverrides
+            ? FindDir(resourcesDir, "GrassSpiceHelper") ?? FindDir(installDir, "GrassSpiceHelper")
+            : Path.Combine(resourcesDir, "GrassSpiceHelper");
+        var helperExe = helperRoot is null ? null : FindFile(helperRoot, "GrassSpiceHelper.exe", "GrassSpiceHelper");
+        var qemuMajor = (allowDevOverrides ? getEnvironmentVariable("GRASSCORE_QEMU_MAJOR") : null)
+            ?? ReadBundledQemuMajor(qemuRoot)
+            ?? "bundled";
+
+        return new RuntimePaths(qemuRoot, qemuSystem, qemuImg, firmwareDir, helperRoot, helperExe, qemuMajor);
+    }
+
     private static string? FindFile(string dir, params string[] names)
     {
+        if (!Directory.Exists(dir)) return null;
         foreach (var n in names)
         {
             var direct = Path.Combine(dir, n);
@@ -258,14 +314,18 @@ public static class Program
         }
         foreach (var f in Directory.EnumerateFiles(dir, "*.*", SearchOption.AllDirectories))
         {
-            var name = Path.GetFileNameWithoutExtension(f);
-            if (names.Any(n => Path.GetFileNameWithoutExtension(n) == name)) return f;
+            // 递归搜索只能按完整文件名匹配；按 stem 匹配会把同目录中的
+            // qemu-system-x86_64.dll 当成可执行文件返回。
+            if (names.Any(n => string.Equals(Path.GetFileName(f), n,
+                    OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal)))
+                return f;
         }
         return null;
     }
 
     private static string? FindDir(string dir, string name)
     {
+        if (!Directory.Exists(dir)) return null;
         var direct = Path.Combine(dir, name);
         if (Directory.Exists(direct)) return direct;
         return Directory.EnumerateDirectories(dir, name, SearchOption.AllDirectories).FirstOrDefault();

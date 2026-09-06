@@ -14,6 +14,7 @@ namespace GrassCore.Qemu;
 public sealed class TransactionalDiskOps
 {
     public const string TempSuffix = ".grass-tmp";
+    public const string ActiveMarkerSuffix = ".active";
 
     private readonly string _qemuImgPath;
     private readonly Action<string>? _log;
@@ -29,6 +30,7 @@ public sealed class TransactionalDiskOps
     {
         internal Process? Process;
         internal string? TempTarget;
+        internal string? ActiveMarkerPath;
         public bool Completed { get; internal set; }
         /// <summary>子进程 stdout（WaitForAsync 排水后填充；info 类命令用）。</summary>
         public string Stdout { get; internal set; } = "";
@@ -37,7 +39,15 @@ public sealed class TransactionalDiskOps
             try { if (Process is { HasExited: false }) Process.Kill(entireProcessTree: true); }
             catch (InvalidOperationException) { /* 已退出 */ }
         }
-        public void Dispose() => Process?.Dispose();
+        public void Dispose()
+        {
+            Process?.Dispose();
+            if (ActiveMarkerPath is { } marker)
+            {
+                try { File.Delete(marker); } catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
+        }
     }
 
     /// <summary>
@@ -152,26 +162,75 @@ public sealed class TransactionalDiskOps
     /// 把 overlay 的数据合并进它的 backing（qemu-img commit；用于删除链中快照：
     /// 被删层先并入其 backing，其后代 overlay 才能安全 rebase 到祖先）。
     ///
-    /// commit 是唯一必须【原地】改写已有文件的磁盘操作（backing 是全链基座）。
-    /// 不做"复制基座→副本上 commit→原子换名"的完全事务化：File.Copy 不保留
-    /// 稀疏性——消费级 100GB 虚拟盘的删除会瞬间占用 100GB 实际空间，比残留
-    /// 风险伤害更大。缓解：commit 后立即 qemu-img check 基座——qemu-img 中途
-    /// 崩溃/掉电损坏基座时会【响亮报错】（删除流程回滚、元数据不动），绝不静默。
+    /// commit 是唯一需要【原地】改写已有文件的磁盘操作（backing 是全链基座）。
+    /// 执行前在同一包的 temp/ 中保留父盘副本和持久 journal；进程崩溃后由启动
+    /// 修复入口按 journal 阶段恢复或清理。副本可能暂时占用接近父盘大小，
+    /// 这是为避免 qemu-img commit 中断后永久丢失父盘数据付出的明确空间代价。
     /// </summary>
     public void CommitOverlay(string overlayFile)
     {
-        var parent = QueryBackingFile(overlayFile);
+        // 提交前必须知道确切的 backing；把 qemu-img info 失败折叠成“无 backing”
+        // 会跳过恢复 journal，随后原地 commit 可能把错误层改坏。
+        var parent = QueryBackingFileStrict(overlayFile);
+        var package = FindOwningPackage(overlayFile);
+        var journal = package is null ? null : Path.Combine(package.TempPath, "commit-journal.json");
+        var backup = parent is null ? null : parent + CommitTempSuffix;
+        if (journal is not null && backup is not null)
+        {
+            if (GrassVmPackage.IsReparsePointOrLink(journal) || GrassVmPackage.IsReparsePointOrLink(backup))
+                throw new QemuImgException("磁盘提交事务文件包含不受支持的符号链接或目录联接。");
+            Directory.CreateDirectory(package!.TempPath);
+            AtomicFile.WriteJsonValidated(journal, JsonSerializer.Serialize(new CommitJournal(parent!, backup, "prepared")));
+            File.Copy(parent!, backup, overwrite: false);
+            AtomicFile.WriteJsonValidated(journal, JsonSerializer.Serialize(new CommitJournal(parent!, backup, "copied")));
+        }
         // tempTarget 只在失败清理时使用：commit 的目标就是真文件，绝不能被删，
         // 传一个不会被创建的哨兵路径（失败清理 File.Delete 对不存在的文件是 no-op）
         using var op = Run(["commit", "-f", "qcow2", overlayFile], overlayFile + ".commit-sentinel");
-        WaitForAsync(op, CancellationToken.None).GetAwaiter().GetResult();
-        op.Completed = true;
-        if (parent is not null)
+        // qemu-img 返回成功后，父盘已经包含 overlay 数据。之后的 check、journal
+        // 更新或临时文件清理即使失败，也绝不能再用旧备份覆盖父盘。
+        var commitCompleted = false;
+        try
         {
-            // 合并完立刻体检基座：坏了就抛（调用方回滚），不让损坏沿链静默传播
-            using var chk = Run(["check", "-f", "qcow2", parent], null);
-            WaitForAsync(chk, CancellationToken.None).GetAwaiter().GetResult();
-            chk.Completed = true;
+            WaitForAsync(op, CancellationToken.None).GetAwaiter().GetResult();
+            op.Completed = true;
+            commitCompleted = true;
+            if (journal is not null && backup is not null)
+            {
+                // 先持久化“已提交”再做任何校验/清理。这样即使后续步骤抛错，
+                // 下次启动也只会回收副本，不会把父盘恢复成提交前的内容。
+                AtomicFile.WriteJsonValidated(journal, JsonSerializer.Serialize(new CommitJournal(parent!, backup, "committed")));
+            }
+            if (parent is not null)
+            {
+                // 合并完立刻体检基座：坏了就抛，让调用方保留未改的元数据并可重试，
+                // 不让损坏沿链静默传播；commit 已成功时绝不回滚父盘。
+                using var chk = Run(["check", "-f", "qcow2", parent], null);
+                WaitForAsync(chk, CancellationToken.None).GetAwaiter().GetResult();
+                chk.Completed = true;
+            }
+            if (journal is not null && backup is not null)
+            {
+                DeleteIfExists(backup);
+                DeleteIfExists(journal);
+            }
+        }
+        catch
+        {
+            if (journal is not null && backup is not null)
+            {
+                try
+                {
+                    // 只有 qemu-img 尚未成功返回时才可以回滚。提交成功后的
+                    // journal/backup 清理失败要留给下一次启动收尾，不能破坏新数据。
+                    if (!commitCompleted && File.Exists(backup) && !GrassVmPackage.IsReparsePointOrLink(backup))
+                        File.Copy(backup, parent!, overwrite: true);
+                    DeleteIfExists(backup);
+                    DeleteIfExists(journal);
+                }
+                catch { /* 持久 journal 留给下次 Core 启动收尾 */ }
+            }
+            throw;
         }
     }
 
@@ -179,26 +238,44 @@ public sealed class TransactionalDiskOps
     public const string CommitTempSuffix = ".grass-commit-tmp";
 
     /// <summary>
-    /// 收尾中断的副本 commit：把 *.grass-commit-tmp 换名覆盖其基名。
-    /// 安全性：commit 只在包级互斥门内发生，基名在事务开始后不会被别人改写；
-    /// 副本要么是合并完成的数据（收尾生效），要么是事务开始时的原件拷贝（换名无损失）。
+    /// 按持久化 commit journal 收尾中断的副本提交。只处理 journal 指定且位于
+    /// 当前包内的父盘/备份；没有可验证 journal 时不信任孤立的 *.grass-commit-tmp。
     /// </summary>
     public static void FinishCommitTempFiles(GrassVmPackage package)
     {
-        var opts = new EnumerationOptions { RecurseSubdirectories = true, IgnoreInaccessible = true };
-        foreach (var tmp in Directory.EnumerateFiles(package.Path, "*" + CommitTempSuffix, opts))
+        var journal = Path.Combine(package.TempPath, "commit-journal.json");
+        if (!File.Exists(journal) || GrassVmPackage.IsReparsePointOrLink(journal)) return;
+        try
         {
-            try
+            var tx = JsonSerializer.Deserialize<CommitJournal>(File.ReadAllText(journal));
+            if (tx is null || string.IsNullOrWhiteSpace(tx.Parent) || string.IsNullOrWhiteSpace(tx.Backup)) return;
+            var root = Path.GetFullPath(package.Path).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                + Path.DirectorySeparatorChar;
+            var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            if (!Path.GetFullPath(tx.Parent).StartsWith(root, cmp) || !Path.GetFullPath(tx.Backup).StartsWith(root, cmp)) return;
+            if (tx.Phase != "committed" && File.Exists(tx.Backup)
+                && !GrassVmPackage.IsReparsePointOrLink(tx.Backup))
+                File.Copy(tx.Backup, tx.Parent, overwrite: true);
+            DeleteIfExists(tx.Backup);
+            DeleteIfExists(journal);
+        }
+        catch { /* 保留 journal，待下一次启动或人工诊断 */ }
+    }
+
+    private sealed record CommitJournal(string Parent, string Backup, string Phase);
+
+    private static GrassVmPackage? FindOwningPackage(string path)
+    {
+        for (var current = new DirectoryInfo(Path.GetDirectoryName(Path.GetFullPath(path))!);
+             current is not null; current = current.Parent)
+        {
+            if (GrassVmPackage.IsGrassVmDirectory(current.FullName))
             {
-                var parent = tmp[..^CommitTempSuffix.Length];
-                if (File.Exists(parent)) File.Move(tmp, parent, overwrite: true);
-                else File.Move(tmp, parent);
-            }
-            catch (IOException)
-            {
-                // 占用：留待下一轮
+                try { return new GrassVmPackage(current.FullName); }
+                catch (ArgumentException) { return null; }
             }
         }
+        return null;
     }
 
     /// <summary>
@@ -231,6 +308,25 @@ public sealed class TransactionalDiskOps
 
     internal Operation Run(string[] arguments, string? tempTarget)
     {
+        var marker = IsTransactionalTemp(tempTarget) ? tempTarget + ActiveMarkerSuffix : null;
+        if (marker is not null)
+        {
+            try
+            {
+                if (GrassVmPackage.IsReparsePointOrLink(marker))
+                    throw new QemuImgException("磁盘事务活动标记包含不受支持的符号链接或目录联接。");
+                Directory.CreateDirectory(Path.GetDirectoryName(marker)!);
+                // 先写 pid=0，再启动子进程：Core 在这个极窄窗口崩溃时，启动清理
+                // 仍会把新鲜标记保留下来，而不是误删刚准备使用的临时文件。
+                File.WriteAllText(marker, JsonSerializer.Serialize(new
+                {
+                    pid = 0,
+                    startedAtUtc = DateTimeOffset.UtcNow,
+                }));
+            }
+            catch (IOException) { marker = null; }
+            catch (UnauthorizedAccessException) { marker = null; }
+        }
         var psi = new ProcessStartInfo
         {
             FileName = _qemuImgPath,
@@ -241,9 +337,36 @@ public sealed class TransactionalDiskOps
         };
         foreach (var a in arguments) psi.ArgumentList.Add(a);
         _log?.Invoke($"qemu-img {string.Join(' ', arguments)}");
-        var p = Process.Start(psi) ?? throw new InvalidOperationException("无法启动 qemu-img。");
-        return new Operation { Process = p, TempTarget = tempTarget };
+        var startedAtUtc = DateTimeOffset.UtcNow;
+        Process p;
+        try
+        {
+            p = Process.Start(psi) ?? throw new InvalidOperationException("无法启动 qemu-img。");
+        }
+        catch
+        {
+            if (marker is not null) { try { File.Delete(marker); } catch { } }
+            throw;
+        }
+        if (marker is not null)
+        {
+            try
+            {
+                File.WriteAllText(marker, JsonSerializer.Serialize(new
+                {
+                    pid = p.Id,
+                    startedAtUtc,
+                }));
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+        return new Operation { Process = p, TempTarget = tempTarget, ActiveMarkerPath = marker };
     }
+
+    private static bool IsTransactionalTemp(string? path) =>
+        path is not null && (path.EndsWith(TempSuffix, StringComparison.Ordinal)
+            || path.EndsWith(CommitTempSuffix, StringComparison.Ordinal));
 
     internal static async Task WaitForAsync(Operation op, CancellationToken ct)
     {
@@ -335,6 +458,11 @@ public sealed class TransactionalDiskOps
 
     private static void DeleteIfExists(string p)
     {
+        // File.Exists 对悬空符号链接返回 false；若直接把该路径交给
+        // File.Copy/qemu-img，目标可能被跟随并写到包外。临时路径属于 Core
+        // 自己管理的命名空间，发现任何链接都必须失败而不是尝试复用。
+        if (GrassVmPackage.IsReparsePointOrLink(p))
+            throw new QemuImgException("磁盘事务临时文件包含不受支持的符号链接或目录联接。");
         if (File.Exists(p)) File.Delete(p);
     }
 }
@@ -352,7 +480,7 @@ public sealed class StartupPreflight
     public static List<Problem> Check(GrassVmPackage package, VmConfigView config, bool lockHeld = false)
     {
         var problems = new List<Problem>();
-        if (!lockHeld && File.Exists(package.LockPath))
+        if (!lockHeld && package.HasLockFiles)
         {
             problems.Add(new Problem(
                 "此虚拟机已被占用（vm.lock 存在）。只有在确认它没有在其他实例或其他电脑上运行时，才能解除锁定。",
@@ -360,11 +488,34 @@ public sealed class StartupPreflight
         }
         if (!config.HasDisplayDevice)
             problems.Add(new Problem("此虚拟机没有显示设备，无法启动。", Fatal: true));
-        if (config.NeedsNvram && !File.Exists(Path.Combine(package.FirmwarePath, "VARS.fd")))
+        if (config.NeedsNvram)
         {
-            problems.Add(new Problem(
-                "此虚拟机的启动固件数据（NVRAM）缺失。请在设置中重建，或删除后重新创建这台虚拟机。",
-                Fatal: true));
+            var vars = Path.Combine(package.FirmwarePath, "VARS.fd");
+            if (!File.Exists(vars))
+            {
+                problems.Add(new Problem(
+                    GrassVmPackage.IsReparsePointOrLink(vars)
+                        ? "此虚拟机的启动固件数据（NVRAM）是符号链接或目录联接，已拒绝使用。请在设置中重建。"
+                        : "此虚拟机的启动固件数据（NVRAM）缺失。请在设置中重建，或删除后重新创建这台虚拟机。",
+                    Fatal: true));
+            }
+            else
+            {
+                try
+                {
+                    var attrs = File.GetAttributes(vars);
+                    if ((attrs & FileAttributes.ReparsePoint) != 0 || (attrs & FileAttributes.Directory) != 0)
+                        problems.Add(new Problem("此虚拟机的启动固件数据（NVRAM）必须是普通文件，不能是符号链接或目录。", Fatal: true));
+                }
+                catch (IOException)
+                {
+                    problems.Add(new Problem("无法检查此虚拟机的启动固件数据（NVRAM），已阻止启动。", Fatal: true));
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    problems.Add(new Problem("无法检查此虚拟机的启动固件数据（NVRAM），已阻止启动。", Fatal: true));
+                }
+            }
         }
 
         foreach (var disk in config.Disks)

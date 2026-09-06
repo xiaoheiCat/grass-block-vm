@@ -49,13 +49,19 @@ public sealed class OvfImporter(TransactionalDiskOps diskOps, string? ovmfVarsTe
         var ns = OvfNames(ovfDoc);
         var env = ovfDoc.Root ?? throw new GrassCoreException("OVF 文档为空。");
         var diskSection = env.Element(ns + "DiskSection");
-        // 重复的 id/diskId（手写档案/坏掉的导出工具）会让 ToDictionary 裸抛
-        // ArgumentException——首个生效的宽容映射，语义与"未知 id 引用解析
-        // 失败→警告"一致
-        var files = env.Element(ns + "References")?.Elements(ns + "File")
-            .GroupBy(f => (string)f.Attribute(ns + "id")!)
-            .ToDictionary(g => g.Key, g => (string)g.First().Attribute(ns + "href")!, StringComparer.Ordinal)
-            ?? new Dictionary<string, string>();
+        // 重复的 id（手写档案/坏掉的导出工具）采用首个生效，语义与
+        // "未知 id 引用解析失败→警告"一致；id/href 缺失则明确拒收，避免
+        // LINQ ToDictionary 裸抛 ArgumentNullException，向 RPC 暴露不可读的错误。
+        var files = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var file in env.Element(ns + "References")?.Elements(ns + "File")
+                     ?? Enumerable.Empty<XElement>())
+        {
+            var id = (string?)file.Attribute(ns + "id");
+            var href = (string?)file.Attribute(ns + "href");
+            if (string.IsNullOrWhiteSpace(id) || string.IsNullOrWhiteSpace(href))
+                throw new GrassCoreException("OVF References/File 缺少有效的 id 或 href，无法导入。");
+            files.TryAdd(id, href);
+        }
         // diskId → (fileRef, virtualSize, format)：capacity × capacityAllocationUnits（默认字节）
         var disks = diskSection?.Elements(ns + "Disk")
             .GroupBy(d => (string?)d.Attribute(ns + "diskId") ?? "")
@@ -432,7 +438,9 @@ public sealed class OvfImporter(TransactionalDiskOps diskOps, string? ovmfVarsTe
                 }
                 var dst = Path.Combine(pkg.Path, "isovol",
                     $"cd{cdOrdinal}-{SanitizeFileName(Path.GetFileNameWithoutExtension(srcIso))}{Path.GetExtension(srcIso)}");
-                File.Copy(srcIso, dst, overwrite: true);
+                using (var source = VerifiedExtractionFile.OpenExistingVerified(srcIso))
+                using (var output = VerifiedExtractionFile.OpenNewWithin(Path.Combine(pkg.Path, "isovol"), dst))
+                    source.CopyTo(output);
                 cd.IsoPath = PathPolicy.NormalizeReference(pkg, dst);
             }
             // 选择"仍然导入"：不可用设备以 Raw(Unsupported) 保留，VM 可能无法运行（用户已被告知）。
@@ -460,7 +468,10 @@ public sealed class OvfImporter(TransactionalDiskOps diskOps, string? ovmfVarsTe
                 if (ovmfVarsTemplate is not null && File.Exists(ovmfVarsTemplate))
                 {
                     Directory.CreateDirectory(pkg.FirmwarePath);
-                    File.Copy(ovmfVarsTemplate, Path.Combine(pkg.FirmwarePath, "VARS.fd"), overwrite: true);
+                    var varsPath = Path.Combine(pkg.FirmwarePath, "VARS.fd");
+                    using var source = VerifiedExtractionFile.OpenExistingVerified(ovmfVarsTemplate);
+                    using var output = VerifiedExtractionFile.OpenNewWithin(pkg.FirmwarePath, varsPath);
+                    source.CopyTo(output);
                 }
                 else
                 {
@@ -485,14 +496,14 @@ public sealed class OvfImporter(TransactionalDiskOps diskOps, string? ovmfVarsTe
     /// <summary>解 OVA（tar）到目录，返回其中的 .ovf 文档路径。</summary>
     public static string ExtractOva(string ovaPath, string destDir)
     {
-        if (GrassVmPackage.ContainsReparsePoint(destDir))
-            throw new GrassCoreException("OVA 解压目录不能通过符号链接或目录联接访问。");
+        destDir = VerifiedExtractionFile.ResolveStablePath(destDir);
         Directory.CreateDirectory(destDir);
+        destDir = VerifiedExtractionFile.ResolveStablePath(destDir);
         const int maxEntries = 100_000;
         const long maxEntryBytes = 128L * 1024 * 1024 * 1024;
         const long maxTotalBytes = 512L * 1024 * 1024 * 1024;
         long total = 0;
-        using var input = File.OpenRead(ovaPath);
+        using var input = VerifiedExtractionFile.OpenExistingVerified(ovaPath);
         using var reader = new TarReader(input);
         TarEntry? entry;
         var count = 0;
@@ -514,7 +525,12 @@ public sealed class OvfImporter(TransactionalDiskOps diskOps, string? ovmfVarsTe
             // 位于 base 目录内；随后 ExtractToFile 可把文件写到其兄弟目录。
             if (!target.StartsWith(rootPrefix, pathComparison))
                 throw new GrassCoreException("OVA 包含非法路径，已拒绝导入。");
-            if (entry.EntryType is TarEntryType.Directory) { Directory.CreateDirectory(target); continue; }
+            if (entry.EntryType is TarEntryType.Directory)
+            {
+                EnsureExtractionPathIsSafe(root, target, directory: true);
+                Directory.CreateDirectory(target);
+                continue;
+            }
             // Tar 可以携带符号链接、硬链接和设备节点。不能把这些条目交给
             // ExtractToFile：它们可能在解包阶段重新指向 destDir 外部，或把宿主
             // 设备暴露成普通文件。OVA 导入只接受普通文件与目录。
@@ -522,12 +538,67 @@ public sealed class OvfImporter(TransactionalDiskOps diskOps, string? ovmfVarsTe
                 throw new GrassCoreException("OVA 包含不支持的链接或特殊文件条目，已拒绝导入。");
             if (entry.Length > maxEntryBytes || (total = checked(total + entry.Length)) > maxTotalBytes)
                 throw new GrassCoreException("OVA 解压内容超过安全配额，已拒绝导入。");
+            if (entry.Length > AvailableFreeSpace(destDir))
+                throw new GrassCoreException("解压这份 OVA 所需空间超过临时目录当前剩余空间，已拒绝导入。请先清理空间后重试。");
+            EnsureExtractionPathIsSafe(root, target, directory: false);
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-            entry.ExtractToFile(target, overwrite: true);
+            // 创建父目录后再次检查，缩小检查与打开之间的重解析点替换窗口；
+            // FileMode.CreateNew 继续拒绝已有目标，避免覆盖外部文件。
+            EnsureExtractionPathIsSafe(root, target, directory: false);
+            // 不使用 overwrite=true：即使目标在检查后被替换成链接，CreateNew
+            // 也不会打开已有目标；重复条目同样拒绝，避免覆盖宿主文件。
+            using var output = VerifiedExtractionFile.OpenNewWithin(root, target);
+            entry.DataStream?.CopyTo(output);
         }
         var ovf = Directory.EnumerateFiles(destDir, "*.ovf", SearchOption.AllDirectories).FirstOrDefault();
         // tar 条目路径安全：ExtractToDirectory 已做路径规范化；额外校验不逃逸
         return ovf ?? throw new GrassCoreException("OVA 中找不到 .ovf 描述文件。");
+    }
+
+    private static void EnsureExtractionPathIsSafe(string root, string target, bool directory)
+    {
+        var comparison = OperatingSystem.IsWindows()
+            ? StringComparison.OrdinalIgnoreCase
+            : StringComparison.Ordinal;
+        var rootFull = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var targetFull = Path.GetFullPath(target);
+        if (!targetFull.StartsWith(rootFull + Path.DirectorySeparatorChar, comparison))
+            throw new GrassCoreException("OVA 包含非法路径，已拒绝导入。");
+
+        // 逐级检查已存在的父目录和目标本身。新目录/文件尚不存在时，
+        // Directory.CreateDirectory/FileMode.CreateNew 会在同一目标上再次拒绝已有对象。
+        var parent = directory ? targetFull : Path.GetDirectoryName(targetFull)!;
+        var pending = new Stack<string>();
+        for (var current = parent; current is not null
+             && !string.Equals(current, rootFull, comparison);
+             current = Path.GetDirectoryName(current))
+            pending.Push(current);
+        while (pending.Count > 0)
+        {
+            var current = pending.Pop();
+            if (GrassVmPackage.IsReparsePointOrLink(current))
+                throw new GrassCoreException("OVA 解压路径包含符号链接或目录联接，已拒绝导入。");
+        }
+        if (GrassVmPackage.IsReparsePointOrLink(targetFull))
+            throw new GrassCoreException("OVA 解压目标包含符号链接或目录联接，已拒绝导入。");
+        if (File.Exists(targetFull) || Directory.Exists(targetFull))
+        {
+            if (!directory)
+                throw new GrassCoreException("OVA 包包含重复或已存在的目标文件，已拒绝覆盖。");
+        }
+    }
+
+    private static long AvailableFreeSpace(string path)
+    {
+        try
+        {
+            var root = Path.GetPathRoot(Path.GetFullPath(path));
+            return string.IsNullOrEmpty(root) ? long.MaxValue : new DriveInfo(root).AvailableFreeSpace;
+        }
+        catch (Exception e) when (e is ArgumentException or IOException or UnauthorizedAccessException)
+        {
+            return long.MaxValue;
+        }
     }
 
     /// <summary>

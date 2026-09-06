@@ -76,6 +76,7 @@ public sealed class CoreCrashRecovery
         try { System.Diagnostics.Process.GetProcessById(pid); return true; }
         catch (ArgumentException) { return false; }
         catch (InvalidOperationException) { return false; }
+        catch (System.ComponentModel.Win32Exception) { return false; }
     }
 
     /// <summary>扫描 Library Root，返回所有带 vm.lock 的 VM 及其接管评估结果。</summary>
@@ -84,12 +85,17 @@ public sealed class CoreCrashRecovery
         var results = new List<ReadoptResult>();
         foreach (var pkg in GrassVm.GrassVmPackage.ScanLibraryRoot(libraryRoot))
         {
-            if (!File.Exists(pkg.LockPath)) continue;
+            // 不读取 runtime/session.json 之前先验证包内固定目录；否则 runtime
+            // junction/symlink 可把恢复扫描引到包外并泄露/改写外部会话文件。
+            if (!pkg.FixedDirectoriesAreSafe() || !pkg.FixedFilesAreSafe()) continue;
+            if (!pkg.HasLockFiles) continue;
             RuntimeSession? session = null;
             if (File.Exists(pkg.SessionPath))
             {
                 try { session = RuntimeSession.Deserialize(File.ReadAllText(pkg.SessionPath)); }
                 catch (System.Text.Json.JsonException) { /* 残留损坏：留给诊断，不自动清锁 */ }
+                catch (IOException) { /* 单个包不可读：留给诊断，不中止其他 VM 接管 */ }
+                catch (UnauthorizedAccessException) { /* 权限异常同样隔离到该包 */ }
             }
             if (session is null)
             {
@@ -99,8 +105,23 @@ public sealed class CoreCrashRecovery
                 }, QemuAlive: false, SessionValid: false));
                 continue;
             }
-            var alive = _isProcessAlive(session.QemuPid);
-            var valid = alive && (_sessionValidator?.Invoke(session) ?? true);
+            bool alive;
+            try { alive = _isProcessAlive(session.QemuPid); }
+            catch (ArgumentException) { alive = false; }
+            catch (InvalidOperationException) { alive = false; }
+            catch (System.ComponentModel.Win32Exception) { alive = false; }
+            catch (UnauthorizedAccessException) { alive = false; }
+            var valid = false;
+            if (alive)
+            {
+                try { valid = _sessionValidator?.Invoke(session) ?? true; }
+                catch (Exception)
+                {
+                    // 校验器属于单个会话的附加约束；其异常不能让一个坏包
+                    // 中止整个 Library 的恢复扫描，当前会话按无效处理。
+                    valid = false;
+                }
+            }
             results.Add(new ReadoptResult(pkg, session, alive, SessionValid: valid));
         }
         return results;

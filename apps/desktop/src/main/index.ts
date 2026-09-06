@@ -124,7 +124,19 @@ function startSpiceBridge(
 
 ipcMain.handle('core:call', async (_e, method: string, params?: unknown) => {
   const b = await createBridge();
-  return b.call(method, params);
+  const result = await b.call(method, params);
+  // 安装器以管理员权限运行，不能在安装阶段写 HKCU（可能属于提供凭据的
+  // 另一个用户）。只有实际登录用户在 Electron 中修改 VM 自启动时，才同步
+  // 该用户自己的登录项。
+  if (method === 'setAutostart' || method === 'removeAutostart') {
+    try {
+      const status = await b.call<{ enabled?: boolean }>('hasAutostart', {});
+      app.setLoginItemSettings({ openAtLogin: status.enabled === true, args: ['--autostart'] });
+    } catch (error) {
+      console.error('[autostart] login item sync failed:', error);
+    }
+  }
+  return result;
 });
 
 // 每个显示器窗口一个 SPICE 桥；窗口关闭时拆除（否则每次开窗泄漏一个 HTTP 服务器）
@@ -232,13 +244,15 @@ app.whenReady().then(async () => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createLibraryWindow();
   });
-  // 自启动只在【开机登录触发的启动】跑（安装器写的 Run 键带 --autostart）。
+  // 自启动只在【开机登录触发的启动】跑（实际用户的登录项带 --autostart）。
   // 用户手动打开应用不拉清单——否则每次打开库都把所有 autostart VM 开一遍
   if (!process.argv.includes('--autostart')) return;
   try {
     const b = await createBridge();
-    b.call('runAutostart', {}).catch((e: unknown) => console.error('[autostart]', e));
+    await b.call('runAutostart', {});
+    app.quit();
   } catch (e) {
     console.error('[autostart] bridge unavailable:', e);
+    app.quit();
   }
 });

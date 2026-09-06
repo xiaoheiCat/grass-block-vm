@@ -330,6 +330,16 @@ public class QemuCommandBuilderTests : IDisposable
         Assert.Contains("mac=52:54:00:", j1);
     }
 
+    [Fact]
+    public void Mac_RejectsQemuOptionInjection()
+    {
+        var config = OsProfileLibrary.CreateDefaultConfig("ubuntu", "Builder VM");
+        var net = config.Devices.OfType<NetworkDevice>().First();
+        net.MacAddress = "52:54:00:00:00:00,romfile=C:/Users/victim/secret.bin";
+
+        Assert.Throws<InvalidOperationException>(() => Build(config, _pkg.Path));
+    }
+
     private static int CountOccurrences(string haystack, string needle)
     {
         var count = 0;
@@ -372,6 +382,37 @@ public class QemuCommandBuilderTests : IDisposable
         var macs = args.Where(a => a.Contains("mac=", StringComparison.Ordinal))
             .Select(a => a.Split("mac=")[1].Split(',')[0]).ToList();
         Assert.Equal(macs.Count, macs.Distinct().Count());
+    }
+
+    [Fact]
+    public void BootIndex_RemainsUnique_WhenClassExceedsLegacyHundredSlot()
+    {
+        var config = OsProfileLibrary.CreateDefaultConfig("ubuntu", "Many disks");
+        for (var i = 0; i < 101; i++)
+            config.Devices.Add(new DiskDevice
+            {
+                Path = $"disks/data-{i}.qcow2",
+                SizeBytes = 8,
+                CreatedOrder = 100 + i,
+            });
+        config.Devices.Add(new CdromDevice { IsoPath = null, CreatedOrder = 300 });
+
+        var args = Build(config, _pkg.Path);
+        var indices = args.Where(a => a.Contains("bootindex=", StringComparison.Ordinal))
+            .Select(a => int.Parse(a.Split("bootindex=")[1].Split(',')[0]))
+            .ToList();
+        Assert.Equal(indices.Count, indices.Distinct().Count());
+
+        var diskIndices = args.Where(a => a.Contains("bootindex=", StringComparison.Ordinal)
+                                           && a.Contains("virtio-blk", StringComparison.Ordinal))
+            .Select(a => int.Parse(a.Split("bootindex=")[1].Split(',')[0]))
+            .ToList();
+        var cdIndices = args.Where(a => a.Contains("bootindex=", StringComparison.Ordinal)
+                                        && a.Contains("ide-cd", StringComparison.Ordinal))
+            .Select(a => int.Parse(a.Split("bootindex=")[1].Split(',')[0]))
+            .ToList();
+        Assert.True(diskIndices.Count > 100 && cdIndices.Count == 1);
+        Assert.True(diskIndices.Max() < cdIndices.Min());
     }
 
     [Fact]

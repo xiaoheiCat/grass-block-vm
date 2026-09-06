@@ -69,7 +69,7 @@ export PATH="$PWD/.dotnet:$PATH"
 export DOTNET_CLI_HOME="$PWD/.dotnet-home" NUGET_PACKAGES="$PWD/.nuget"
 ```
 
-开发机（非 Windows）调试 GrassCore：`dotnet run --project apps/core/src/GrassCore` 走 stdio JSON-RPC（4 字节小端长度前缀 + JSON），用 `GRASSCORE_QEMU_DIR` / `GRASSCORE_OVMF_DIR` / `GRASSCORE_QEMU_MAJOR` 环境变量指向假 QEMU 目录即可全链路驱动（创建/快照/克隆/导入导出/挂起恢复均有单测与假件覆盖）。
+开发机（非 Windows）调试 GrassCore：`dotnet run --project apps/core/src/GrassCore` 走 stdio JSON-RPC（4 字节小端长度前缀 + JSON），Debug 构建可用 `GRASSCORE_QEMU_DIR` / `GRASSCORE_OVMF_DIR` / `GRASSCORE_QEMU_MAJOR` 环境变量指向假 QEMU 目录；Release 构建必须显式追加 `--dev-runtime` 才允许覆盖。正式安装版不接受这些环境变量，只从安装包内固定目录加载运行时。
 
 ## 平台边界（1.0）
 

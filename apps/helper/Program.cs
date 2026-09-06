@@ -111,6 +111,9 @@ static async Task RunWebSocketClientAsync(WebSocket socket, HelperOptions option
         var buffer = new byte[64 * 1024];
         var authenticated = false;
         const int maxMessageBytes = 1 * 1024 * 1024;
+        // 握手完成后仍未认证的连接不能无限占用 Helper 槽位：本机任意进程
+        // 都能完成普通 WebSocket 101，但只有持有会话 token 的渲染器才应长期留存。
+        using var authenticationTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         while (socket.State == WebSocketState.Open)
         {
             WebSocketReceiveResult received;
@@ -119,9 +122,10 @@ static async Task RunWebSocketClientAsync(WebSocket socket, HelperOptions option
             {
                 // WebSocket 允许把一条文本消息拆成任意数量的帧；必须累积到
                 // EndOfMessage 才能交给 JSON 解析器，且设置总量上限避免内存滥用。
+                var receiveToken = authenticated ? CancellationToken.None : authenticationTimeout.Token;
                 do
                 {
-                    received = await socket.ReceiveAsync(buffer, CancellationToken.None);
+                    received = await socket.ReceiveAsync(buffer, receiveToken);
                     if (received.MessageType == WebSocketMessageType.Close) break;
                     if (received.Count > 0) message.Write(buffer, 0, received.Count);
                     if (message.Length > maxMessageBytes)
@@ -159,6 +163,9 @@ static async Task RunWebSocketClientAsync(WebSocket socket, HelperOptions option
                         _ => new { error = "unknown-method" },
                     };
                 await SendAsync(socket, new { jsonrpc = "2.0", id, result });
+                // 错误 token 连接立即释放槽位；不允许攻击者通过反复发送无效
+                // hello 把未认证连接保持成长期占位。
+                if (method == "hello" && !authenticated) return;
             }
             catch
             {

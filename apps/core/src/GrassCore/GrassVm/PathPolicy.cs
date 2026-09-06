@@ -40,6 +40,26 @@ public static class PathPolicy
         catch (IOException) { return false; }
     }
 
+    /// <summary>
+    /// 按解析后的实际位置判断资源是否包外。与 DiskDevice.IsExternal 的字符串判断
+    /// 不同，这里兼容历史配置中保存的包内绝对路径，同时把越界/非法引用视为外部，
+    /// 让调用方采取保守拒绝或不参与快照链的处理。
+    /// </summary>
+    public static bool IsExternal(GrassVmPackage package, string storedRef)
+    {
+        try
+        {
+            var resolved = System.IO.Path.GetFullPath(Resolve(package, storedRef));
+            var root = System.IO.Path.GetFullPath(package.Path)
+                .TrimEnd(System.IO.Path.DirectorySeparatorChar, System.IO.Path.AltDirectorySeparatorChar)
+                + System.IO.Path.DirectorySeparatorChar;
+            var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+            return !resolved.StartsWith(root, cmp);
+        }
+        catch (ArgumentException) { return true; }
+        catch (IOException) { return true; }
+    }
+
     private static string ResolvePackagePath(GrassVmPackage package, string storedRef)
     {
         var root = EnsureTrailingSeparator(System.IO.Path.GetFullPath(package.Path));

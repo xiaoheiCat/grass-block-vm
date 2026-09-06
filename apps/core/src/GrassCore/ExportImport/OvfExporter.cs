@@ -15,10 +15,50 @@ namespace GrassCore.ExportImport;
 /// </summary>
 public sealed class OvfExporter(TransactionalDiskOps diskOps)
 {
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim> ExportGates =
+        new(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+
     public async Task<string> ExportAsync(GrassVmPackage package, string destDir, CancellationToken ct = default)
     {
+        var targetDir = Path.GetFullPath(destDir);
+        var gate = ExportGates.GetOrAdd(targetDir, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            return await ExportAsyncCore(package, targetDir, ct);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task<string> ExportAsyncCore(GrassVmPackage package, string targetDir, CancellationToken ct)
+    {
+        targetDir = VerifiedExtractionFile.ResolveStablePath(targetDir);
+        EnsureExportPathSafe(targetDir);
+        using var exportLock = ExportTargetLock.Acquire(targetDir);
+        var stagingDir = targetDir + ".grass-tmp-" + Guid.NewGuid().ToString("N");
+        EnsureExportPathSafe(stagingDir);
+        try
+        {
+            Directory.CreateDirectory(stagingDir);
+            stagingDir = VerifiedExtractionFile.ResolveStablePath(stagingDir);
+            var stagedOvf = await ExportIntoDirectoryAsync(package, stagingDir, ct);
+            CommitStagingDirectory(stagingDir, targetDir);
+            return Path.Combine(targetDir, Path.GetFileName(stagedOvf));
+        }
+        catch
+        {
+            try { if (Directory.Exists(stagingDir)) Directory.Delete(stagingDir, recursive: true); } catch { }
+            throw;
+        }
+    }
+
+    private async Task<string> ExportIntoDirectoryAsync(GrassVmPackage package, string destDir, CancellationToken ct)
+    {
         var config = new ConfigStore(package).Load();
-        Directory.CreateDirectory(destDir);
+        EnsureExportPathSafe(destDir);
         var vmId = Sanitize(config.Name);
         if (string.IsNullOrEmpty(vmId)) vmId = "vm";
 
@@ -37,9 +77,11 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
         {
             idx++;
             var src = ResolveSafeExportFile(package, disk.Path, "硬盘");
+            using var sourceGuard = VerifiedExtractionFile.OpenExistingVerified(src);
             EnsureBackingChainContained(package, src);
             var href = $"{vmId}-disk{idx}.vmdk";
             var dst = Path.Combine(destDir, href);
+            EnsureExportPathSafe(dst);
             // 清掉上次失败留下的半成品/旧档：convert 内部是 overwrite:false 的原子
             // 改名，对着旧目录重试导出会直接 IOException
             if (File.Exists(dst))
@@ -57,20 +99,61 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
             if (cd.IsoPath is null) continue;
             var src = ResolveSafeExportFile(package, cd.IsoPath, "光盘镜像");
             if (!File.Exists(src)) continue; // 介质已不在：导出为空光驱（与"弹出"同语义）
+            using var source = VerifiedExtractionFile.OpenExistingVerified(src);
             var href = $"{vmId}-cd{cdOrdinal}.iso";
             var dst = Path.Combine(destDir, href);
+            EnsureExportPathSafe(dst);
             if (File.Exists(dst))
                 throw new GrassCoreException($"导出目标已存在文件：{dst}。请选择空目录，避免覆盖已有档案。");
-            File.Copy(src, dst);
+            using (var output = VerifiedExtractionFile.OpenNewWithin(destDir, dst))
+                source.CopyTo(output);
             isoFiles.Add((cdOrdinal, href, new FileInfo(dst).Length));
         }
 
         var ovf = BuildOvfXml(config, vmId, diskFiles, isoFiles);
         var ovfPath = Path.Combine(destDir, vmId + ".ovf");
+        EnsureExportPathSafe(ovfPath);
         if (File.Exists(ovfPath))
             throw new GrassCoreException($"导出目标已存在文件：{ovfPath}。请选择空目录，避免覆盖已有档案。");
-        await File.WriteAllTextAsync(ovfPath, ovf, new UTF8Encoding(false), ct);
+        await using (var output = VerifiedExtractionFile.OpenNewWithin(destDir, ovfPath))
+        await using (var writer = new StreamWriter(output, new UTF8Encoding(false), bufferSize: 4096, leaveOpen: false))
+            await writer.WriteAsync(ovf.AsMemory(), ct);
         return ovfPath;
+    }
+
+    private static void CommitStagingDirectory(string stagingDir, string targetDir)
+    {
+        EnsureExportPathSafe(targetDir);
+        var moved = new List<string>();
+        try
+        {
+            Directory.CreateDirectory(targetDir);
+            EnsureExportPathSafe(targetDir);
+            foreach (var source in Directory.EnumerateFiles(stagingDir, "*", SearchOption.AllDirectories))
+            {
+                var stableSource = VerifiedExtractionFile.ResolveStablePath(source);
+                var relative = Path.GetRelativePath(stagingDir, stableSource);
+                var destination = Path.Combine(targetDir, relative);
+                EnsureExportPathSafe(destination);
+                Directory.CreateDirectory(Path.GetDirectoryName(destination)!);
+                // 创建父目录后重新解析目标；后续移动只使用稳定路径，
+                // 不再把检查过的原始路径交给 File.Move。
+                destination = VerifiedExtractionFile.ResolveStablePath(destination);
+                if (File.Exists(destination) || Directory.Exists(destination))
+                    throw new GrassCoreException($"导出目标已存在文件：{destination}。请选择空目录，避免覆盖已有档案。");
+                File.Move(stableSource, destination);
+                moved.Add(destination);
+            }
+            Directory.Delete(stagingDir, recursive: true);
+        }
+        catch
+        {
+            foreach (var destination in moved)
+            {
+                try { if (File.Exists(destination)) File.Delete(destination); } catch { }
+            }
+            throw;
+        }
     }
 
     private static string ResolveSafeExportFile(GrassVmPackage package, string storedRef, string label)
@@ -91,7 +174,7 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
             || GrassVmPackage.ContainsReparsePoint(full))
             throw new GrassCoreException(
                 $"{label}必须是虚拟机包内的普通文件，不能导出包外文件或符号链接。请先将资源移入包内后重试。");
-        return full;
+        return VerifiedExtractionFile.ResolveStablePath(full);
     }
 
     private void EnsureBackingChainContained(GrassVmPackage package, string image)
@@ -123,17 +206,40 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
     /// <summary>OVA = ovf + vmdk 打 tar。旧档案先保底再替换（与 zip 导出同一策略）。</summary>
     public async Task<string> ExportOvaAsync(GrassVmPackage package, string ovaPath, string workDir, CancellationToken ct = default)
     {
+        var targetPath = Path.GetFullPath(ovaPath);
+        var gate = ExportGates.GetOrAdd(targetPath, static _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            return await ExportOvaAsyncCore(package, targetPath, workDir, ct);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task<string> ExportOvaAsyncCore(GrassVmPackage package, string ovaPath, string workDir, CancellationToken ct)
+    {
+        ovaPath = VerifiedExtractionFile.ResolveStablePath(ovaPath);
+        workDir = VerifiedExtractionFile.ResolveStablePath(workDir);
+        EnsureExportPathSafe(ovaPath);
+        using var exportLock = ExportTargetLock.Acquire(ovaPath);
         var dir = Path.Combine(workDir, "ova-" + Guid.NewGuid().ToString("N"));
         var tempOva = ovaPath + ".grass-tmp-" + Guid.NewGuid().ToString("N");
         var backup = ovaPath + ".grass-old-" + Guid.NewGuid().ToString("N");
+        EnsureExportPathSafe(tempOva);
+        EnsureExportPathSafe(backup);
         var hadOld = File.Exists(ovaPath);
         try
         {
             await ExportAsync(package, dir, ct);
+            dir = VerifiedExtractionFile.ResolveStablePath(dir);
             // OVA 的第一个 tar 条目必须是 OVF descriptor，便于流式导入器在
             // 尚未下载完大磁盘时先读到硬件描述。CreateFromDirectory 的枚举顺序
             // 不提供此保证，显式用 TarWriter 固定 ovf → 其它资源的顺序。
-            await using (var output = File.Create(tempOva))
+            await using (var output = VerifiedExtractionFile.OpenNewWithin(
+                             Path.GetDirectoryName(tempOva)!, tempOva))
             await using (var writer = new TarWriter(output, TarEntryFormat.Pax, leaveOpen: false))
             {
                 var files = Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories)
@@ -145,7 +251,7 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
                     var rel = Path.GetRelativePath(dir, file).Replace('\\', '/');
                     var entry = new PaxTarEntry(TarEntryType.RegularFile, rel)
                     {
-                        DataStream = File.OpenRead(file),
+                        DataStream = VerifiedExtractionFile.OpenExistingVerified(file),
                     };
                     try { await writer.WriteEntryAsync(entry, ct); }
                     finally { entry.DataStream?.Dispose(); }
@@ -166,6 +272,19 @@ public sealed class OvfExporter(TransactionalDiskOps diskOps)
         }
         if (hadOld) try { File.Delete(backup); } catch { }
         return ovaPath;
+    }
+
+    private static void EnsureExportPathSafe(string path)
+    {
+        try
+        {
+            if (GrassVmPackage.IsReparsePointOrLink(Path.GetFullPath(path)))
+                throw new GrassCoreException("导出目标或其父目录包含符号链接或目录联接，已拒绝写入。");
+        }
+        catch (ArgumentException)
+        {
+            throw new GrassCoreException("导出目标路径无效，已拒绝写入。");
+        }
     }
 
     private static string BuildOvfXml(VmConfiguration config, string vmId,

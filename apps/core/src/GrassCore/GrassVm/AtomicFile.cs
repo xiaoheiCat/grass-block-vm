@@ -48,11 +48,15 @@ public sealed class VmLock : IDisposable
     private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, FileStream> Handles =
         new(OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
     private readonly GrassVmPackage _package;
+    // vm.lock.guard 的句柄是实际的跨进程排他锁；FileOptions.DeleteOnClose
+    // 确保 Core 崩溃后不会留下一个可被误认为仍在使用的 guard。vm.lock 本身
+    // 由 _markerHandle 持有 FileShare.None，作为需要人工确认的持久化残留标记。
     private FileStream? _handle;
+    private FileStream? _markerHandle;
 
     public VmLock(GrassVmPackage package) => _package = package;
 
-    public bool IsLocked => File.Exists(_package.LockPath);
+    public bool IsLocked => File.Exists(_package.LockPath) || File.Exists(_package.LockGuardPath);
 
     /// <summary>
     /// 获取锁。已存在 vm.lock 直接阻止并引导手动解除锁——本机崩溃后也不自动接管，
@@ -61,36 +65,47 @@ public sealed class VmLock : IDisposable
     public void Acquire()
     {
         if (_handle is not null) return;
-        if (IsLocked)
+        if (IsLocked || File.Exists(_package.LockGuardPath))
             throw new VmLockedException($"此虚拟机已被占用（存在 vm.lock）。只有在确认它没有在其他 Grass Block VM 实例或其他电脑上运行时，才能解除锁定。");
         Directory.CreateDirectory(_package.Path);
-        // 排他创建（原子）：检查-再-写入在并发双击下会让两个调用都通过检查——
-        // 两个 QEMU 同写一张盘正是 vm.lock 要防的事故。CreateNew 在文件已存在时抛 IOException。
-        FileStream? fs = null;
+        // 先原子创建并持有持久化标记，再创建独占 guard。两个进程的并发
+        // CreateNew 只有一个赢家；guard 使用 FileShare.None，外部进程不能
+        // 在生命周期内删除/替换它来绕过互斥。
+        FileStream? marker = null;
+        FileStream? guard = null;
+        var markerCreated = false;
         try
         {
-            // 允许删除当前打开的锁文件：Release 会先在持有句柄时删除路径，
-            // 避免关闭句柄后到 Delete 之间被另一进程抢先创建同名新锁。
-            fs = new FileStream(_package.LockPath, FileMode.CreateNew, FileAccess.ReadWrite, FileShare.Delete);
-            fs.WriteByte(0);
-            fs.Flush(true);
-            if (!Handles.TryAdd(_package.LockPath, fs))
-            {
-                fs.Dispose();
-                fs = null;
+            marker = new FileStream(_package.LockPath, FileMode.CreateNew, FileAccess.ReadWrite,
+                FileShare.None, bufferSize: 1, options: FileOptions.WriteThrough);
+            markerCreated = true;
+            marker.WriteByte(0);
+            marker.Flush(true);
+            guard = new FileStream(_package.LockGuardPath, FileMode.CreateNew, FileAccess.ReadWrite,
+                FileShare.None, bufferSize: 1, options: FileOptions.DeleteOnClose);
+            if (!Handles.TryAdd(_package.LockPath, guard))
                 throw new VmLockedException("此虚拟机已被当前进程占用。");
-            }
-            _handle = fs;
-            fs = null;
+            _markerHandle = marker;
+            _handle = guard;
+            marker = null;
+            guard = null;
         }
-        catch (IOException) when (File.Exists(_package.LockPath))
+        catch (IOException) when (File.Exists(_package.LockPath) || File.Exists(_package.LockGuardPath))
         {
-            try { fs?.Dispose(); } catch { }
+            try { guard?.Dispose(); } catch { }
+            try { marker?.Dispose(); } catch { }
+            // 若 guard 创建失败且没有其他持有者，撤销本次创建的标记；
+            // 已存在 guard 时保留标记，避免把活锁伪装成无锁状态。
+            if (markerCreated && !Handles.ContainsKey(_package.LockPath) && !File.Exists(_package.LockGuardPath))
+                TryDeleteMarker();
             throw new VmLockedException($"此虚拟机已被占用（存在 vm.lock）。只有在确认它没有在其他 Grass Block VM 实例或其他电脑上运行时，才能解除锁定。");
         }
         catch
         {
-            try { fs?.Dispose(); } catch { }
+            try { guard?.Dispose(); } catch { }
+            try { marker?.Dispose(); } catch { }
+            if (markerCreated && !Handles.ContainsKey(_package.LockPath) && !File.Exists(_package.LockGuardPath))
+                TryDeleteMarker();
             throw;
         }
     }
@@ -98,61 +113,64 @@ public sealed class VmLock : IDisposable
     /// <summary>正常释放 VM 时删除 vm.lock。仅当锁确实存在且由本次会话持有时调用。</summary>
     public void Release()
     {
-        var h = Interlocked.Exchange(ref _handle, null);
-        if (h is null)
+        if (_handle is null)
         {
-            // 生命周期收尾经常发生在 Core 重启后（AdoptRunningVms / Exited 监视器）：
-            // 原进程的 FileStream 已由操作系统释放，但 vm.lock 文件仍在。先尝试把
-            // 现存文件以 FileShare.None 重新登记到本进程；只有取得排他句柄才允许
-            // 删除，避免把另一进程/另一台机器仍持有的锁误当残留清掉。
-            // 如果当前进程的另一个 VmLock 实例仍持有句柄，不能从全局表移除并
-            // 代为释放；否则一个无句柄的临时实例会误杀正在运行 VM 的锁。
+            // 生命周期收尾经常发生在 Core 重启后：只有成功以独占方式
+            // 接管残留标记和 guard，才允许清理；另一个进程持有 marker/guard
+            // 时这里会失败并保留锁。
             if (Handles.ContainsKey(_package.LockPath)) return;
-            h = TryAttachExistingHandle();
+            if (TryAttachExistingHandle() is null) return;
         }
-        else
-        {
-            Handles.TryRemove(_package.LockPath, out _);
-        }
-        if (h is null) return; // 不得误删别的进程持有的锁
-        // 句柄仍在时删除路径：Windows 将其标记为 delete-pending，Unix 直接
-        // unlink；新进程只能在路径消失后创建新锁，不会被旧 Release 删除。
+        var guard = _handle;
+        if (guard is null) return;
         try
         {
-            if (File.Exists(_package.LockPath)) File.Delete(_package.LockPath);
+            var marker = Interlocked.Exchange(ref _markerHandle, null);
+            try { marker?.Dispose(); } catch { }
+            if (!TryDeleteMarker())
+            {
+                return;
+            }
         }
-        catch
-        {
-            // 删除失败时继续持有原句柄和全局登记，避免句柄泄漏或让对象
-            // 误以为已释放；下次显式 Release/Dispose 再尝试。
-            _handle = h;
-            Handles.TryAdd(_package.LockPath, h);
-            return;
-        } // 保留锁文件比误删新锁更安全
-        RemoveRegisteredHandle(h);
-        try { h.Dispose(); } catch { }
+        catch { return; /* 标记删除失败时继续持有 guard，交给后续重试 */ }
+        Interlocked.Exchange(ref _handle, null);
+        RemoveRegisteredHandle(guard);
+        try { guard.Dispose(); } catch { /* DeleteOnClose 尽力清理 guard */ }
     }
 
     private FileStream? TryAttachExistingHandle()
     {
         if (!File.Exists(_package.LockPath)) return null;
+        if (Handles.ContainsKey(_package.LockPath)) return null;
+        FileStream? marker = null;
+        FileStream? guard = null;
         try
         {
-            var fs = new FileStream(_package.LockPath, FileMode.Open, FileAccess.ReadWrite, FileShare.Delete);
-            if (Handles.TryAdd(_package.LockPath, fs)) return fs;
-            fs.Dispose();
-            // 另一个本进程实例已经持有它：不能把对方的句柄交给本次
-            // Release，否则会误关对方的排他锁并删除仍在使用的 vm.lock。
-            return null;
+            // 新旧版本都必须能安全处理：旧版本只持有 vm.lock，若它仍在运行，
+            // FileShare.None 会因共享冲突失败；若只是残留，则可在此取得 marker。
+            marker = new FileStream(_package.LockPath, FileMode.Open, FileAccess.ReadWrite,
+                FileShare.None, bufferSize: 1, options: FileOptions.WriteThrough);
+            guard = new FileStream(_package.LockGuardPath, FileMode.CreateNew, FileAccess.ReadWrite,
+                FileShare.None, bufferSize: 1, options: FileOptions.DeleteOnClose);
+            if (!Handles.TryAdd(_package.LockPath, guard)) return null;
+            _markerHandle = marker;
+            _handle = guard;
+            marker = null;
+            guard = null;
+            return _handle;
         }
         catch (IOException)
         {
-            // 仍被其他进程/主机持有，保留锁文件。
             return null;
         }
         catch (UnauthorizedAccessException)
         {
             return null;
+        }
+        finally
+        {
+            try { guard?.Dispose(); } catch { }
+            try { marker?.Dispose(); } catch { }
         }
     }
 
@@ -164,10 +182,7 @@ public sealed class VmLock : IDisposable
     public bool TryAcquireExisting()
     {
         if (_handle is not null) return true;
-        var handle = TryAttachExistingHandle();
-        if (handle is null) return false;
-        _handle = handle;
-        return true;
+        return TryAttachExistingHandle() is not null;
     }
 
     public void Dispose() => Release();
@@ -178,21 +193,20 @@ public sealed class VmLock : IDisposable
     /// </summary>
     public void ForceUnlockByUser()
     {
-        var h = Interlocked.Exchange(ref _handle, null);
-        if (h is not null)
+        var guard = _handle;
+        if (guard is not null)
         {
             // 只有本对象取得的句柄才可以在这里释放；不能从全局表拿走另一个
             // VmLock 实例的句柄，否则 UI 的“解除锁定”会误关掉本进程正在运行的 VM。
-            Handles.TryRemove(_package.LockPath, out _);
-            try { if (File.Exists(_package.LockPath)) File.Delete(_package.LockPath); }
-            catch
+            var marker = Interlocked.Exchange(ref _markerHandle, null);
+            try { marker?.Dispose(); } catch { }
+            if (!TryDeleteMarker())
             {
-                _handle = h;
-                Handles.TryAdd(_package.LockPath, h);
                 return;
             }
-            RemoveRegisteredHandle(h);
-            try { h.Dispose(); } catch { }
+            Interlocked.Exchange(ref _handle, null);
+            RemoveRegisteredHandle(guard);
+            try { guard.Dispose(); } catch { }
             return;
         }
 
@@ -202,22 +216,34 @@ public sealed class VmLock : IDisposable
         // 没有本进程句柄时，只有成功以独占方式接管现有文件，才能证明它
         // 已经是残留锁。若仍被另一进程/另一台电脑持有，保留锁文件，避免
         // Unix 上 unlink 仍打开的文件造成两个 QEMU 同时写盘。
-        h = TryAttachExistingHandle();
-        if (h is null)
+        guard = TryAttachExistingHandle();
+        if (guard is null)
         {
             if (File.Exists(_package.LockPath))
                 throw new VmLockedException("无法确认锁已失效：它仍可能由另一实例或另一台电脑持有。");
             return;
         }
-        try { if (File.Exists(_package.LockPath)) File.Delete(_package.LockPath); }
-        catch
+        var adoptedMarker = Interlocked.Exchange(ref _markerHandle, null);
+        try { adoptedMarker?.Dispose(); } catch { }
+        if (!TryDeleteMarker())
         {
-            _handle = h;
-            Handles.TryAdd(_package.LockPath, h);
             return;
         }
-        RemoveRegisteredHandle(h);
-        try { h.Dispose(); } catch { }
+        Interlocked.Exchange(ref _handle, null);
+        RemoveRegisteredHandle(guard);
+        try { guard.Dispose(); } catch { }
+    }
+
+    private bool TryDeleteMarker()
+    {
+        try
+        {
+            if (File.Exists(_package.LockPath))
+                File.Delete(_package.LockPath);
+            return true;
+        }
+        catch (IOException) { return false; }
+        catch (UnauthorizedAccessException) { return false; }
     }
 
     private void RemoveRegisteredHandle(FileStream handle)

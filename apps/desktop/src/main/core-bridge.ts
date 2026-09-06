@@ -16,10 +16,13 @@ type BridgeChannel = { writable: NodeJS.WritableStream; readable: NodeJS.Readabl
 
 export class CoreBridge extends EventEmitter {
   private proc: ChildProcess | null = null;
+  private channelProc: ChildProcess | null = null;
   private nextId = 1;
   private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
   /** 单飞：并发首调共享同一个连接尝试（否则会孵出多个 GrassCore 进程，双重接管） */
   private connecting: Promise<void> | null = null;
+  /** 单飞：一次重连只触发一次运行中 VM 接管，避免并发 RPC 重复扫描状态。 */
+  private adopting: Promise<void> | null = null;
 
   constructor(private coreExe: string) {
     super();
@@ -41,15 +44,22 @@ export class CoreBridge extends EventEmitter {
         await this.connectNamedPipe(PIPE_NAME);
         return;
       } catch {
-        this.spawnCore();
+        const spawned = this.spawnCore();
         for (let i = 0; i < 50; i++) {
           await sleep(200);
           try {
+            // 命名管道连接不携带服务端进程身份：即使刚启动的候选进程
+            // 触发了连接，也可能实际接入了已经存在的 Core（候选进程
+            // 可能因单实例 mutex 直接退出）。因此不能把 spawned 绑定为
+            // 通道所有者，否则通道关闭时会误杀不属于本桥的 Core。
             await this.connectNamedPipe(PIPE_NAME);
             return;
           } catch {
             /* 重试 */
           }
+        }
+        if (this.proc === spawned && !spawned.killed) {
+          try { spawned.kill(); } catch { /* 进程可能已退出 */ }
         }
         throw new Error('无法连接 GrassCore。');
       }
@@ -57,43 +67,56 @@ export class CoreBridge extends EventEmitter {
       // 开发机：stdio 直连
       const proc = spawn(this.coreExe, [], { stdio: ['pipe', 'pipe', 'inherit'] });
       this.proc = proc;
-      const channel = this.wire(proc.stdin!, proc.stdout!);
+      const channel = this.wire(proc.stdin!, proc.stdout!, proc);
       // 进程事件可能滞后到重连之后才到达；必须同时校验进程和通道身份，
       // 不能用 null 无条件拆掉已经建立的新连接。
       proc.on('error', () => {
         if (this.proc === proc) this.teardownChannel(channel, new Error('无法启动 GrassCore。'));
       });
       proc.on('exit', () => {
-        if (this.proc === proc) this.teardownChannel(channel, new Error('GrassCore 已退出。'));
+        if (this.proc === proc && (this.channel === null || this.channelProc === proc))
+          this.teardownChannel(channel, new Error('GrassCore 已退出。'));
       });
       await this.call('ping');
     }
   }
 
-  private spawnCore() {
+  private spawnCore(): ChildProcess {
     const proc = spawn(this.coreExe, [], { stdio: 'ignore' });
     this.proc = proc;
     // spawn 失败（路径错误/ENOENT）走 error 事件——没有监听器会变成主进程未捕获异常
     proc.on('error', () => {
-      if (this.proc === proc) this.teardownChannel(this.channel, new Error('无法启动 GrassCore。'));
+      // spawnCore 期间可能已经连上了另一个既有 Core。此时
+      // this.channel 属于旧进程，不能因新进程的延迟 error 事件拆掉它。
+      if (this.proc === proc && this.channel === null)
+        this.emit('core-exit');
     });
     proc.on('exit', (code) => {
-      if (this.proc === proc) this.emit('core-exit', code);
+      // Windows 重试连接可能在 spawned Core 尚未监听时接到另一个既有
+      // Core；此时 channelProc 不能证明该通道属于 proc。活动通道的 close/
+      // error 事件会负责拆除，只有没有活动通道时才把 proc 退出上报。
+      if (this.proc === proc && this.channel === null) this.emit('core-exit', code);
     });
+    return proc;
   }
 
   private async connectNamedPipe(name: string): Promise<void> {
     const socket = net.connect({ path: name });
     await new Promise<void>((resolve, reject) => {
       socket.once('connect', () => resolve());
-      socket.once('error', reject);
+      socket.once('error', (error) => {
+        socket.destroy();
+        reject(error);
+      });
     });
     this.wire(socket, socket);
   }
 
-  private wire(writable: NodeJS.WritableStream, readable: NodeJS.ReadableStream): BridgeChannel {
+  private wire(writable: NodeJS.WritableStream, readable: NodeJS.ReadableStream,
+    ownerProc: ChildProcess | null = null): BridgeChannel {
     const currentChannel = { writable, readable };
     this.channel = currentChannel;
+    this.channelProc = ownerProc;
     let buf = Buffer.alloc(0);
     readable.on('data', (chunk: Buffer) => {
       buf = Buffer.concat([buf, chunk]);
@@ -139,7 +162,25 @@ export class CoreBridge extends EventEmitter {
     reason: Error,
   ): void {
     if (targetChannel && this.channel !== targetChannel) return;
+    const ownerProc = this.channelProc;
     this.channel = null;
+    this.channelProc = null;
+    // 先摘掉当前通道身份，再销毁底层资源；销毁触发的 close/error 事件
+    // 会被上面的身份检查视为过时事件，不会拆掉随后建立的新连接。
+    if (targetChannel) {
+      const resources: Array<NodeJS.ReadableStream | NodeJS.WritableStream> =
+        [targetChannel.readable, targetChannel.writable];
+      for (const resource of resources) {
+        const destroy = (resource as NodeJS.ReadableStream & { destroy?: () => void }).destroy;
+        if (typeof destroy === 'function') destroy.call(resource);
+      }
+    }
+    // stdio 模式的 Core 是本桥自己启动的；协议损坏后终止它，避免坏进程
+    // 留在后台并与下一次重连并存。Windows 命名管道没有 ownerProc，不能
+    // 误杀可能属于另一个 UI 实例的 Core。
+    if (ownerProc && this.proc === ownerProc && !ownerProc.killed) {
+      try { ownerProc.kill(); } catch { /* 进程可能已退出 */ }
+    }
     for (const [, p] of this.pending) p.reject(reason);
     this.pending.clear();
     this.emit('core-exit');
@@ -165,7 +206,7 @@ export class CoreBridge extends EventEmitter {
         throw new Error('GrassCore 未连接且无法重新启动。');
       });
       // 重生后触发重接管（Core 启动时也会自动执行；此处兜底连接到既有 Core 的场景）
-      if (this.channel) void this.call('adoptRunningVms').catch(() => undefined);
+      if (this.channel) this.scheduleAdoption();
     }
     if (!this.channel) throw new Error('GrassCore 未连接。');
     const id = this.nextId++;
@@ -182,6 +223,15 @@ export class CoreBridge extends EventEmitter {
         this.teardownChannel(this.channel, error instanceof Error ? error : new Error(String(error)));
       }
     });
+  }
+
+  private scheduleAdoption(): void {
+    if (this.adopting) return;
+    this.adopting = this.call('adoptRunningVms')
+      .then(() => undefined, () => undefined)
+      .finally(() => {
+        this.adopting = null;
+      });
   }
 }
 

@@ -62,6 +62,11 @@ public static class SnapshotService
     public static bool RepairStagedOverlays(GrassVmPackage package,
         GrassCore.Qemu.TransactionalDiskOps? diskOps = null)
     {
+        if (!package.FixedDirectoriesAreSafe() || !package.FixedFilesAreSafe())
+            throw new GrassCoreException("虚拟机包包含不受支持的符号链接或目录联接，已拒绝自动修复。");
+        var journalPath = RestoreJournalPath(package);
+        if (File.Exists(journalPath) && GrassVmPackage.IsReparsePointOrLink(journalPath))
+            throw new GrassCoreException("恢复事务日志是符号链接或目录联接，已拒绝自动修复。");
         // ⓪ 中断的副本 commit 收尾（独立于其他阶段；无 diskOps 也可做——纯文件操作）
         GrassCore.Qemu.TransactionalDiskOps.FinishCommitTempFiles(package);
 
@@ -96,9 +101,11 @@ public static class SnapshotService
         {
             RecurseSubdirectories = true,
             IgnoreInaccessible = true,
+            AttributesToSkip = FileAttributes.ReparsePoint,
         };
         foreach (var staged in Directory.EnumerateFiles(package.Path, "*" + StagedOverlaySuffix, enumOpts))
         {
+            if (GrassVmPackage.ContainsReparsePoint(staged)) continue;
             var active = staged[..^StagedOverlaySuffix.Length];
             try
             {
@@ -116,6 +123,7 @@ public static class SnapshotService
         // active 缺失 → 换入没完成，prev 救回工作路径（Restore 回滚方向的修复）
         foreach (var prev in Directory.EnumerateFiles(package.Path, "*" + RestorePrevSuffix, enumOpts))
         {
+            if (GrassVmPackage.ContainsReparsePoint(prev)) continue;
             var active = prev[..^RestorePrevSuffix.Length];
             try
             {
@@ -152,7 +160,7 @@ public static class SnapshotService
                 // 足迹按【每张非外部盘】的链分别走：多盘 VM 各链长度不同、基座各异，
                 // 只走第一张盘会把其他盘的合法基座当成"不在链上"
                 var tails = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                foreach (var disk in cfg.DevicesOfType<DiskDevice>().Where(d => !d.IsExternal))
+                foreach (var disk in cfg.DevicesOfType<DiskDevice>().Where(d => !PathPolicy.IsExternal(package, d.Path)))
                 {
                     var cur = GrassCore.GrassVm.PathPolicy.Resolve(package, disk.Path);
                     for (var hops = 0; hops < 64 && cur is not null; hops++)
@@ -174,29 +182,41 @@ public static class SnapshotService
                     string.Equals(s.Uuid, state.CurrentSnapshotUuid, StringComparison.OrdinalIgnoreCase));
             position ??= tree.All.Where(s => !tree.ChildrenOf(s.Uuid).Any())
                 .OrderByDescending(s => s.CreatedAt).FirstOrDefault();
-            foreach (var dir in Directory.EnumerateDirectories(package.SnapshotsPath))
+            var snapshotEnumOpts = new EnumerationOptions
             {
+                IgnoreInaccessible = true,
+                AttributesToSkip = FileAttributes.ReparsePoint,
+            };
+            foreach (var dir in Directory.EnumerateDirectories(package.SnapshotsPath, "*", snapshotEnumOpts))
+            {
+                if (GrassVmPackage.ContainsReparsePoint(dir)) continue;
+                var dirUuid = System.IO.Path.GetFileName(dir);
+                if (!SnapshotTree.IsValidUuid(dirUuid) || Path.GetFileName(dirUuid) != dirUuid) continue;
                 if (File.Exists(System.IO.Path.Combine(dir, "metadata.json"))) continue;
                 // 只有意向、没建 disks/ 的目录（WriteFreezeIntent 与首盘操作之间崩溃）
                 // 是合法现场——跳过。绝不因它抛 DirectoryNotFoundException 中止
                 // 整个半创建处理（后面的目录里可能还有唯一副本等着救）
                 var disksDir = System.IO.Path.Combine(dir, "disks");
                 if (!Directory.Exists(disksDir)) continue;
-                var dirUuid = System.IO.Path.GetFileName(dir);
                 var intent = LoadFreezeIntent(package, dirUuid);
                 // 只有【创建中断现场】才做半创建处理：freeze-intent.json（Create 落
                 // 任何盘之前一定先写）或 rescue-pending.json 在场才算。链根基座
                 // 删除保留的 disks/（metadata 与 intent 一并被清）不是中断现场——
                 // 把它当半创建，会把链基座 unsafe-rebase 到它自己的后代上
                 //（环形 backing 链，QEMU 拒绝打开），并把已删快照复活成倒挂节点
-                if (!File.Exists(FreezeIntentPath(package, dirUuid))
-                    && !File.Exists(RescuePendingPath(package, dirUuid)))
+                var intentPath = FreezeIntentPath(package, dirUuid);
+                var rescuePath = RescuePendingPath(package, dirUuid);
+                if ((!File.Exists(intentPath) || GrassVmPackage.ContainsReparsePoint(intentPath))
+                    && (!File.Exists(rescuePath) || GrassVmPackage.ContainsReparsePoint(rescuePath)))
                     continue;
-                foreach (var frozen in Directory.EnumerateFiles(disksDir, "disk-*.qcow2"))
+                if (GrassVmPackage.ContainsReparsePoint(disksDir)) continue;
+                foreach (var frozen in Directory.EnumerateFiles(disksDir, "disk-*.qcow2", snapshotEnumOpts))
                 {
+                    if (GrassVmPackage.ContainsReparsePoint(frozen)) continue;
                     // 文件名形态 disk-<deviceId>.qcow2
                     var name = System.IO.Path.GetFileName(frozen);
                     var deviceId = name["disk-".Length..^".qcow2".Length];
+                    if (!DeviceIdPolicy.IsValid(deviceId)) continue;
                     // 意向父（创建时记录）；没有意向的旧目录才退化用位置快照引用
                     string? intendedParent = null;
                     if (intent?.ParentsByDeviceId is not null)
@@ -255,6 +275,7 @@ public static class SnapshotService
                         var fixedAll = true;
                         foreach (var deviceId in pending.DeviceIds)
                         {
+                            if (!DeviceIdPolicy.IsValid(deviceId)) { fixedAll = false; continue; }
                             var activeAbs = FindActivePathForDevice(package, deviceId);
                             var parentAbs = ResolveIntent(package, intent.ParentsByDeviceId, deviceId);
                             if (activeAbs is null || parentAbs is null || !File.Exists(activeAbs)) { fixedAll = false; continue; }
@@ -285,6 +306,9 @@ public static class SnapshotService
                     {
                         var frozenFiles = Directory.EnumerateFiles(disksDir, "disk-*.qcow2")
                             .Select(f => System.IO.Path.GetFullPath(f)).ToList();
+                        if (frozenFiles.Any(f => !DeviceIdPolicy.IsValid(
+                                System.IO.Path.GetFileName(f)["disk-".Length..^".qcow2".Length])))
+                            continue;
                         var onChain = frozenFiles.Count > 0
                             && (chainFootprint.Count == 0 || frozenFiles.All(chainFootprint.Contains));
                         // 指针健康 = 每张冻结文件要么 backing 可解析，要么它就是链基座
@@ -352,6 +376,10 @@ public static class SnapshotService
         GrassCore.Qemu.TransactionalDiskOps? diskOps = null,
         string? upgradeProtectionBackupDir = null)
     {
+        if (config.Devices is null || config.Devices.Any(d => d is null || !DeviceIdPolicy.IsValid(d.DeviceId)))
+            throw new GrassCoreException("虚拟机配置包含无效设备标识，必须是 UUID，无法创建快照。");
+        if (config.Devices.Select(d => d.DeviceId).Distinct(StringComparer.OrdinalIgnoreCase).Count() != config.Devices.Count)
+            throw new GrassCoreException("虚拟机配置包含重复设备标识，无法创建快照。");
         var snap = new Snapshot
         {
             Uuid = Guid.NewGuid().ToString(),
@@ -390,13 +418,14 @@ public static class SnapshotService
         // "半快照"（部分盘冻结、部分盘悬空），树上的引用不再可信
         if (diskOps is not null)
         {
-            foreach (var disk in config.DevicesOfType<DiskDevice>().Where(d => !d.IsExternal))
+            foreach (var disk in config.DevicesOfType<DiskDevice>().Where(d => !PathPolicy.IsExternal(package, d.Path)))
             {
                 var activeAbs = GrassCore.GrassVm.PathPolicy.Resolve(package, disk.Path);
                 if (!File.Exists(activeAbs))
                     throw new InvalidOperationException(
                         $"磁盘文件缺失，无法创建快照：{disk.Path}。请先恢复该文件（例如从备份拷回），或删除后重建这台虚拟机。");
             }
+            ValidateBackingChainsInsidePackage(package, config, diskOps);
         }
 
         // 全有或全无：任何一盘失败 → 逐盘逆操作回滚（新 overlay 删掉、冻结盘移回
@@ -416,7 +445,7 @@ public static class SnapshotService
             var intent = new Dictionary<string, string?>();
             if (diskOps is not null)
             {
-                foreach (var disk in config.DevicesOfType<DiskDevice>().Where(d => !d.IsExternal))
+                foreach (var disk in config.DevicesOfType<DiskDevice>().Where(d => !PathPolicy.IsExternal(package, d.Path)))
                 {
                     var activeAbs0 = GrassCore.GrassVm.PathPolicy.Resolve(package, disk.Path);
                     var backing0 = diskOps.QueryBackingFile(activeAbs0)
@@ -430,7 +459,7 @@ public static class SnapshotService
                 }
                 WriteFreezeIntent(package, snap.Uuid, intent);
             }
-            foreach (var disk in config.DevicesOfType<DiskDevice>().Where(d => !d.IsExternal))
+            foreach (var disk in config.DevicesOfType<DiskDevice>().Where(d => !PathPolicy.IsExternal(package, d.Path)))
             {
                 var frozenRel = $"disks/disk-{disk.DeviceId}.qcow2";
                 if (diskOps is null)
@@ -598,8 +627,16 @@ public static class SnapshotService
     {
         if (!Directory.Exists(package.SnapshotsPath)) return new SnapshotTree(Array.Empty<Snapshot>());
         var snaps = new List<Snapshot>();
-        foreach (var dir in Directory.EnumerateDirectories(package.SnapshotsPath))
+        string[] dirs;
+        try { dirs = Directory.EnumerateDirectories(package.SnapshotsPath).ToArray(); }
+        catch (IOException) { return new SnapshotTree(Array.Empty<Snapshot>()); }
+        catch (UnauthorizedAccessException) { return new SnapshotTree(Array.Empty<Snapshot>()); }
+        Array.Sort(dirs, StringComparer.Ordinal);
+        foreach (var dir in dirs)
         {
+            // 先检查快照目录自身；否则 metadata.json 可能从 junction/symlink
+            // 指向包外，后续删除/恢复按同一路径继续跟随链接。
+            if (GrassVmPackage.ContainsReparsePoint(dir)) continue;
             var meta = System.IO.Path.Combine(dir, "metadata.json");
             if (!File.Exists(meta)) continue; // 未知目录保留但不解释
             try
@@ -607,19 +644,141 @@ public static class SnapshotService
                 var snapshot = JsonSerializer.Deserialize<Snapshot>(File.ReadAllText(meta), Opts);
                 if (snapshot is null) continue;
                 var dirUuid = Path.GetFileName(dir);
+                var uuidCmp = OperatingSystem.IsWindows()
+                    ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
                 if (!SnapshotTree.IsValidUuid(snapshot.Uuid)
-                    || !string.Equals(dirUuid, snapshot.Uuid, StringComparison.OrdinalIgnoreCase)
+                    || !string.Equals(dirUuid, snapshot.Uuid, uuidCmp)
                     || (snapshot.ParentSnapshotUuid is not null && !SnapshotTree.IsValidUuid(snapshot.ParentSnapshotUuid))
-                    || snapshot.DiskOverlayRefs.Any(kv => !IsSafeOverlayReference(package, snapshot.Uuid, kv.Value)))
+                    || snapshot.DiskOverlayRefs.Keys.Any(key => !DeviceIdPolicy.IsValid(key))
+                    || snapshot.DiskOverlayRefs.Any(kv => !IsSafeOverlayReference(package, snapshot.Uuid, kv.Value))
+                    || !TryLoadSnapshotConfig(package, snapshot, out _))
                     continue;
                 snaps.Add(snapshot);
             }
-            catch (JsonException)
+            catch (Exception ex) when (ex is JsonException or ArgumentException or InvalidOperationException
+                or NotSupportedException or NullReferenceException or IOException
+                or UnauthorizedAccessException)
             {
-                // 快照树元数据损坏：可能改数据的修复必须先征得用户确认（保守修复），这里跳过加载
+                // 快照树元数据或路径引用损坏：可能改数据的修复必须先征得用户确认
+                //（保守修复），这里跳过当前条目，不能让一个坏快照阻断整棵树。
             }
         }
-        return new SnapshotTree(snaps);
+        // UUID 语义不区分大小写；大小写敏感文件系统上可能同时存在两个目录。
+        // 这种情况无法安全判断用户要操作哪一层，宁可把整组歧义条目暂时隔离，
+        // 也不能静默择一后让 Restore/Delete/LinkedClone 改错物理磁盘。
+        var groups = snaps.GroupBy(s => s.Uuid, StringComparer.OrdinalIgnoreCase);
+        return new SnapshotTree(groups.Where(g => g.Count() == 1).SelectMany(g => g));
+    }
+
+    /// <summary>
+    /// 快照冻结会把当前工作盘移动到 snapshots/；因此在任何物理移动前，
+    /// 必须证明内部盘的完整 backing 链仍在包内。启动时也会做同样校验，
+    /// 但快照入口可被独立调用，不能把安全边界寄托在调用方顺序上。
+    /// </summary>
+    private static void ValidateBackingChainsInsidePackage(GrassVmPackage package,
+        VmConfiguration config, GrassCore.Qemu.TransactionalDiskOps diskOps)
+    {
+        var root = Path.GetFullPath(package.Path)
+            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+            + Path.DirectorySeparatorChar;
+        var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        foreach (var disk in config.DevicesOfType<DiskDevice>().Where(d => !PathPolicy.IsExternal(package, d.Path)))
+        {
+            var current = PathPolicy.Resolve(package, disk.Path);
+            var seen = new HashSet<string>(OperatingSystem.IsWindows()
+                ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
+            for (var depth = 0; depth < 64; depth++)
+            {
+                current = Path.GetFullPath(current);
+                if (!seen.Add(current) || !File.Exists(current)
+                    || GrassVmPackage.IsReparsePointOrLink(current))
+                    throw new GrassCoreException("虚拟磁盘 backing 链包含循环、缺失或链接文件，无法创建快照。");
+                string? backing;
+                try { backing = diskOps.QueryBackingFileStrict(current); }
+                catch (GrassCore.Qemu.QemuImgException e)
+                {
+                    throw new GrassCoreException($"无法验证虚拟磁盘 backing 链，快照已拒绝：{e.Message}");
+                }
+                if (backing is null) break;
+                var backingFull = Path.GetFullPath(backing);
+                if (!backingFull.StartsWith(root, cmp)
+                    || GrassVmPackage.IsReparsePointOrLink(backingFull))
+                    throw new GrassCoreException("虚拟磁盘 backing 链指向虚拟机包外或链接文件，已拒绝创建快照。");
+                current = backingFull;
+                if (depth == 63)
+                    throw new GrassCoreException("虚拟磁盘 backing 链超过 64 层，无法创建快照。");
+            }
+        }
+    }
+
+    /// <summary>
+    /// 校验快照中嵌入的完整配置。快照档案来自 ZIP/OVA 等不可信输入时，不能只
+    /// 相信 metadata 的 overlay 引用；恢复/链接克隆会按该配置解析工作盘路径。
+    /// 包外磁盘仍是合法配置，但绝不能出现在 DiskOverlayRefs 中，否则恢复会把
+    /// 任意宿主文件改名并写入新 overlay。
+    /// </summary>
+    internal static bool TryLoadSnapshotConfig(
+        GrassVmPackage package,
+        Snapshot snapshot,
+        out VmConfiguration? config)
+    {
+        config = null;
+        try
+        {
+            var parsed = ConfigJson.Deserialize(snapshot.FullConfigSnapshot);
+            if (parsed.SchemaVersion != VmConfiguration.CurrentSchemaVersion
+                || parsed.Firmware is null
+                || parsed.BootOrder is null
+                || parsed.BootOrder.Count == 0
+                || parsed.Devices is null
+                || parsed.Devices.Any(d => d is null || !DeviceIdPolicy.IsValid(d.DeviceId))
+                || !DeviceNamer.HasUniqueCreatedOrders(parsed)
+                || parsed.Devices.Select(d => d.DeviceId).Distinct(StringComparer.OrdinalIgnoreCase).Count()
+                    != parsed.Devices.Count
+                || parsed.CpuCores is < 1 or > 256
+                || parsed.MemoryMiB is < 512 or > 1024 * 1024
+                || !parsed.HasDisplayDevice
+                || parsed.Devices.OfType<NetworkDevice>().Any(n => n.Mode is NetworkMode.Bridged or NetworkMode.HostOnly)
+                || parsed.Devices.OfType<RawDevice>().Any(r => !r.Unsupported
+                    && (r.Arguments is null || r.Arguments.Count == 0 || r.Arguments.Count % 2 != 0))
+                || parsed.Devices.OfType<NetworkDevice>().Any(n => !string.IsNullOrWhiteSpace(n.MacAddress)
+                    && !DeviceIdPolicy.IsValidMac(n.MacAddress)))
+                return false;
+
+            var internalDiskIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var disk in parsed.Devices.OfType<DiskDevice>())
+            {
+                if (string.IsNullOrWhiteSpace(disk.Path)) return false;
+                // Resolve both internal and external references so relative traversal,
+                // malformed roots, and reparse-point paths are rejected conservatively.
+                var resolved = PathPolicy.Resolve(package, disk.Path);
+                if (!PathPolicy.IsExternal(package, disk.Path))
+                {
+                    var diskRoot = Path.GetFullPath(package.DisksPath).TrimEnd(Path.DirectorySeparatorChar,
+                        Path.AltDirectorySeparatorChar) + Path.DirectorySeparatorChar;
+                    var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+                    if (!Path.GetFullPath(resolved).StartsWith(diskRoot, cmp)
+                        || GrassVmPackage.IsReparsePointOrLink(resolved)) return false;
+                    internalDiskIds.Add(disk.DeviceId);
+                }
+            }
+            foreach (var cd in parsed.Devices.OfType<CdromDevice>())
+                if (cd.IsoPath is not null) _ = PathPolicy.Resolve(package, cd.IsoPath);
+            foreach (var folder in parsed.Devices.OfType<SharedFolderDevice>())
+                if (!string.IsNullOrWhiteSpace(folder.HostPath)) _ = PathPolicy.Resolve(package, folder.HostPath);
+
+            var overlayIds = new HashSet<string>(snapshot.DiskOverlayRefs.Keys, StringComparer.OrdinalIgnoreCase);
+            if (overlayIds.Count != snapshot.DiskOverlayRefs.Count || !overlayIds.SetEquals(internalDiskIds))
+                return false;
+
+            config = parsed;
+            return true;
+        }
+        catch (Exception e) when (e is JsonException or ArgumentException or InvalidOperationException
+            or NotSupportedException or IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
 
     private static bool IsSafeOverlayReference(GrassVmPackage package, string uuid, string reference)
@@ -672,7 +831,28 @@ public static class SnapshotService
         // 冲到界面横幅里——与 Delete 的措辞一致，请用户刷新
         if (!tree.TryGet(uuid, out var snap) || snap is null)
             throw new GrassCoreException("快照不存在，请刷新列表。");
-        var restored = ConfigJson.Deserialize(snap.FullConfigSnapshot);
+        // SnapshotTree 的 UUID 语义不区分大小写，但磁盘路径在 Linux/macOS
+        // 上区分大小写；后续所有物理路径必须使用树中实际存在的目录名。
+        var canonicalUuid = snap.Uuid;
+        if (!TryLoadSnapshotConfig(package, snap, out var restored) || restored is null)
+            throw new GrassCoreException("快照配置已损坏或包含包外硬盘引用，无法恢复。请删除该快照后重试。");
+        // 外部可写盘不进入快照链。恢复时只允许保留当前配置中同一设备的
+        // 同一路径，禁止恶意快照把设备重定向到任意宿主文件。
+        if (File.Exists(package.ConfigPath))
+        {
+            var currentConfig = new ConfigStore(package).Load();
+            foreach (var restoredDisk in restored.Devices.OfType<DiskDevice>())
+            {
+                if (!PathPolicy.IsExternal(package, restoredDisk.Path)) continue;
+                var currentDisk = currentConfig.Devices.OfType<DiskDevice>()
+                    .FirstOrDefault(d => string.Equals(d.DeviceId, restoredDisk.DeviceId, StringComparison.OrdinalIgnoreCase));
+                if (currentDisk is null || !PathPolicy.IsExternal(package, currentDisk.Path)
+                    || !string.Equals(Path.GetFullPath(PathPolicy.Resolve(package, currentDisk.Path)),
+                        Path.GetFullPath(PathPolicy.Resolve(package, restoredDisk.Path)),
+                        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
+                    throw new GrassCoreException("快照包含未经当前配置确认的外部硬盘路径，已拒绝恢复。");
+            }
+        }
         // 磁盘先行（物理操作成功后再改元数据——失败时树仍是旧世界的诚实描述）：
         // 丢弃当前工作 overlay（未快照的更改，调用方已警告），在快照冻结点上开全新 overlay。
         var swapped = new List<(string activeAbs, string prevAbs)>();
@@ -694,9 +874,11 @@ public static class SnapshotService
             // 里移除设备"这样的可行动提示
             foreach (var (deviceId, frozenRel) in snap.DiskOverlayRefs)
             {
-                var frozenAbs = System.IO.Path.Combine(package.SnapshotsPath, uuid,
+                var frozenAbs = System.IO.Path.Combine(package.SnapshotsPath, canonicalUuid,
                     frozenRel.Replace('/', System.IO.Path.DirectorySeparatorChar));
-                if (!File.Exists(frozenAbs)) continue;
+                if (!File.Exists(frozenAbs) || GrassVmPackage.IsReparsePointOrLink(frozenAbs))
+                    throw new GrassCoreException(
+                        $"快照磁盘文件缺失或包含链接，无法恢复：{frozenRel}。请先修复快照文件后重试。");
                 var dev = restored.Devices.OfType<DiskDevice>().FirstOrDefault(d => d.DeviceId == deviceId);
                 if (dev is null) continue;
                 var activeAbs = GrassCore.GrassVm.PathPolicy.Resolve(package, dev.Path);
@@ -718,14 +900,17 @@ public static class SnapshotService
                 .Where(d => d is not null)
                 .Select(d => GrassCore.GrassVm.PathPolicy.Resolve(package, d!.Path))
                 .ToList();
-            WriteRestoreJournal(package, uuid, planned, vars: true, txId, varsExisted);
+            WriteRestoreJournal(package, canonicalUuid, planned, vars: true, txId, varsExisted);
             try
             {
                 foreach (var (deviceId, frozenRel) in snap.DiskOverlayRefs)
                 {
-                    var frozenAbs = System.IO.Path.Combine(package.SnapshotsPath, uuid,
+                    var frozenAbs = System.IO.Path.Combine(package.SnapshotsPath, canonicalUuid,
                         frozenRel.Replace('/', System.IO.Path.DirectorySeparatorChar));
-                    if (!File.Exists(frozenAbs)) continue; // 元数据先行时代的快照：保留只回滚配置
+                    // 预检已确保所有内部快照盘均在场；这里不再允许部分盘继续，
+                    // 避免多盘恢复写入配置/状态后留下撕裂状态。
+                    if (!File.Exists(frozenAbs) || GrassVmPackage.IsReparsePointOrLink(frozenAbs))
+                        throw new GrassCoreException("快照磁盘文件在恢复过程中消失或被替换为链接，已中止恢复。");
                     var activeAbs = GrassCore.GrassVm.PathPolicy.Resolve(package, restoredDiskPath(restored, deviceId));
                     if (string.Equals(activeAbs, frozenAbs, StringComparison.OrdinalIgnoreCase)) continue;
                     // 崩溃安全 + 可回滚顺序：① 暂存 overlay（指向快照冻结点）；② 旧工作盘
@@ -749,7 +934,9 @@ public static class SnapshotService
                 // 挂起/启动路径再读它就是硬故障。
                 // active 缺失 = 没有可回滚的旧变量：单向恢复快照变量即可
                 // （跳过的话磁盘/配置都回去了、NVRAM 预检却让机器永远开不了机）
-                var frozenVars = System.IO.Path.Combine(package.SnapshotsPath, uuid, "VARS.fd");
+                var frozenVars = System.IO.Path.Combine(package.SnapshotsPath, canonicalUuid, "VARS.fd");
+                if (File.Exists(frozenVars) && GrassVmPackage.IsReparsePointOrLink(frozenVars))
+                    throw new GrassCoreException("快照固件变量文件包含符号链接或目录联接，已中止恢复。");
                 if (File.Exists(frozenVars) && !File.Exists(activeVarsPath))
                 {
                     Directory.CreateDirectory(package.FirmwarePath);
@@ -832,7 +1019,7 @@ public static class SnapshotService
         new ConfigStore(package).Save(restored);
         // 位置 + pending 清除同一次落盘（单一提交点）：此后崩溃 → 修复按"已提交"收尾
         var state = VmState.Load(package);
-        state.CurrentSnapshotUuid = uuid;
+        state.CurrentSnapshotUuid = canonicalUuid;
         state.PendingRestoreTxId = null;
         state.Save(package);
         // 事务提交点已过（元数据全部落定）——删日志，之后残留的 prev 只是待清理垃圾
@@ -863,6 +1050,9 @@ public static class SnapshotService
         bool vars, string txId, bool varsExisted)
     {
         Directory.CreateDirectory(package.SnapshotsPath);
+        var journalPath = RestoreJournalPath(package);
+        if (GrassVmPackage.IsReparsePointOrLink(journalPath))
+            throw new GrassCoreException("恢复事务日志不能是符号链接或目录联接。");
         var rels = activeAbsPaths
             .Select(p => System.IO.Path.GetRelativePath(package.Path, p).Replace('\\', '/'))
             .ToList();
@@ -898,6 +1088,7 @@ public static class SnapshotService
     private static bool RollbackInterruptedRestore(GrassVmPackage package)
     {
         var journalPath = RestoreJournalPath(package);
+        if (GrassVmPackage.IsReparsePointOrLink(journalPath)) return false;
         if (!File.Exists(journalPath)) return true; // 无事务：nothing to do
         try
         {
@@ -1068,7 +1259,7 @@ public static class SnapshotService
 
     private static bool PathEquals(string a, string b) =>
         string.Equals(System.IO.Path.GetFullPath(a), System.IO.Path.GetFullPath(b),
-            StringComparison.OrdinalIgnoreCase);
+            OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
 
     /// <summary>
     /// 从 <paramref name="from"/> 沿 backing 链向上走，判断会不会到达 <paramref name="target"/>。
@@ -1106,6 +1297,7 @@ public static class SnapshotService
         try
         {
             var p = FreezeIntentPath(package, uuid);
+            if (GrassVmPackage.ContainsReparsePoint(p)) return null;
             if (!File.Exists(p)) return null;
             return JsonSerializer.Deserialize<FreezeIntent>(File.ReadAllText(p), JournalOpts);
         }
@@ -1151,6 +1343,8 @@ public static class SnapshotService
 
     private static void DeleteIfExists(string path)
     {
+        if (GrassVmPackage.IsReparsePointOrLink(path))
+            throw new GrassCoreException("快照事务文件包含不受支持的符号链接或目录联接。");
         if (File.Exists(path)) File.Delete(path);
     }
 
@@ -1158,7 +1352,15 @@ public static class SnapshotService
     private static void CopyAtomic(string from, string to)
     {
         var tmp = to + ".grass-tmp";
-        File.Copy(from, tmp, overwrite: true);
+        if (GrassVmPackage.IsReparsePointOrLink(tmp) || GrassVmPackage.IsReparsePointOrLink(to))
+            throw new GrassCoreException("快照事务目标包含不受支持的符号链接或目录联接。");
+        if (File.Exists(tmp)) File.Delete(tmp);
+        File.Copy(from, tmp, overwrite: false);
+        if (GrassVmPackage.IsReparsePointOrLink(tmp))
+        {
+            try { File.Delete(tmp); } catch { }
+            throw new GrassCoreException("快照事务临时文件被替换为符号链接，操作已中止。");
+        }
         File.Move(tmp, to, overwrite: true);
     }
 
@@ -1194,17 +1396,26 @@ public static class SnapshotService
         if (!SnapshotTree.IsValidUuid(uuid) || Path.GetFileName(uuid) != uuid)
             throw new GrassCoreException("快照不存在。");
         var tree = LoadTree(package);
-        var dir = System.IO.Path.Combine(package.SnapshotsPath, uuid);
         var deleted = tree.All.FirstOrDefault(s =>
             string.Equals(s.Uuid, uuid, StringComparison.OrdinalIgnoreCase));
         if (deleted is null)
         {
+            var candidates = Directory.Exists(package.SnapshotsPath)
+                ? Directory.EnumerateDirectories(package.SnapshotsPath)
+                    .Where(d => string.Equals(Path.GetFileName(d), uuid, StringComparison.OrdinalIgnoreCase))
+                    .ToList()
+                : new List<string>();
+            if (candidates.Count > 1)
+                throw new GrassCoreException("快照 UUID 存在大小写冲突，已拒绝清理；请先人工整理快照目录。");
+            var dir = candidates.SingleOrDefault() ?? System.IO.Path.Combine(package.SnapshotsPath, uuid);
             // 上次删除中途失败后的【重试】：树里已无此快照（metadata 已清），
             // 直接 tree.Get 会抛裸 KeyNotFoundException——"稍后重删一次"的
             // 承诺就永远兑现不了。保守规则：目录里还有 qcow2 = 无法断定上次
             // 是否决定保留基座（链根/共享基座的后代还指着它）→ 只清非磁盘
             // 文件；没有 qcow2 → 整目录删除。宁可漏删（留无主文件占空间）
             // 也不能错删后代 overlay 的基座
+            if (GrassVmPackage.ContainsReparsePoint(dir))
+                throw new GrassCoreException("快照目录包含不受支持的链接文件，已拒绝删除。");
             if (!Directory.Exists(dir)) throw new GrassCoreException("快照不存在。");
             try
             {
@@ -1229,6 +1440,7 @@ public static class SnapshotService
             }
             return;
         }
+        var deletedDir = System.IO.Path.Combine(package.SnapshotsPath, deleted.Uuid);
         var linkedClones = FindLinkedCloneReferences(package);
         var plan = SnapshotPlanner.PlanDelete(tree, uuid, linkedClones);
         var state = VmState.Load(package);
@@ -1250,7 +1462,8 @@ public static class SnapshotService
                 if (affectedSnapshotIds.Add(child.Uuid)) descendants.Push(child.Uuid);
         }
         var runningLinkedClone = linkedClones.FirstOrDefault(lc =>
-            File.Exists(Path.Combine(lc.ChildVmPath, GrassVmPackage.LockFile))
+            (File.Exists(Path.Combine(lc.ChildVmPath, GrassVmPackage.LockFile))
+             || File.Exists(Path.Combine(lc.ChildVmPath, GrassVmPackage.LockGuardFile)))
             && affectedSnapshotIds.Contains(lc.ParentSnapshotUuid));
         if (runningLinkedClone is not null)
             throw new GrassCoreException(
@@ -1268,7 +1481,7 @@ public static class SnapshotService
             var devicePlan = new List<(string FrozenAbs, string ParentFrozen, List<string> Dependents)>();
             foreach (var (deviceId, frozenRel) in deleted.DiskOverlayRefs)
             {
-                var frozenAbs = System.IO.Path.Combine(package.SnapshotsPath, uuid,
+                var frozenAbs = System.IO.Path.Combine(package.SnapshotsPath, deleted.Uuid,
                     frozenRel.Replace('/', System.IO.Path.DirectorySeparatorChar));
                 if (!File.Exists(frozenAbs)) continue;
                 // 父 UUID 可能指向已不存在的快照（其 metadata 损坏被 LoadTree 跳过）：
@@ -1459,25 +1672,25 @@ public static class SnapshotService
         // 算出未改挂的孩子（幂等 rebase），已改挂的孩子物理上也已不再指向本层。
         // 这里若因文件被占用（杀毒/索引器是常态）删不掉：树状态一致、链完好，
         // 把原始 IOException 翻译成"可重试"的明确提示，而不是裸抛
-        if (Directory.Exists(dir))
+        if (Directory.Exists(deletedDir))
         {
-            var frozenFiles = Directory.EnumerateFiles(dir, "*.qcow2", SearchOption.AllDirectories).ToList();
+            var frozenFiles = Directory.EnumerateFiles(deletedDir, "*.qcow2", SearchOption.AllDirectories).ToList();
             var keepPhysical = parentUuid is null || anyDeviceKeptAsBase
                 || diskOps is null && frozenFiles.Count > 0;
             try
             {
                 if (keepPhysical)
                 {
-                    foreach (var f in Directory.EnumerateFiles(dir))
+                    foreach (var f in Directory.EnumerateFiles(deletedDir))
                     {
-                        var rel = System.IO.Path.GetRelativePath(dir, f);
+                        var rel = System.IO.Path.GetRelativePath(deletedDir, f);
                         if (rel != "disks" && !rel.StartsWith("disks" + System.IO.Path.DirectorySeparatorChar, StringComparison.Ordinal))
                             File.Delete(f);
                     }
                 }
                 else
                 {
-                    Directory.Delete(dir, recursive: true);
+                    Directory.Delete(deletedDir, recursive: true);
                 }
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -1499,10 +1712,15 @@ public static class SnapshotService
     private static string? FrozenPathOrNull(GrassVmPackage package, Snapshot snap, string deviceId)
     {
         if (!snap.DiskOverlayRefs.TryGetValue(deviceId, out var rel)) return null;
+        if (!IsSafeOverlayReference(package, snap.Uuid, rel))
+            throw new GrassCoreException("快照磁盘引用越出快照目录或包含不受支持的链接文件。");
         var dir = Path.GetFullPath(Path.Combine(package.SnapshotsPath, snap.Uuid));
         var path = Path.GetFullPath(Path.Combine(dir, rel.Replace('/', Path.DirectorySeparatorChar)));
-        if (!path.StartsWith(dir + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
-            throw new GrassCoreException("快照磁盘引用越出快照目录。");
+        // IsSafeOverlayReference 校验了引用父链，但快照目录本身可能在加载后
+        // 被替换成 junction/symlink；再次检查完整路径，避免删除流程跟随链接
+        // 对包外 backing 执行 rebase/commit。
+        if (GrassVmPackage.ContainsReparsePoint(path))
+            throw new GrassCoreException("快照磁盘引用包含不受支持的链接文件。");
         return path;
     }
 
@@ -1519,7 +1737,9 @@ public static class SnapshotService
             {
                 var config = new ConfigStore(pkg).Load();
                 if (config.CloneInfo is { } ci &&
-                    string.Equals(Path.GetFullPath(Path.Combine(pkg.Path, ci.ParentVmPath.Replace('/', Path.DirectorySeparatorChar))), parentPackage.Path, StringComparison.OrdinalIgnoreCase))
+                    string.Equals(Path.GetFullPath(Path.Combine(pkg.Path, ci.ParentVmPath.Replace('/', Path.DirectorySeparatorChar))),
+                        parentPackage.Path,
+                        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal))
                 {
                     result.Add(new LinkedCloneReference(pkg.Name, pkg.Path, ci.ParentSnapshotUuid));
                 }

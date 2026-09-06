@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using GrassCore.Qemu;
@@ -24,6 +25,9 @@ public sealed class GrassVmPackage
     public const string ConfigFile = "config.json";
     public const string StateFile = "state.json";
     public const string LockFile = "vm.lock";
+    // vm.lock 是持久化的残留锁标记；guard 由持锁进程以独占句柄打开，
+    // 并设置 DeleteOnClose，避免其他进程在生命周期内删除标记或抢占磁盘。
+    public const string LockGuardFile = "vm.lock.guard";
     public const string SessionFile = "runtime/session.json";
 
     private static readonly JsonSerializerOptions JsonOpts = new()
@@ -59,6 +63,8 @@ public sealed class GrassVmPackage
     public string ConfigPath => System.IO.Path.Combine(Path, ConfigFile);
     public string StatePath => System.IO.Path.Combine(Path, StateFile);
     public string LockPath => System.IO.Path.Combine(Path, LockFile);
+    public string LockGuardPath => System.IO.Path.Combine(Path, LockGuardFile);
+    public bool HasLockFiles => File.Exists(LockPath) || File.Exists(LockGuardPath);
     public string SessionPath => System.IO.Path.Combine(Path, SessionFile);
 
     /// <summary>Library Root 扫描：目录名以 .grassvm 结尾即被发现。发现 ≠ 已验证。</summary>
@@ -86,6 +92,31 @@ public sealed class GrassVmPackage
             catch (IOException) { return true; }
             current = current.Parent;
         }
+        return false;
+    }
+
+    /// <summary>
+    /// 检查路径本身及其父级是否为重解析点。File.GetAttributes 对部分悬空链接
+    /// 可能只返回 FileNotFound；LinkTarget 能补上这种情况，避免后续
+    /// Directory.CreateDirectory 跟随悬空 junction/symlink 到包外。
+    /// </summary>
+    public static bool IsReparsePointOrLink(string path)
+    {
+        if (ContainsReparsePoint(path)) return true;
+        try
+        {
+            if (new DirectoryInfo(System.IO.Path.GetFullPath(path)).LinkTarget is not null)
+                return true;
+        }
+        catch (IOException) { return true; }
+        catch (UnauthorizedAccessException) { return true; }
+        try
+        {
+            if (new FileInfo(System.IO.Path.GetFullPath(path)).LinkTarget is not null)
+                return true;
+        }
+        catch (IOException) { return true; }
+        catch (UnauthorizedAccessException) { return true; }
         return false;
     }
 
@@ -148,6 +179,8 @@ public sealed class GrassVmPackage
     /// <summary>确保固定目录存在。缺失 disks/ 等目录属于"确定无损"问题，允许保守自动修复。</summary>
     public void EnsureStructure()
     {
+        if (IsReparsePointOrLink(Path))
+            throw new IOException("虚拟机包根目录不能是符号链接或目录联接。");
         Directory.CreateDirectory(Path);
         EnsurePlainDirectory(DisksPath, DisksDir);
         EnsurePlainDirectory(SnapshotsPath, SnapshotsDir);
@@ -156,6 +189,66 @@ public sealed class GrassVmPackage
         EnsurePlainDirectory(LogsPath, LogsDir);
         EnsurePlainDirectory(TempPath, TempDir);
         EnsurePlainDirectory(RuntimePath, RuntimeDir);
+    }
+
+    /// <summary>
+    /// 只检查固定目录的安全属性，不读取或修复配置/状态文件。
+    /// Core 崩溃恢复扫描必须在读取 runtime/session.json 前使用它，避免
+    /// 为诊断一个锁定包而触发任何数据修复或把缺失目录误判成损坏。
+    /// </summary>
+    public bool FixedDirectoriesAreSafe()
+    {
+        if (IsReparsePointOrLink(Path)) return false;
+        foreach (var path in new[]
+        {
+            DisksPath, SnapshotsPath, FirmwarePath, ArtworkPath,
+            LogsPath, TempPath, RuntimePath,
+        })
+        {
+            try
+            {
+                var attrs = File.GetAttributes(path);
+                if ((attrs & FileAttributes.ReparsePoint) != 0
+                    || (attrs & FileAttributes.Directory) == 0)
+                    return false;
+            }
+            catch (FileNotFoundException) { if (IsReparsePointOrLink(path)) return false; }
+            catch (DirectoryNotFoundException) { if (IsReparsePointOrLink(path)) return false; }
+            catch (UnauthorizedAccessException) { return false; }
+            catch (IOException) { return false; }
+        }
+        return true;
+    }
+
+    /// <summary>检查会话、固件和根元数据等固定文件本身，拒绝文件级链接。</summary>
+    public bool FixedFilesAreSafe()
+    {
+        if (IsReparsePointOrLink(Path)) return false;
+        foreach (var path in new[]
+        {
+            ConfigPath, StatePath, LockPath, LockGuardPath, SessionPath,
+            System.IO.Path.Combine(FirmwarePath, "VARS.fd"),
+        })
+        {
+            try
+            {
+                var attrs = File.GetAttributes(path);
+                if ((attrs & FileAttributes.ReparsePoint) != 0
+                    || (attrs & FileAttributes.Directory) != 0)
+                    return false;
+            }
+            catch (FileNotFoundException) { if (IsReparsePointOrLink(path)) return false; }
+            catch (DirectoryNotFoundException) { if (IsReparsePointOrLink(path)) return false; }
+            catch (UnauthorizedAccessException) { return false; }
+            catch (IOException) { return false; }
+        }
+        return true;
+    }
+
+    public void EnsureFixedFilesAreSafe()
+    {
+        if (!FixedFilesAreSafe())
+            throw new IOException("虚拟机固定元数据或固件文件不能是符号链接、目录联接或目录。");
     }
 
     private static void EnsurePlainDirectory(string path, string label)
@@ -169,8 +262,16 @@ public sealed class GrassVmPackage
                 throw new IOException($"固定目录 {label}/ 被同名文件占用。");
             return;
         }
-        catch (FileNotFoundException) { }
-        catch (DirectoryNotFoundException) { }
+        catch (FileNotFoundException)
+        {
+            if (IsReparsePointOrLink(path))
+                throw new IOException($"固定目录 {label}/ 不能是符号链接或目录联接。");
+        }
+        catch (DirectoryNotFoundException)
+        {
+            if (IsReparsePointOrLink(path))
+                throw new IOException($"固定目录 {label}/ 不能是符号链接或目录联接。");
+        }
         Directory.CreateDirectory(path);
     }
 
@@ -202,11 +303,17 @@ public sealed class GrassVmPackage
             }
             catch (FileNotFoundException)
             {
-                report.SafeRepairs.Add(new SafeRepair($"缺少 {label}/ 目录", () => EnsurePlainDirectory(dir, label)));
+                if (IsReparsePointOrLink(dir))
+                    report.FatalProblems.Add($"固定目录 {label}/ 是悬空符号链接或目录联接，已拒绝访问。");
+                else
+                    report.SafeRepairs.Add(new SafeRepair($"缺少 {label}/ 目录", () => EnsurePlainDirectory(dir, label)));
             }
             catch (DirectoryNotFoundException)
             {
-                report.SafeRepairs.Add(new SafeRepair($"缺少 {label}/ 目录", () => EnsurePlainDirectory(dir, label)));
+                if (IsReparsePointOrLink(dir))
+                    report.FatalProblems.Add($"固定目录 {label}/ 是悬空符号链接或目录联接，已拒绝访问。");
+                else
+                    report.SafeRepairs.Add(new SafeRepair($"缺少 {label}/ 目录", () => EnsurePlainDirectory(dir, label)));
             }
             catch (IOException)
             {
@@ -256,8 +363,12 @@ public sealed class GrassVmPackage
             try
             {
                 if (ContainsReparsePoint(f)) continue;
+                var activeMarker = f + TransactionalDiskOps.ActiveMarkerSuffix;
+                if (IsActiveTransactionMarker(activeMarker, cutoff)) continue;
                 if (File.GetLastWriteTimeUtc(f) >= cutoff) continue;
                 File.Delete(f);
+                try { File.Delete(activeMarker); } catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
                 n++;
             }
             catch (IOException)
@@ -314,6 +425,38 @@ public sealed class GrassVmPackage
         }
         catch { /* state 读写失败/损坏/占用：留待下一轮 */ }
         return n;
+    }
+
+    private static bool IsActiveTransactionMarker(string markerPath, DateTime cutoff)
+    {
+        if (!File.Exists(markerPath)) return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(markerPath));
+            var root = doc.RootElement;
+            var pid = root.TryGetProperty("pid", out var pidEl) && pidEl.TryGetInt32(out var parsedPid)
+                ? parsedPid : 0;
+            if (pid <= 0)
+                return File.GetLastWriteTimeUtc(markerPath) >= cutoff;
+
+            using var process = Process.GetProcessById(pid);
+            if (process.HasExited) return false;
+            if (root.TryGetProperty("startedAtUtc", out var startedEl)
+                && startedEl.TryGetDateTimeOffset(out var expectedStart))
+            {
+                var actualStart = process.StartTime.ToUniversalTime();
+                // PID 复用时不能把无关进程当成 qemu-img；无法精确到毫秒时取 2 秒宽限。
+                if ((actualStart - expectedStart.UtcDateTime).Duration() > TimeSpan.FromSeconds(2))
+                    return false;
+            }
+            return true;
+        }
+        catch (ArgumentException) { return false; }
+        catch (InvalidOperationException) { return true; }
+        catch (System.ComponentModel.Win32Exception) { return true; }
+        catch (JsonException) { return true; }
+        catch (IOException) { return true; }
+        catch (UnauthorizedAccessException) { return true; }
     }
 }
 

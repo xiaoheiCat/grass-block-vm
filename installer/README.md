@@ -38,3 +38,15 @@ C:\Program Files\Grass Block VM\
 
 - `%LOCALAPPDATA%\GrassBlockVM\grass.db`（SQLite：Library Root、偏好、自动启动、Host-only 网络、索引缓存）
 - 默认 Library Root：`%USERPROFILE%\Documents\Grass Block VM`
+
+## Windows 发布构建前置条件
+
+安装器不会从源码伪造或下载运行时组件；正式构建必须由发布流水线注入经过审核的二进制目录，
+`installer/build.ps1` 会在打包前逐项校验并执行实际 QEMU 版本检查。可使用环境变量指定这些目录：
+
+- `GRASSVM_QEMU_DIR`：包含 `qemu-system-x86_64.exe`、`qemu-img.exe` 及其 DLL。
+- `GRASSVM_FIRMWARE_DIR`：包含 `OVMF_CODE.fd`、`OVMF_CODE.secboot.fd`、`OVMF_VARS.fd`。
+- `GRASSVM_TAP_DIR`：包含 `tapinstall.exe`、`OemVista.inf` 及 TAP 驱动文件。
+- `GRASSVM_HELPER_DIR`：可选；缺少时由同一 .NET 10 SDK 从 `apps/helper` 发布。
+
+未提供这些目录时脚本必须失败并明确指出缺失组件，不能生成一个安装后无法启动的半成品。

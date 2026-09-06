@@ -154,4 +154,48 @@ public class QemuImgTransactionTests : IDisposable
         Assert.Equal(0, removed);
         Assert.True(File.Exists(fresh));
     }
+
+    [Fact]
+    public void OldGrassTmp_WithLiveTransactionMarker_IsKept()
+    {
+        var pkg = GrassVmPackage.CreateNew(_dir, "Active VM");
+        var tmp = Path.Combine(pkg.DisksPath, "being-written.qcow2" + TransactionalDiskOps.TempSuffix);
+        File.WriteAllText(tmp, "in flight");
+        File.SetLastWriteTimeUtc(tmp, DateTime.UtcNow - TimeSpan.FromMinutes(15));
+        var marker = tmp + TransactionalDiskOps.ActiveMarkerSuffix;
+        File.WriteAllText(marker, System.Text.Json.JsonSerializer.Serialize(new
+        {
+            pid = Environment.ProcessId,
+            startedAtUtc = System.Diagnostics.Process.GetCurrentProcess().StartTime.ToUniversalTime(),
+        }));
+        File.SetLastWriteTimeUtc(marker, DateTime.UtcNow - TimeSpan.FromMinutes(15));
+
+        var removed = pkg.CleanupResidualTempFiles();
+        Assert.Equal(0, removed);
+        Assert.True(File.Exists(tmp));
+        File.Delete(marker);
+    }
+
+    [Fact]
+    public void CommittedJournal_DoesNotRestoreOldParent()
+    {
+        var pkg = GrassVmPackage.CreateNew(_dir, "Committed VM");
+        var parent = Path.Combine(pkg.DisksPath, "base.qcow2");
+        var backup = parent + TransactionalDiskOps.CommitTempSuffix;
+        var journal = Path.Combine(pkg.TempPath, "commit-journal.json");
+        File.WriteAllText(parent, "committed-data");
+        File.WriteAllText(backup, "old-data");
+        File.WriteAllText(journal, System.Text.Json.JsonSerializer.Serialize(new
+        {
+            Parent = parent,
+            Backup = backup,
+            Phase = "committed",
+        }));
+
+        TransactionalDiskOps.FinishCommitTempFiles(pkg);
+
+        Assert.Equal("committed-data", File.ReadAllText(parent));
+        Assert.False(File.Exists(backup));
+        Assert.False(File.Exists(journal));
+    }
 }

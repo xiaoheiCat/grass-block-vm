@@ -1,10 +1,12 @@
 using System.Diagnostics;
 using System.Formats.Tar;
 using System.Text;
+using System.Text.Json.Nodes;
 using GrassCore.Clone;
 using GrassCore.Config;
 using GrassCore.ExportImport;
 using GrassCore.GrassVm;
+using GrassCore.Library;
 using GrassCore.Profiles;
 using GrassCore.Qemu;
 using GrassCore.Rpc;
@@ -81,6 +83,51 @@ public class CloneExportTests : IDisposable
     }
 
     [Fact]
+    public void UpdateConfig_NormalizesAbsoluteInPackageDiskReference()
+    {
+        var pkg = GrassVmPackage.CreateNew(_root, "Absolute Disk");
+        var diskPath = Path.Combine(pkg.DisksPath, "system.qcow2");
+        File.WriteAllText(diskPath, "qcow2 placeholder");
+        var config = OsProfileLibrary.CreateDefaultConfig("other", pkg.Name);
+        config.Devices.Add(new DiskDevice
+        {
+            Path = diskPath, // 模拟旧版/手工配置把包内绝对路径直接写入 config
+            SizeBytes = 80L * 1024 * 1024 * 1024,
+            CreatedOrder = 10,
+        });
+        new ConfigStore(pkg).Save(config);
+
+        using var db = new HostDb(Path.Combine(_dir, "absolute-disk.db"));
+        db.SetPreference("libraryRoot", _root);
+        var service = new GrassCoreService(
+            db, "missing-qemu", _fakeQemuImg, Path.Combine(_dir, "firmware"), "11");
+
+        service.UpdateConfig(pkg.Path, ConfigJson.Serialize(config));
+
+        var savedDisk = new ConfigStore(pkg).Load().Devices.OfType<DiskDevice>().Single();
+        Assert.False(savedDisk.IsExternal);
+        Assert.Equal("disks/system.qcow2", savedDisk.Path);
+    }
+
+    [Fact]
+    public async Task FullClone_CopiesAbsoluteInPackageIsoReference()
+    {
+        var src = await CreateVmWithDiskAsync("Absolute ISO source");
+        var iso = Path.Combine(src.Path, "isovol", "setup.iso");
+        Directory.CreateDirectory(Path.GetDirectoryName(iso)!);
+        File.WriteAllText(iso, "iso placeholder");
+        var config = new ConfigStore(src).Load();
+        config.Devices.Add(new CdromDevice { IsoPath = iso, CreatedOrder = 20 });
+        new ConfigStore(src).Save(config);
+
+        var clone = await new CloneService(Ops()).FullCloneAsync(src, "Absolute ISO clone");
+        var cloneIso = new ConfigStore(clone).Load().DevicesOfType<CdromDevice>()
+            .Single(d => d.IsoPath is not null).IsoPath!;
+        Assert.False(Path.IsPathRooted(cloneIso));
+        Assert.True(File.Exists(PathPolicy.Resolve(clone, cloneIso)));
+    }
+
+    [Fact]
     public async Task LinkedClone_MustBeBasedOnSnapshot_RecordsCloneInfo()
     {
         var src = await CreateVmWithDiskAsync("Ubuntu");
@@ -109,6 +156,23 @@ public class CloneExportTests : IDisposable
     }
 
     [Fact]
+    public async Task LinkedClone_RejectsSnapshotMissingInternalDiskReference()
+    {
+        var src = await CreateVmWithDiskAsync("Missing overlay source");
+        var config = new ConfigStore(src).Load();
+        var snap = SnapshotService.Create(src, config, "Incomplete snapshot", diskOps: Ops());
+
+        var metadataPath = Path.Combine(src.SnapshotsPath, snap.Uuid, "metadata.json");
+        var metadata = JsonNode.Parse(await File.ReadAllTextAsync(metadataPath))!.AsObject();
+        metadata["DiskOverlayRefs"] = new JsonObject();
+        await File.WriteAllTextAsync(metadataPath, metadata.ToJsonString());
+
+        var cloner = new CloneService(Ops());
+        Assert.Throws<GrassCoreException>(() => cloner.LinkedClone(src, snap.Uuid, "Incomplete clone"));
+        Assert.False(Directory.Exists(Path.Combine(_root, "Incomplete clone.grassvm")));
+    }
+
+    [Fact]
     public async Task GrassVmZip_RoundTrips_FullArchive_WithoutLocalTraces()
     {
         var src = await CreateVmWithDiskAsync("归档机");
@@ -119,9 +183,17 @@ public class CloneExportTests : IDisposable
         File.WriteAllText(src.SessionPath, "{\"session\":\"x\"}");
         File.WriteAllText(Path.Combine(src.LogsPath, "qemu.log"), "log");
 
-        GrassVmZip.EnsureExportable(src, isRunning: false);
         var zipPath = Path.Combine(_dir, "archive.zip");
-        GrassVmZip.Export(src, zipPath);
+        using (var exportLock = new VmLock(src))
+        {
+            exportLock.Acquire();
+            GrassVmZip.EnsureExportable(src, isRunning: false, lockHeld: true);
+            GrassVmZip.Export(src, zipPath);
+        }
+
+        using (var archive = System.IO.Compression.ZipFile.OpenRead(zipPath))
+            Assert.DoesNotContain(archive.Entries, entry =>
+                entry.FullName.EndsWith("/" + GrassVmPackage.LockGuardFile, StringComparison.OrdinalIgnoreCase));
 
         // 导入到另一个 Library Root（完整档案：快照树 + 磁盘 + 配置都在）
         var otherRoot = Path.Combine(_dir, "imported-root");
@@ -176,6 +248,39 @@ public class CloneExportTests : IDisposable
         Assert.Throws<GrassCoreException>(() => GrassVmZip.Import(zipPath, _root));
     }
 
+    [Theory]
+    [InlineData("devices")]
+    [InlineData("bootOrder")]
+    public void GrassVmZip_Import_RejectsNullConfigCollections(string nullProperty)
+    {
+        var zipPath = Path.Combine(_dir, $"null-{nullProperty}.zip");
+        var devices = nullProperty == "devices"
+            ? "null"
+            : "[ { \"deviceType\": \"display\", \"createdOrder\": 1 } ]";
+        var bootOrder = nullProperty == "bootOrder" ? "null" : "[ \"disk\", \"cd\", \"network\" ]";
+        var config = $$"""
+            {
+              "schemaVersion": 1,
+              "name": "Malformed",
+              "osProfileId": "other",
+              "cpuCores": 1,
+              "memoryMiB": 2048,
+              "firmware": { "kind": "bios", "secureBoot": false, "tpm": false },
+              "bootOrder": {{bootOrder}},
+              "devices": {{devices}}
+            }
+            """;
+        using (var zip = System.IO.Compression.ZipFile.Open(zipPath, System.IO.Compression.ZipArchiveMode.Create))
+        {
+            var entry = zip.CreateEntry("Malformed.grassvm/config.json");
+            using var writer = new StreamWriter(entry.Open());
+            writer.Write(config);
+        }
+
+        var ex = Assert.Throws<GrassCoreException>(() => GrassVmZip.Import(zipPath, _root));
+        Assert.Contains("无法导入", ex.Message);
+    }
+
     [Fact]
     public void Ovf_ExtractOva_RejectsCaseSensitiveTraversal()
     {
@@ -201,6 +306,66 @@ public class CloneExportTests : IDisposable
 
         Assert.Throws<GrassCoreException>(() => OvfImporter.ExtractOva(ova, baseDir));
         Assert.False(File.Exists(Path.Combine(siblingDir, "escaped.txt")));
+    }
+
+    [Fact]
+    public void Ovf_ExtractOva_NeverOverwritesPreexistingTarget()
+    {
+        var baseDir = Path.Combine(_dir, "existing-target");
+        Directory.CreateDirectory(baseDir);
+        var target = Path.Combine(baseDir, "disk.vmdk");
+        File.WriteAllText(target, "original");
+        var ova = Path.Combine(_dir, "existing-target.ova");
+        using (var output = File.Create(ova))
+        using (var writer = new TarWriter(output, TarEntryFormat.Pax, leaveOpen: false))
+        {
+            var entry = new PaxTarEntry(TarEntryType.RegularFile, "disk.vmdk")
+            {
+                DataStream = new MemoryStream("replacement"u8.ToArray()),
+            };
+            writer.WriteEntry(entry);
+            entry.DataStream?.Dispose();
+        }
+
+        Assert.Throws<GrassCoreException>(() => OvfImporter.ExtractOva(ova, baseDir));
+        Assert.Equal("original", File.ReadAllText(target));
+    }
+
+    [Fact]
+    public void Ovf_ExtractOva_RejectsPreexistingSymlinkParent()
+    {
+        var baseDir = Path.Combine(_dir, "symlink-target");
+        var outsideDir = Path.Combine(_dir, "outside");
+        Directory.CreateDirectory(baseDir);
+        Directory.CreateDirectory(outsideDir);
+        var link = Path.Combine(baseDir, "nested");
+        try
+        {
+            Directory.CreateSymbolicLink(link, outsideDir);
+        }
+        catch (UnauthorizedAccessException)
+        {
+            return;
+        }
+        catch (IOException)
+        {
+            return;
+        }
+
+        var ova = Path.Combine(_dir, "symlink-parent.ova");
+        using (var output = File.Create(ova))
+        using (var writer = new TarWriter(output, TarEntryFormat.Pax, leaveOpen: false))
+        {
+            var entry = new PaxTarEntry(TarEntryType.RegularFile, "nested/escaped.txt")
+            {
+                DataStream = new MemoryStream("escaped"u8.ToArray()),
+            };
+            writer.WriteEntry(entry);
+            entry.DataStream?.Dispose();
+        }
+
+        Assert.Throws<GrassCoreException>(() => OvfImporter.ExtractOva(ova, baseDir));
+        Assert.False(File.Exists(Path.Combine(outsideDir, "escaped.txt")));
     }
 
     [Fact]
@@ -391,6 +556,21 @@ public class CloneExportTests : IDisposable
             """;
         var plan = new OvfImporter(Ops()).PlanFromOvf(System.Xml.Linq.XDocument.Parse(ovf), _dir);
         Assert.Equal(GrassCore.Config.FirmwareKind.Bios, plan.Config.Firmware?.Kind);
+    }
+
+    [Fact]
+    public void Ovf_Import_RejectsReferenceFileWithoutIdOrHref()
+    {
+        const string ovf = """
+            <ovf:Envelope xmlns:ovf="http://schemas.dmtf.org/ovf/envelope/1">
+              <ovf:References><ovf:File href="disk.vmdk"/></ovf:References>
+            </ovf:Envelope>
+            """;
+
+        var ex = Assert.Throws<GrassCoreException>(() =>
+            new OvfImporter(Ops()).PlanFromOvf(System.Xml.Linq.XDocument.Parse(ovf), _dir));
+
+        Assert.Contains("References/File", ex.Message);
     }
 
     [Fact]

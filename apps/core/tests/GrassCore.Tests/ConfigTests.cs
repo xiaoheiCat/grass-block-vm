@@ -145,6 +145,13 @@ public class VmLockTests : IDisposable
         var l1 = new VmLock(pkg);
         l1.Acquire();
         Assert.True(l1.IsLocked);
+        Assert.True(File.Exists(pkg.LockGuardPath));
+
+        if (OperatingSystem.IsWindows())
+        {
+            Assert.ThrowsAny<IOException>(() => File.Delete(pkg.LockPath));
+            Assert.True(File.Exists(pkg.LockPath));
+        }
 
         var l2 = new VmLock(pkg);
         var ex = Assert.Throws<VmLockedException>(() => l2.Acquire());
@@ -171,6 +178,7 @@ public class VmLockTests : IDisposable
         l.Acquire();
         l.ForceUnlockByUser(); // UI 已确认风险
         Assert.False(l.IsLocked);
+        Assert.False(File.Exists(pkg.LockGuardPath));
         l.Acquire(); // 可以重新接管
     }
 
@@ -189,6 +197,7 @@ public class VmLockTests : IDisposable
 
         owner.Release();
         Assert.False(File.Exists(pkg.LockPath));
+        Assert.False(File.Exists(pkg.LockGuardPath));
     }
 
     [Fact]
@@ -206,6 +215,7 @@ public class VmLockTests : IDisposable
 
         owner.Release();
         Assert.False(File.Exists(pkg.LockPath));
+        Assert.False(File.Exists(pkg.LockGuardPath));
     }
 
     [Fact]
@@ -217,6 +227,7 @@ public class VmLockTests : IDisposable
         // 模拟 Core 重启后由没有原始句柄的收尾实例接管残留锁。
         new VmLock(pkg).Release();
         Assert.False(File.Exists(pkg.LockPath));
+        Assert.False(File.Exists(pkg.LockGuardPath));
 
         // 若进程内 Handles 仍登记已释放的 Stream，这里会错误地拒绝获取。
         using var replacement = new VmLock(pkg);
