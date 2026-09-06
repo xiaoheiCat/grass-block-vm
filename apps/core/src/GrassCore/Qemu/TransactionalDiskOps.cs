@@ -175,6 +175,7 @@ public sealed class TransactionalDiskOps
         var package = FindOwningPackage(overlayFile);
         var journal = package is null ? null : Path.Combine(package.TempPath, "commit-journal.json");
         var backup = parent is null ? null : parent + CommitTempSuffix;
+        var backupCopied = false;
         if (journal is not null && backup is not null)
         {
             if (GrassVmPackage.IsReparsePointOrLink(journal) || GrassVmPackage.IsReparsePointOrLink(backup))
@@ -182,6 +183,7 @@ public sealed class TransactionalDiskOps
             Directory.CreateDirectory(package!.TempPath);
             AtomicFile.WriteJsonValidated(journal, JsonSerializer.Serialize(new CommitJournal(parent!, backup, "prepared")));
             File.Copy(parent!, backup, overwrite: false);
+            backupCopied = true;
             AtomicFile.WriteJsonValidated(journal, JsonSerializer.Serialize(new CommitJournal(parent!, backup, "copied")));
         }
         // tempTarget 只在失败清理时使用：commit 的目标就是真文件，绝不能被删，
@@ -223,7 +225,8 @@ public sealed class TransactionalDiskOps
                 {
                     // 只有 qemu-img 尚未成功返回时才可以回滚。提交成功后的
                     // journal/backup 清理失败要留给下一次启动收尾，不能破坏新数据。
-                    if (!commitCompleted && File.Exists(backup) && !GrassVmPackage.IsReparsePointOrLink(backup))
+                    if (!commitCompleted && backupCopied && File.Exists(backup)
+                        && !GrassVmPackage.IsReparsePointOrLink(backup))
                         File.Copy(backup, parent!, overwrite: true);
                     DeleteIfExists(backup);
                     DeleteIfExists(journal);
@@ -253,7 +256,9 @@ public sealed class TransactionalDiskOps
                 + Path.DirectorySeparatorChar;
             var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
             if (!Path.GetFullPath(tx.Parent).StartsWith(root, cmp) || !Path.GetFullPath(tx.Backup).StartsWith(root, cmp)) return;
-            if (tx.Phase != "committed" && File.Exists(tx.Backup)
+            // 只有完整复制完成后才有资格恢复。prepared 表示父盘备份尚未完成，
+            // 可能只是截断文件；拿它覆盖健康父盘会把用户数据回滚成残片。
+            if (tx.Phase == "copied" && File.Exists(tx.Backup)
                 && !GrassVmPackage.IsReparsePointOrLink(tx.Backup))
                 File.Copy(tx.Backup, tx.Parent, overwrite: true);
             DeleteIfExists(tx.Backup);

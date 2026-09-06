@@ -198,4 +198,50 @@ public class QemuImgTransactionTests : IDisposable
         Assert.False(File.Exists(backup));
         Assert.False(File.Exists(journal));
     }
+
+    [Fact]
+    public void PreparedJournal_DiscardsIncompleteBackup_AndKeepsParent()
+    {
+        var pkg = GrassVmPackage.CreateNew(_dir, "Prepared VM");
+        var parent = Path.Combine(pkg.DisksPath, "base.qcow2");
+        var backup = parent + TransactionalDiskOps.CommitTempSuffix;
+        var journal = Path.Combine(pkg.TempPath, "commit-journal.json");
+        File.WriteAllText(parent, "healthy-parent");
+        File.WriteAllText(backup, "truncated-backup");
+        File.WriteAllText(journal, System.Text.Json.JsonSerializer.Serialize(new
+        {
+            Parent = parent,
+            Backup = backup,
+            Phase = "prepared",
+        }));
+
+        TransactionalDiskOps.FinishCommitTempFiles(pkg);
+
+        Assert.Equal("healthy-parent", File.ReadAllText(parent));
+        Assert.False(File.Exists(backup));
+        Assert.False(File.Exists(journal));
+    }
+
+    [Fact]
+    public void CopiedJournal_RestoresCompleteBackup()
+    {
+        var pkg = GrassVmPackage.CreateNew(_dir, "Copied VM");
+        var parent = Path.Combine(pkg.DisksPath, "base.qcow2");
+        var backup = parent + TransactionalDiskOps.CommitTempSuffix;
+        var journal = Path.Combine(pkg.TempPath, "commit-journal.json");
+        File.WriteAllText(parent, "possibly-damaged-parent");
+        File.WriteAllText(backup, "complete-backup");
+        File.WriteAllText(journal, System.Text.Json.JsonSerializer.Serialize(new
+        {
+            Parent = parent,
+            Backup = backup,
+            Phase = "copied",
+        }));
+
+        TransactionalDiskOps.FinishCommitTempFiles(pkg);
+
+        Assert.Equal("complete-backup", File.ReadAllText(parent));
+        Assert.False(File.Exists(backup));
+        Assert.False(File.Exists(journal));
+    }
 }

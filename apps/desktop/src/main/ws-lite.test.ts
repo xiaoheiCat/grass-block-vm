@@ -152,4 +152,16 @@ describe('ws-lite 帧协议（SPICE 桥的地基）', () => {
       await fx.done();
     });
   });
+
+  it('允许 spice-html5 的多通道连接，但拒绝超出桥接上限的连接', async () => {
+    await withServer(async (fx) => {
+      const sockets: net.Socket[] = [];
+      for (let i = 0; i < 8; i++) sockets.push(await upgradeAndConnect(fx.port, `/${fx.token}`));
+      expect(fx.wss.clients.size).toBe(8);
+      await expect(upgradeAndConnect(fx.port, `/${fx.token}`, 500)).rejects.toThrow();
+      expect(fx.wss.clients.size).toBe(8);
+      for (const socket of sockets) socket.destroy();
+      await fx.done();
+    });
+  });
 });

@@ -18,7 +18,8 @@ export interface WsConnection extends EventEmitter {
 }
 
 export class WebSocketServer extends EventEmitter {
-  private static readonly MaxClientsPerBridge = 2;
+  // spice-html5 为一条显示器拆分建立 main/display/inputs/cursor/playback 等多条通道。
+  private static readonly MaxClientsPerBridge = 8;
   private readonly conns = new Set<WsConnImpl>();
 
   /** 当前连接（拆除桥时用于终止全部会话）。 */

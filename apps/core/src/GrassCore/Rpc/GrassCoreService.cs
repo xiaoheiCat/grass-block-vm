@@ -868,8 +868,12 @@ public sealed class GrassCoreService
                 // 时必须保留后续真实 Exited 事件，否则锁和 runtime 将永久残留。
                 if (Interlocked.Exchange(ref cleanupStarted, 1) != 0) return;
 
-                if (!_running.Remove(vm.PackagePath, out var removed)) return; // 已被挂起/强制路径处理
-                removed.Qmp?.Dispose();
+                if (!_running.TryGetValue(vm.PackagePath, out var removed)
+                    || !ReferenceEquals(removed, vm)) return; // 已被挂起/强制路径处理
+                // QEMU 已退出但清理尚未完成时仍保留运行记录和锁。否则 ScanLibrary
+                // 会显示 stopped，另一个启动请求可以在 runtime/和 vm.lock 清理前
+                // 进入，最终与本次异步收尾互相删除对方会话。
+                _lifecycleInFlight[vm.PackagePath] = "stopping";
                 var pkg = new GrassVmPackage(vm.PackagePath);
                 // 挂起恢复的 VM 退出时挂起标记还在（确认循环没能确认 running）：
                 // 客户机可能已跑过并写过磁盘，保存的内存状态不可再重放——作废。
@@ -887,12 +891,10 @@ public sealed class GrassCoreService
                         try { if (File.Exists(sf)) File.Delete(sf); } catch { /* 回收失败不致命 */ }
                     }
                 }
-                // 收尾（升级保护清理 + runtime 清空 + 放锁）全部进包级互斥门：
-                // 退出瞬间 UI 就显示"已关机"，此刻的 解除锁定→启动 / 快照 RPC 都
-                // 拿得到空闲的门。门外的清理（尤其几分钟的 qemu-img commit + NAS/
-                // 杀毒拖长的 runtime 删除）会在等门用户操作【之后】醒来，把新会话
-                // 刚写好的 session.json 删掉、把新会话的活锁放掉——双写者灾难正是
-                // vm.lock 要防的事。门内复核运行状态 + 会话身份，都不是本会话就不动。
+                // 收尾（升级保护清理 + runtime 清空 + 放锁）全部进包级互斥门；
+                // stopping 状态会持续到这段工作完成，期间 UI 不会显示已关机，
+                // 也不会让解除锁定/启动/快照 RPC 趁清理尚未完成时进入。
+                // 门内复核运行状态 + 会话身份，都不是本会话就不动。
                 // 必须挪到线程池跑：WaitForExit（挂起流程）会在【持门的调用线程】上
                 // 同步派发 Exited——同一根线程再进 SemaphoreSlim = 自死锁（实测挂死）
                 System.Threading.Tasks.Task.Run(() =>
@@ -901,7 +903,8 @@ public sealed class GrassCoreService
                     {
                         WithDiskJob(() => WithPackageGate(vm.PackagePath, () =>
                         {
-                            if (_running.ContainsKey(vm.PackagePath)) return; // 等门期间已被再次启动
+                            if (!_running.TryGetValue(vm.PackagePath, out var current)
+                                || !ReferenceEquals(current, vm)) return; // 生命周期已被其他路径接管
                             // 双保险：runtime 里的 session 不是本会话 = 有人已解锁并启动过
                             //（新会话可能又已退出）——残局属于别人，不碰
                             try
@@ -921,12 +924,16 @@ public sealed class GrassCoreService
                             // 正常退出路径：清空 runtime/ 并删除 vm.lock
                             if (Directory.Exists(pkg.RuntimePath))
                                 foreach (var f in Directory.EnumerateFiles(pkg.RuntimePath)) File.Delete(f);
+                            removed.Qmp?.Dispose();
                             removed.Lock.Release();
+                            _running.TryRemove(vm.PackagePath, out _);
+                            _lifecycleInFlight.TryRemove(vm.PackagePath, out _);
                         }));
                     }
                     catch
                     {
-                        // 收尾失败：残留锁由下次启动预检诊断（与旧的同步路径语义一致）
+                        // 收尾失败时保留 stopping 状态和锁，绝不能伪报 stopped 允许
+                        // 第二个 QEMU 启动。下次 Core 接管/人工诊断继续处理残局。
                     }
                 });
             }
@@ -1357,7 +1364,38 @@ public sealed class GrassCoreService
             {
                 if (_running.TryGetValue(packagePath, out var fo))
                     fo.AcpiShutdownRequested = false;
-                return QmpResult(RequireQmp(packagePath).ForceQuitAsync().GetAwaiter().GetResult());
+                var qmp = RequireQmp(packagePath);
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                try
+                {
+                    return QmpResult(qmp.ForceQuitAsync(timeout.Token).GetAwaiter().GetResult());
+                }
+                catch (Exception ex) when (ex is OperationCanceledException or QmpException or IOException or ObjectDisposedException)
+                {
+                    // QMP 无响应时不能把包级门永久占住。杀掉已跟踪的 QEMU，
+                    // 让退出监视器继续执行统一的 helper/runtime/vm.lock 收尾。
+                    if (_running.TryGetValue(packagePath, out var tracked))
+                    {
+                        var terminated = false;
+                        try
+                        {
+                            if (tracked.Process.HasExited)
+                                terminated = true;
+                            else
+                            {
+                                tracked.Process.Kill(entireProcessTree: true);
+                                terminated = tracked.Process.WaitForExit(5_000);
+                            }
+                        }
+                        catch (InvalidOperationException) { }
+                        catch (ArgumentException) { }
+                        catch (System.ComponentModel.Win32Exception) { }
+                        catch (UnauthorizedAccessException) { }
+                        if (!terminated)
+                            throw new GrassCoreException("QMP 控制通道无响应，且无法确认 QEMU 已终止。请稍后重试或结束 QEMU 进程后再操作。");
+                    }
+                    return new { sent = false, terminated = true, fallback = true };
+                }
             }
             // 挂起 = 保存完整运行状态后完全退出 QEMU（不是 pause；1.0 无"暂停"）。
             // 直接调内部实现：PowerAction 已持有该包的门，再进公共 SuspendVm 会同线程重入死锁。

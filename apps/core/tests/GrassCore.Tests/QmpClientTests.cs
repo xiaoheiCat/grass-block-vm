@@ -46,7 +46,7 @@ public class QmpClientTests
         }
     }
 
-    private static async Task RunWithFakeQmp(Func<QmpClient, Task> body)
+    private static async Task RunWithFakeQmp(Func<QmpClient, Task> body, bool ignoreQuit = false)
     {
         using var fake = new FakeQmp();
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
@@ -81,6 +81,9 @@ public class QmpClientTests
                         break;
                     case "system_powerdown":
                         fake.WriteLine($$"""{"return":{},"id":{{id}}}""");
+                        break;
+                    case "quit" when ignoreQuit:
+                        // 用于验证调用方的取消令牌不会在 QMP 无响应时永久等待。
                         break;
                     default:
                         fake.WriteLine($$"""{"error":{"class":"CommandNotFound","desc":"unknown command"},"id":{{id}}}""");
@@ -143,5 +146,16 @@ public class QmpClientTests
             await qmp.MigrateToFileAsync(@"C:\VM\state.dat");
             Assert.Equal("completed", await qmp.MigrationStatusAsync());
         });
+    }
+
+    [Fact]
+    public async Task ForceQuit_HonorsCancellation_WhenQmpDoesNotRespond()
+    {
+        await RunWithFakeQmp(async qmp =>
+        {
+            using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(
+                () => qmp.ForceQuitAsync(timeout.Token));
+        }, ignoreQuit: true);
     }
 }

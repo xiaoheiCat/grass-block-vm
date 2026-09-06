@@ -43,16 +43,13 @@ public static class Program
             return 2;
         }
 
-        // Named Pipe 可以允许多个 server instance；如果两个 Electron/UI 进程同时
-        // 发现 Core 不在线，单靠进程内单飞仍会孵出两个 GrassCore，各自接管同一 VM。
-        // 命名管道在 Windows 上跨 Terminal Session 可见，因此互斥锁也必须使用
-        // Global 命名空间；Local 会话锁会让快速用户切换/RDP 的两个会话各自启动
-        // 一个 Core，客户端随后可能随机接入错误的服务实例。后启动者直接退出，
-        // 前一个实例继续提供既有管道。mutex 句柄持有到 Main 返回，崩溃时由 OS 自动释放。
+        // Named Pipe 和 mutex 都按当前用户隔离。管道使用 CurrentUserOnly ACL，
+        // 互斥锁使用同一用户名摘要，避免一个用户的 Core 阻塞另一个用户却又
+        // 无法连接其管道。后启动者直接退出，句柄持有到 Main 返回，崩溃时由 OS 自动释放。
         Mutex? coreMutex = null;
         if (OperatingSystem.IsWindows())
         {
-            coreMutex = new Mutex(initiallyOwned: false, name: @"Global\GrassBlockVM.Core", createdNew: out _);
+            coreMutex = new Mutex(initiallyOwned: false, name: Transport.CurrentUserMutexName, createdNew: out _);
             var ownsMutex = false;
             try { ownsMutex = coreMutex.WaitOne(0); }
             catch (AbandonedMutexException) { ownsMutex = true; }

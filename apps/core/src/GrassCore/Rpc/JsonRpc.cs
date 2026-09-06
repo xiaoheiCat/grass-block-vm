@@ -1,5 +1,7 @@
 using System.IO.Pipes;
 using System.Net;
+using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 
@@ -96,7 +98,23 @@ public sealed class JsonRpcConnection
 /// <summary>IPC 传输端点选择：Windows 用 Named Pipe；其他平台（开发）用 stdio。</summary>
 public static class Transport
 {
+    // 保留旧常量供测试/外部诊断代码编译；服务端默认端点已改为用户专属名称。
     public const string DefaultPipeName = "grassvm-core";
+    /// <summary>按当前用户隔离管道和互斥锁，避免不同用户互相阻塞却无法连接。</summary>
+    public static string CurrentUserPipeName => "grassvm-core-" + CurrentUserKey();
+    public static string CurrentUserMutexName => "Local\\GrassBlockVM.Core." + CurrentUserKey();
+
+    private static string CurrentUserKey()
+    {
+        var identity = Environment.UserName;
+        if (OperatingSystem.IsWindows())
+        {
+            try { identity = WindowsIdentity.GetCurrent().User?.Value ?? identity; }
+            catch { /* 受限宿主环境回退到用户名；两端仍使用同一回退规则 */ }
+        }
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(identity.ToUpperInvariant()));
+        return Convert.ToHexString(bytes)[..16].ToLowerInvariant();
+    }
     public const int MaxConnections = 16;
 
     /// <summary>当前活跃连接数（空闲退出判定用）。</summary>
@@ -107,7 +125,7 @@ public static class Transport
     {
         if (OperatingSystem.IsWindows())
         {
-            var name = pipeName ?? DefaultPipeName;
+            var name = pipeName ?? CurrentUserPipeName;
             while (!ct.IsCancellationRequested)
             {
                 var server = new NamedPipeServerStream(name, PipeDirection.InOut,

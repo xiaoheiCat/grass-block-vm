@@ -5,11 +5,34 @@
  * - 非 Windows 开发机：GrassCore 以 stdio 承载同一协议（便于本机联调）
  * - UI 崩溃不杀 Core；Core 崩溃不杀 QEMU（Core 侧负责无损重接管）
  */
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
 import net from 'node:net';
+import os from 'node:os';
+import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
 
-const PIPE_NAME = '\\\\.\\pipe\\grassvm-core';
+function currentUserIdentity(): string {
+  if (process.platform === 'win32') {
+    try {
+      const output = execFileSync('whoami.exe', ['/user'], {
+        encoding: 'utf8',
+        windowsHide: true,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+      const sid = output.match(/\bS-\d-\d+(?:-\d+)+\b/)?.[0];
+      if (sid) return sid;
+    } catch {
+      // 受限环境中 whoami 可能不可用；Core 端也有同样的用户名回退。
+    }
+  }
+  return os.userInfo().username;
+}
+
+const userKey = crypto.createHash('sha256')
+  .update(currentUserIdentity().toUpperCase(), 'utf8')
+  .digest('hex')
+  .slice(0, 16);
+const PIPE_NAME = `\\\\.\\pipe\\grassvm-core-${userKey}`;
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 
 type BridgeChannel = { writable: NodeJS.WritableStream; readable: NodeJS.ReadableStream };
