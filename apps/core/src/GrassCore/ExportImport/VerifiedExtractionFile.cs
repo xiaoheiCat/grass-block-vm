@@ -107,11 +107,15 @@ internal static class VerifiedExtractionFile
             var fd = handle.DangerousGetHandle();
             if (OperatingSystem.IsLinux())
             {
-                var unixBuffer = new StringBuilder(4096);
-                var unixLength = UnixReadLink($"/proc/self/fd/{fd.ToInt64()}", unixBuffer, (nuint)unixBuffer.Capacity);
-                if (unixLength <= 0 || unixLength >= unixBuffer.Capacity)
+                // readlink(2) 返回写入的字节数且不会补 NUL；用 StringBuilder
+                // 作为 out 缓冲时，.NET 的 Length 不保证等于原生写入长度，
+                // 在 Linux 上会导致 ToString(start,length) 越界。使用字节数组
+                // 按返回长度解码，兼容 UTF-8 路径和不同 libc 的 marshaler 行为。
+                var unixBuffer = new byte[4096];
+                var unixLength = UnixReadLink($"/proc/self/fd/{fd.ToInt64()}", unixBuffer, (nuint)unixBuffer.Length);
+                if (unixLength <= 0 || unixLength >= unixBuffer.Length)
                     throw new GrassCoreException("无法确认文件句柄的实际路径，已拒绝写入或读取。");
-                return Path.GetFullPath(unixBuffer.ToString(0, checked((int)unixLength)));
+                return Path.GetFullPath(Encoding.UTF8.GetString(unixBuffer, 0, checked((int)unixLength)));
             }
             if (OperatingSystem.IsMacOS())
             {
@@ -197,7 +201,7 @@ internal static class VerifiedExtractionFile
     private const int MacFGetPath = 50;
 
     [DllImport("libc", EntryPoint = "readlink", CharSet = CharSet.Ansi, SetLastError = true)]
-    private static extern nint UnixReadLink(string path, StringBuilder buffer, nuint bufferSize);
+    private static extern nint UnixReadLink(string path, byte[] buffer, nuint bufferSize);
 
     [DllImport("libc", EntryPoint = "fcntl", SetLastError = true)]
     private static extern int UnixFcntl(IntPtr fd, int command, StringBuilder buffer);

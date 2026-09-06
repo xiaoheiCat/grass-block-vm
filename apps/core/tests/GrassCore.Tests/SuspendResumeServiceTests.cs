@@ -19,26 +19,56 @@ public class SuspendResumeServiceTests : IDisposable
     public SuspendResumeServiceTests() => Directory.CreateDirectory(_dir);
     public void Dispose() { try { Directory.Delete(_dir, recursive: true); } catch { } }
 
-    private sealed class RecordingLauncher : IQemuProcessLauncher
+    private sealed class RecordingLauncher : IQemuProcessLauncher, IDisposable
     {
         public List<QemuCommandLine> Commands { get; } = new();
+        private readonly List<Process> _processes = new();
         public Process Start(QemuCommandLine cmd)
         {
             lock (Commands) Commands.Add(cmd);
-            // 假 QEMU 进程：真实 OS 进程（sleep），保证 Process API 语义一致
+            // 假 QEMU 进程：真实 OS 进程，保证 Process API 语义一致。
+            // Windows runner 上 cmd /c timeout 偶发因控制台/作业回收提前退出；
+            // ping 回环地址不依赖交互输入，能稳定保持指定时长。
             var psi = new ProcessStartInfo
             {
-                FileName = OperatingSystem.IsWindows() ? "cmd" : "sleep",
-                // `pause` 在无交互 stdin 的测试宿主中会立即退出，导致启动后
-                // 进程监视测试拿到已失效 PID；timeout 不依赖控制台输入。
-                Arguments = OperatingSystem.IsWindows() ? "/c timeout /t 600 /nobreak >nul" : "600",
+                FileName = OperatingSystem.IsWindows() ? "ping.exe" : "sleep",
+                Arguments = OperatingSystem.IsWindows() ? "-n 601 127.0.0.1" : "600",
                 UseShellExecute = false,
                 CreateNoWindow = true,
                 // 不继承测试宿主的输出管道（否则子进程会撑住 vstest 的 EOF 造成挂起）
                 RedirectStandardOutput = true,
                 RedirectStandardError = true,
             };
-            return Process.Start(psi)!;
+            var process = Process.Start(psi)!;
+            // ping 会持续写标准输出；重定向后必须持续消费，否则管道缓冲区
+            // 填满会让假 QEMU 阻塞，进而使退出监视测试永久等待。
+            process.OutputDataReceived += (_, _) => { };
+            process.ErrorDataReceived += (_, _) => { };
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
+            lock (_processes) _processes.Add(process);
+            return process;
+        }
+
+        public void Dispose()
+        {
+            Process[] processes;
+            lock (_processes)
+            {
+                processes = _processes.ToArray();
+                _processes.Clear();
+            }
+            foreach (var process in processes)
+            {
+                try
+                {
+                    if (!process.HasExited) process.Kill(entireProcessTree: true);
+                }
+                catch (InvalidOperationException) { }
+                catch (ArgumentException) { }
+                try { process.WaitForExit(2000); } catch (InvalidOperationException) { }
+                process.Dispose();
+            }
         }
     }
 
@@ -85,7 +115,7 @@ public class SuspendResumeServiceTests : IDisposable
         };
         var acceptTask = fakeQmp.AcceptAsync();
 
-        var launcher = new RecordingLauncher();
+        using var launcher = new RecordingLauncher();
         using var db = new HostDb(Path.Combine(_dir, "grass.db"));
         var root = Path.Combine(_dir, "root");
         Directory.CreateDirectory(root);
@@ -163,7 +193,7 @@ public class SuspendResumeServiceTests : IDisposable
             _ => """{"return":{}}""",
         });
         var acceptTask = fakeQmp.AcceptAsync();
-        var launcher = new RecordingLauncher();
+        using var launcher = new RecordingLauncher();
         using var db = new HostDb(Path.Combine(_dir, "migration-failure.db"));
         var root = Path.Combine(_dir, "migration-failure-root");
         var fw = Path.Combine(_dir, "migration-failure-fw");
@@ -198,7 +228,7 @@ public class SuspendResumeServiceTests : IDisposable
         using var fakeQmp = new FakeQmpServer();
         fakeQmp.OnCommand = (_, _) => Task.FromResult("""{"return":{}}""");
         var acceptTask = fakeQmp.AcceptAsync(); // 本测试不实际连接（startVm 被拒绝）
-        var launcher = new RecordingLauncher();
+        using var launcher = new RecordingLauncher();
         using var db = new HostDb(Path.Combine(_dir, "grass.db"));
         var root = Path.Combine(_dir, "root2");
         Directory.CreateDirectory(root);
@@ -232,7 +262,7 @@ public class SuspendResumeServiceTests : IDisposable
         using var fakeQmp = new FakeQmpServer();
         fakeQmp.OnCommand = (_, _) => Task.FromResult("""{"return":{}}""");
         var acceptTask = fakeQmp.AcceptAsync();
-        var launcher = new RecordingLauncher();
+        using var launcher = new RecordingLauncher();
         using var db = new HostDb(Path.Combine(_dir, "grass.db"));
         var root = Path.Combine(_dir, "root3");
         Directory.CreateDirectory(root);
@@ -279,7 +309,7 @@ public class SuspendResumeServiceTests : IDisposable
         using var fakeQmp = new FakeQmpServer();
         fakeQmp.OnCommand = (_, _) => Task.FromResult("""{"return":{}}""");
         var acceptTask = fakeQmp.AcceptAsync();
-        var launcher = new RecordingLauncher();
+        using var launcher = new RecordingLauncher();
         using var db = new HostDb(Path.Combine(_dir, "grass.db"));
         var root = Path.Combine(_dir, "root5");
         Directory.CreateDirectory(root);
@@ -318,7 +348,7 @@ public class SuspendResumeServiceTests : IDisposable
         using var fakeQmp = new FakeQmpServer();
         fakeQmp.OnCommand = (_, _) => Task.FromResult("""{"return":{}}""");
         var acceptTask = fakeQmp.AcceptAsync();
-        var launcher = new RecordingLauncher();
+        using var launcher = new RecordingLauncher();
         using var db = new HostDb(Path.Combine(_dir, "grass.db"));
         var root = Path.Combine(_dir, "root4");
         Directory.CreateDirectory(root);
@@ -361,7 +391,7 @@ public class SuspendResumeServiceTests : IDisposable
     {
         // 场景：VM 已被另一个会话锁定运行（vm.lock + session.json 在），本实例 startVm 预检拒绝。
         // 关键断言：拒绝路径不得删除别人的锁/session（否则互斥失效 → 双开 → 磁盘损坏）。
-        var launcher = new RecordingLauncher();
+        using var launcher = new RecordingLauncher();
         using var db = new HostDb(Path.Combine(_dir, "grass.db"));
         var root = Path.Combine(_dir, "root5");
         Directory.CreateDirectory(root);
