@@ -1346,10 +1346,17 @@ public sealed class GrassCoreService
                 // 发送失败必须复位——否则这台 VM 之后 quit（用户强制/崩溃）会被
                 // 监视器误判成"正常关机"，升级保护快照被提前删除
                 vm.AcpiShutdownRequested = true;
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
                 try
                 {
-                    var r = qmp.AcpiShutdownAsync().GetAwaiter().GetResult();
+                    var r = qmp.AcpiShutdownAsync(timeout.Token).GetAwaiter().GetResult();
                     return QmpResult(r);
+                }
+                catch (OperationCanceledException)
+                {
+                    vm.AcpiShutdownRequested = false;
+                    throw new GrassCoreException(
+                        "正常关机请求超时，QMP 控制通道没有响应。可稍后重试，或确认后使用强制关机。");
                 }
                 catch
                 {
@@ -2191,7 +2198,7 @@ public sealed class GrassCoreService
 
     /// <summary>克隆/快照等重操作的关机状态守卫：运行/锁定/挂起都不允许（Core 是唯一守门人）。</summary>
     /// <remarks>返回的锁必须由调用方 Dispose，且覆盖整个磁盘/配置操作。</remarks>
-    private VmLock EnsureStoppedForMutation(GrassVmPackage pkg)
+    private VmLock EnsureStoppedForMutation(GrassVmPackage pkg, string? pendingDeleteUuid = null)
     {
         if (_running.ContainsKey(pkg.Path))
             throw new GrassCoreException("虚拟机正在运行，关机后才能执行此操作。");
@@ -2213,7 +2220,7 @@ public sealed class GrassCoreService
             // 取得锁后重读状态，覆盖另一 Core 在初始检查之后完成挂起的窗口。
             if (VmState.Load(pkg).SuspendedStatePath is not null)
                 throw new GrassCoreException("虚拟机已挂起。请先恢复并正常关机后再执行此操作。");
-            if (!SnapshotService.RepairStagedOverlays(pkg, new Qemu.TransactionalDiskOps(_qemuImgPath)))
+            if (!SnapshotService.RepairStagedOverlays(pkg, new Qemu.TransactionalDiskOps(_qemuImgPath), pendingDeleteUuid))
                 throw new GrassCoreException("此虚拟机有一个未完成的恢复操作正在收尾（磁盘可能被占用）。请关闭占用它的程序后重试。");
             return mutationLock;
         }
@@ -2612,118 +2619,29 @@ public sealed class GrassCoreService
     private object PlanDeleteSnapshotCore(string packagePath, string uuid)
     {
         var pkg = new GrassVmPackage(packagePath);
-        var tree = SnapshotService.LoadTree(pkg);
-        // 陈旧 UUID（列表刷新前被别处删掉）→ 产品化措辞，而不是裸 KeyNotFound。
-        // 必须放在 PlanDelete 之前——规划器内部同样按 uuid 索引
+        if (SnapshotService.IsDeleteCleanupPending(pkg, uuid))
+            return new
+            {
+                cleanupOnly = true,
+                isChainRoot = false,
+                requiresMerge = false,
+                keepsBase = false,
+                affectedLinkedClones = Array.Empty<object>(),
+                rebindings = Array.Empty<object>(),
+            };
+        var tree = SnapshotService.LoadTree(pkg, strict: true);
         if (!tree.TryGet(uuid, out var target) || target is null)
             throw new GrassCoreException("快照不存在，请刷新列表。");
-        var clones = SnapshotService.FindLinkedCloneReferences(pkg);
-        var plan = SnapshotPlanner.PlanDelete(tree, uuid, clones);
-        // 链根基座（无父）删除不做 commit/rebase：物理文件保留（后代还指着它），
-        // 只是元数据移除——又快，也没有"合并进前一个快照"这回事。非根删除是否
-        // 合并取决于【物理依赖者】（孩子冻结层 / 实际压在这层上的活动盘）：没有
-        // 依赖者的删除 = 直接丢弃（快、不 commit）；有依赖者才 commit 进父层。
-        // UI 靠这两个字段给出如实的确认措辞
+        var plan = SnapshotPlanner.PlanDelete(tree, uuid, SnapshotService.FindLinkedCloneReferences(pkg));
+        var storage = SnapshotService.DescribeDeleteStorage(pkg, tree, target,
+            new Qemu.TransactionalDiskOps(_qemuImgPath));
         var isChainRoot = target.ParentSnapshotUuid is null;
-        var parent = isChainRoot ? null
-            : tree.TryGet(target.ParentSnapshotUuid!, out var parentNode) ? parentNode : null;
-        // 【逐盘】与执行侧同判：某盘有物理依赖者（孩子冻结层文件在场 / 活动盘
-        // 压在这层上 / 指针查询失败按保守计）且父快照有它的引用 → 该盘 commit
-        // 合并；父没有该盘引用（建盘时点落在父之后）→ 该盘按"保留基座"处置。
-        // 两种处置会出现在同一次删除里（混合盘型）——措辞绝不能"全有或全无"：
-        // 承诺"不合并"而实际跑分钟级 commit = 把用户当猴耍；承诺"合并"而实际
-        // 只动元数据 = 用户为不存在的改写白等白担心
-        var children = tree.ChildrenOf(uuid).ToList();
-        var positionWasHere = string.Equals(
-            GrassCore.Config.VmState.Load(pkg).CurrentSnapshotUuid, uuid, StringComparison.OrdinalIgnoreCase);
-        bool mergeDevice = false, keepDevice = false;
-        try
-        {
-            var ops = new Qemu.TransactionalDiskOps(_qemuImgPath);
-            var config = new ConfigStore(pkg).Load();
-            foreach (var (devId, frozenRel) in target.DiskOverlayRefs)
-            {
-                var frozenAbs = System.IO.Path.Combine(pkg.SnapshotsPath, uuid,
-                    frozenRel.Replace('/', System.IO.Path.DirectorySeparatorChar));
-                var frozenExists = File.Exists(frozenAbs);
-                // 执行侧对【目标自己的冻结文件缺失】整盘跳过（continue，无合并
-                // 也无保留）——计划侧必须同判，否则缺失+孩子在场时承诺"合并"
-                // 而实际是元数据删除
-                if (!frozenExists) continue;
-                // 父的该盘冻结文件路径（在场才存在合并语义；childHas 的"上一轮
-                // 已 rebase"排除要用到）
-                string? parentFrozenAbs = null;
-                if (parent is not null && parent.DiskOverlayRefs.TryGetValue(devId, out var pr))
-                {
-                    var pAbs0 = System.IO.Path.Combine(pkg.SnapshotsPath, parent.Uuid,
-                        pr.Replace('/', System.IO.Path.DirectorySeparatorChar));
-                    if (File.Exists(pAbs0)) parentFrozenAbs = pAbs0;
-                }
-                // 孩子在场 = 依赖者——除非它的 backing 已经指向父：那是上一轮删除
-                // 自己的产物（物理 rebase 先于元数据改挂，崩溃夹在中间），执行侧
-                // 会排除它、这层盘按"无依赖"直接丢弃。计划不排除的话，措辞会承诺
-                // 一次并不存在的分钟级合并（同轮崩溃重试现场）
-                var childHas = false;
-                foreach (var c in children)
-                {
-                    if (!c.DiskOverlayRefs.TryGetValue(devId, out var r)) continue;
-                    var cAbs = System.IO.Path.Combine(pkg.SnapshotsPath, c.Uuid,
-                        r.Replace('/', System.IO.Path.DirectorySeparatorChar));
-                    if (!File.Exists(cAbs)) continue;
-                    if (parentFrozenAbs is not null)
-                    {
-                        string? cb;
-                        try { cb = ops.QueryBackingFileStrict(cAbs); }
-                        catch (GrassCore.Qemu.QemuImgException) { cb = cAbs; } // 失败：保守按依赖计（同执行侧）
-                        if (cb is not null
-                            && string.Equals(System.IO.Path.GetFullPath(cb), System.IO.Path.GetFullPath(parentFrozenAbs),
-                                StringComparison.OrdinalIgnoreCase))
-                            continue; // 已被上一轮 rebase 到父：只差元数据改挂
-                    }
-                    childHas = true;
-                    break;
-                }
-                // 活动盘判定（执行侧同一套规则，含失败保守计）
-                var activeDependent = false;
-                var disk = config.Devices.OfType<DiskDevice>().FirstOrDefault(d => d.DeviceId == devId);
-                if (disk is not null)
-                {
-                    var active = GrassVm.PathPolicy.Resolve(pkg, disk.Path);
-                    if (File.Exists(active) && frozenExists)
-                    {
-                        string? b;
-                        try { b = ops.QueryBackingFileStrict(active); }
-                        catch (GrassCore.Qemu.QemuImgException)
-                        {
-                            b = frozenAbs; // 查询失败：按依赖计（保守，同执行侧）
-                        }
-                        if (b is not null
-                            && string.Equals(System.IO.Path.GetFullPath(b), System.IO.Path.GetFullPath(frozenAbs),
-                                StringComparison.OrdinalIgnoreCase))
-                            activeDependent = true;
-                        else if (b is null && positionWasHere)
-                            activeDependent = true;
-                    }
-                }
-                if (!childHas && !activeDependent) continue; // 这层盘无依赖者：随删除丢弃
-                // 合并（commit 进父层）要求父的该盘冻结文件【在场】（上面已算出）
-                //——父文件缺失/损坏时执行侧走"保留基座"，计划承诺"合并"就是
-                // 又一次措辞与事实的分叉
-                var parentFrozenExists = parentFrozenAbs is not null;
-                if (!parentFrozenExists) keepDevice = true;
-                else mergeDevice = true;
-            }
-        }
-        catch
-        {
-            mergeDevice = true; // 元数据/查询整体失败：按"有合并"提示（保守）
-        }
         return new
         {
             isChainRoot,
-            requiresMerge = !isChainRoot && mergeDevice,
-            keepsBase = !isChainRoot && keepDevice,
-            affectedLinkedClones = plan.AffectedLinkedClones.Select(c => new { c.ChildVmName, c.ChildVmPath }),
+            requiresMerge = storage.RequiresMerge,
+            keepsBase = !isChainRoot && storage.KeepsBase,
+            affectedLinkedClones = plan.AffectedLinkedClones.Select(clone => new { clone.ChildVmName, clone.ChildVmPath }),
             rebindings = plan.Rebindings,
         };
     }
@@ -2737,25 +2655,8 @@ public sealed class GrassCoreService
     private object DeleteSnapshotCore(string packagePath, string uuid)
     {
         var pkg = new GrassVmPackage(packagePath);
-        using var mutationLock = EnsureStoppedForMutation(pkg);
-        // 链接克隆位于不同包，父包的门无法阻止它在检查后启动。先为所有
-        // 依赖父快照的克隆持有跨进程锁；任一克隆正在运行则安全拒绝删除，
-        // 锁贯穿 rebase/删除直到完成。
-        var cloneLocks = new List<VmLock>();
-        try
-        {
-            foreach (var clone in SnapshotService.FindLinkedCloneReferences(pkg))
-            {
-                var cloneLock = new VmLock(new GrassVmPackage(clone.ChildVmPath));
-                cloneLock.Acquire();
-                cloneLocks.Add(cloneLock);
-            }
-            SnapshotService.Delete(pkg, uuid, new Qemu.TransactionalDiskOps(_qemuImgPath));
-        }
-        finally
-        {
-            foreach (var cloneLock in cloneLocks) cloneLock.Dispose();
-        }
+        using var mutationLock = EnsureStoppedForMutation(pkg, uuid);
+        SnapshotService.Delete(pkg, uuid, new Qemu.TransactionalDiskOps(_qemuImgPath));
         return new { deleted = uuid };
     }
 

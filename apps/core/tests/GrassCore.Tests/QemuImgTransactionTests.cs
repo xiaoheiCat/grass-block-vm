@@ -176,6 +176,139 @@ public class QemuImgTransactionTests : IDisposable
         File.Delete(marker);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FakeCommit_KeepSourceFlagControlsDataRetention(bool keepSource)
+    {
+        var ops = new TransactionalDiskOps(FakeQemuImg.Create(Path.Combine(_dir, "chain-fakes")));
+        var parent = Path.Combine(_dir, "parent.qcow2");
+        var overlay = Path.Combine(_dir, "overlay.qcow2");
+        File.WriteAllText(parent, "PARENT-DATA\n");
+        ops.CreateOverlay(parent, overlay, relativeBacking: true);
+        File.AppendAllText(overlay, "OVERLAY-ONLY-DATA\n");
+        var sourceBefore = File.ReadAllBytes(overlay);
+        string[] arguments = keepSource
+            ? ["commit", "-d", "-f", "qcow2", overlay]
+            : ["commit", "-f", "qcow2", overlay];
+
+        using var operation = ops.Run(arguments, null);
+        await TransactionalDiskOps.WaitForAsync(operation, CancellationToken.None);
+        operation.Completed = true;
+
+        Assert.Contains("OVERLAY-ONLY-DATA", File.ReadAllText(parent));
+        if (keepSource)
+            Assert.Equal(sourceBefore, File.ReadAllBytes(overlay));
+        else
+            Assert.DoesNotContain("OVERLAY-ONLY-DATA", File.ReadAllText(overlay));
+        Assert.Equal(parent, Path.GetFullPath(ops.QueryBackingFileStrict(overlay)!));
+    }
+
+    [Fact]
+    public void CommitOverlay_CrashBeforeCommittedJournal_RecoveryRetainsSourceForRetry()
+    {
+        var package = GrassVmPackage.CreateNew(_dir, "commit-window");
+        var ops = new TransactionalDiskOps(FakeQemuImg.Create(Path.Combine(_dir, "chain-fakes")));
+        var parent = Path.Combine(package.DisksPath, "parent.qcow2");
+        var overlay = Path.Combine(package.DisksPath, "overlay.qcow2");
+        var backup = parent + TransactionalDiskOps.CommitTempSuffix;
+        var journal = Path.Combine(package.TempPath, "commit-journal.json");
+        File.WriteAllText(parent, "PARENT-BEFORE-COMMIT\n");
+        ops.CreateOverlay(parent, overlay, relativeBacking: true);
+        File.AppendAllText(overlay, "UNIQUE-OVERLAY-DATA\n");
+        var parentBefore = File.ReadAllBytes(parent);
+        var sourceBefore = File.ReadAllBytes(overlay);
+
+        ops.CommitOverlay(overlay);
+
+        Assert.Contains("UNIQUE-OVERLAY-DATA", File.ReadAllText(parent));
+        File.WriteAllBytes(backup, parentBefore);
+        AtomicFile.WriteJsonValidated(journal, System.Text.Json.JsonSerializer.Serialize(new
+        {
+            Parent = parent,
+            Backup = backup,
+            Phase = "copied",
+        }));
+
+        TransactionalDiskOps.FinishCommitTempFiles(package);
+        TransactionalDiskOps.FinishCommitTempFiles(package);
+
+        Assert.Equal(parentBefore, File.ReadAllBytes(parent));
+        Assert.Equal(sourceBefore, File.ReadAllBytes(overlay));
+        Assert.Equal(parent, Path.GetFullPath(ops.QueryBackingFileStrict(overlay)!));
+        Assert.False(File.Exists(backup));
+        Assert.False(File.Exists(journal));
+
+        ops.CommitOverlay(overlay);
+
+        Assert.Contains("UNIQUE-OVERLAY-DATA", File.ReadAllText(parent));
+        Assert.Equal(sourceBefore, File.ReadAllBytes(overlay));
+        Assert.False(File.Exists(backup));
+        Assert.False(File.Exists(journal));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RebaseOverlay_OnlySafeModePreservesInheritedData(bool unsafeMode)
+    {
+        var ops = new TransactionalDiskOps(FakeQemuImg.Create(Path.Combine(_dir, "chain-fakes")));
+        var parent = Path.Combine(_dir, "parent.qcow2");
+        var firstLayer = Path.Combine(_dir, "first.qcow2");
+        var secondLayer = Path.Combine(_dir, "second.qcow2");
+        var dependent = Path.Combine(_dir, "dependent.qcow2");
+        File.WriteAllText(parent, "ORIGINAL-PARENT-DATA\n");
+        ops.CreateOverlay(parent, firstLayer, relativeBacking: true);
+        File.AppendAllText(firstLayer, "FIRST-LAYER-DATA\n");
+        ops.CreateOverlay(firstLayer, secondLayer, relativeBacking: true);
+        File.AppendAllText(secondLayer, "SECOND-LAYER-DATA\n");
+        ops.CreateOverlay(secondLayer, dependent, relativeBacking: true);
+        File.AppendAllText(dependent, "DEPENDENT-DATA\n");
+        var parentBefore = File.ReadAllBytes(parent);
+        var firstBefore = File.ReadAllBytes(firstLayer);
+        var secondBefore = File.ReadAllBytes(secondLayer);
+
+        ops.RebaseOverlay(dependent, parent, relativeBacking: true, unsafeMode: unsafeMode);
+
+        var dependentData = File.ReadAllText(dependent);
+        Assert.Equal(!unsafeMode, dependentData.Contains("FIRST-LAYER-DATA", StringComparison.Ordinal));
+        Assert.Equal(!unsafeMode, dependentData.Contains("SECOND-LAYER-DATA", StringComparison.Ordinal));
+        Assert.Contains("DEPENDENT-DATA", dependentData);
+        Assert.Equal(parentBefore, File.ReadAllBytes(parent));
+        Assert.Equal(firstBefore, File.ReadAllBytes(firstLayer));
+        Assert.Equal(secondBefore, File.ReadAllBytes(secondLayer));
+        Assert.Equal(parent, Path.GetFullPath(ops.QueryBackingFileStrict(dependent)!));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RebaseOverlay_MissingOldBacking_OnlyUnsafeModeSucceeds(bool unsafeMode)
+    {
+        var ops = new TransactionalDiskOps(FakeQemuImg.Create(Path.Combine(_dir, "chain-fakes")));
+        var parent = Path.Combine(_dir, "parent.qcow2");
+        var oldBacking = Path.Combine(_dir, "missing.qcow2");
+        var dependent = Path.Combine(_dir, "dependent.qcow2");
+        File.WriteAllText(parent, "PARENT-DATA\n");
+        File.WriteAllText(oldBacking, "OLD-BACKING-DATA\n");
+        ops.CreateOverlay(oldBacking, dependent, relativeBacking: true);
+        var sourceBefore = File.ReadAllBytes(dependent);
+        File.Delete(oldBacking);
+
+        if (unsafeMode)
+        {
+            ops.RebaseOverlay(dependent, parent, relativeBacking: true, unsafeMode: true);
+            Assert.Equal(parent, Path.GetFullPath(ops.QueryBackingFileStrict(dependent)!));
+        }
+        else
+        {
+            Assert.Throws<QemuImgException>(() =>
+                ops.RebaseOverlay(dependent, parent, relativeBacking: true));
+            Assert.Equal(sourceBefore, File.ReadAllBytes(dependent));
+        }
+        Assert.Equal("PARENT-DATA\n", File.ReadAllText(parent));
+    }
+
     [Fact]
     public void CommittedJournal_DoesNotRestoreOldParent()
     {

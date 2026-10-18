@@ -49,7 +49,13 @@ function closeServer(server: http.Server): Promise<void> {
   return new Promise((resolve) => server.close(() => resolve()));
 }
 
-function upgradeAndConnect(port: number, path: string, timeoutMs = 1500): Promise<net.Socket> {
+function upgradeAndConnect(
+  port: number,
+  path: string,
+  timeoutMs = 1500,
+  protocol?: string,
+  onResponse?: (response: string) => void,
+): Promise<net.Socket> {
   return new Promise((resolve, reject) => {
     let timer: NodeJS.Timeout;
     let settled = false;
@@ -64,12 +70,16 @@ function upgradeAndConnect(port: number, path: string, timeoutMs = 1500): Promis
     sock.on('connect', () => {
       sock.write(
         `GET ${path} HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n` +
-          `Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n`,
+          `Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n` +
+          (protocol ? `Sec-WebSocket-Protocol: ${protocol}\r\n` : '') +
+          '\r\n',
       );
     });
     sock.once('data', (chunk: Buffer) => {
       clearTimeout(timer);
-      if (chunk.toString().includes('101')) { settled = true; resolve(sock); }
+      const response = chunk.toString();
+      onResponse?.(response);
+      if (response.includes('101')) { settled = true; resolve(sock); }
       else { sock.destroy(); fail(new Error(`expected 101, got: ${chunk.toString().split('\r\n')[0]}`)); }
     });
     sock.once('error', (e) => {
@@ -81,6 +91,38 @@ function upgradeAndConnect(port: number, path: string, timeoutMs = 1500): Promis
 }
 
 describe('ws-lite 帧协议（SPICE 桥的地基）', () => {
+  it.each(['binary', 'other, binary', 'binary, other'])('从 %s 中选择 binary 子协议', async (protocol) => {
+    await withServer(async (fx) => {
+      let response = '';
+      const sock = await upgradeAndConnect(
+        fx.port,
+        `/${fx.token}`,
+        1500,
+        protocol,
+        (value) => { response = value; },
+      );
+      expect(response).toContain('Sec-WebSocket-Protocol: binary\r\n');
+      sock.destroy();
+      await fx.done();
+    });
+  });
+
+  it.each([undefined, 'other', 'Binary'])('不回显未请求的 binary 子协议：%s', async (protocol) => {
+    await withServer(async (fx) => {
+      let response = '';
+      const sock = await upgradeAndConnect(
+        fx.port,
+        `/${fx.token}`,
+        1500,
+        protocol,
+        (value) => { response = value; },
+      );
+      expect(response).not.toContain('Sec-WebSocket-Protocol:');
+      sock.destroy();
+      await fx.done();
+    });
+  });
+
   it('单帧二进制消息完整送达', async () => {
     await withServer(async (fx) => {
       const received: Buffer[] = [];

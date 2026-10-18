@@ -37,6 +37,10 @@ export class WebSocketServer extends EventEmitter {
 
   private handleUpgrade(req: http.IncomingMessage, socket: net.Socket, head: Buffer): void {
     const key = req.headers['sec-websocket-key'];
+    const requestedProtocols = String(req.headers['sec-websocket-protocol'] ?? '')
+      .split(',')
+      .map((p) => p.trim())
+      .filter(Boolean);
     if (req.method !== 'GET'
       || req.headers.upgrade?.toLowerCase() !== 'websocket'
       || !String(req.headers.connection ?? '').toLowerCase().includes('upgrade')
@@ -59,7 +63,11 @@ export class WebSocketServer extends EventEmitter {
       'HTTP/1.1 101 Switching Protocols\r\n' +
         'Upgrade: websocket\r\n' +
         'Connection: Upgrade\r\n' +
-        `Sec-WebSocket-Accept: ${accept}\r\n\r\n`,
+        `Sec-WebSocket-Accept: ${accept}\r\n` +
+        // spice-html5 用 new WebSocket(uri, 'binary')。浏览器要求服务端从
+        // 请求列表中明确选回该子协议，否则即使 101 成功也会立刻关闭连接。
+        (requestedProtocols.includes('binary') ? 'Sec-WebSocket-Protocol: binary\r\n' : '') +
+        '\r\n',
     );
     socket.setNoDelay(true);
 

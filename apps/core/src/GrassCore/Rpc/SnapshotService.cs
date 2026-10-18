@@ -60,10 +60,11 @@ public static class SnapshotService
     /// "一半盘旧时间点、一半盘新时间点"的撕裂态，调用方必须拒绝启动/变更这台 VM。
     /// </summary>
     public static bool RepairStagedOverlays(GrassVmPackage package,
-        GrassCore.Qemu.TransactionalDiskOps? diskOps = null)
+        GrassCore.Qemu.TransactionalDiskOps? diskOps = null, string? pendingDeleteUuid = null)
     {
         if (!package.FixedDirectoriesAreSafe() || !package.FixedFilesAreSafe())
             throw new GrassCoreException("虚拟机包包含不受支持的符号链接或目录联接，已拒绝自动修复。");
+        if (EnsureDeleteRecoveryReady(package, pendingDeleteUuid)) return true;
         var journalPath = RestoreJournalPath(package);
         if (File.Exists(journalPath) && GrassVmPackage.IsReparsePointOrLink(journalPath))
             throw new GrassCoreException("恢复事务日志是符号链接或目录联接，已拒绝自动修复。");
@@ -77,6 +78,15 @@ public static class SnapshotService
         // 现在按 Create 的规则动它们 = 删掉 prev（旧数据的唯一副本）或强行完成
         // 一个未提交的换入——都不可逆。
         if (!RollbackInterruptedRestore(package)) return false;
+        try
+        {
+            foreach (var intent in PendingDeleteCleanups(package))
+                FinalizeDeleteMetadata(package, intent);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
 
         // 孤儿 pending（崩溃在 pending 落盘与日志落盘之间）：没有日志就没有未完结
         // 事务，清掉——留着会让下一次真事务的"已提交"判定永远为假
@@ -192,6 +202,7 @@ public static class SnapshotService
                 if (GrassVmPackage.ContainsReparsePoint(dir)) continue;
                 var dirUuid = System.IO.Path.GetFileName(dir);
                 if (!SnapshotTree.IsValidUuid(dirUuid) || Path.GetFileName(dirUuid) != dirUuid) continue;
+                if (IsDeleteCleanupPending(package, dirUuid)) continue;
                 if (File.Exists(System.IO.Path.Combine(dir, "metadata.json"))) continue;
                 // 只有意向、没建 disks/ 的目录（WriteFreezeIntent 与首盘操作之间崩溃）
                 // 是合法现场——跳过。绝不因它抛 DirectoryNotFoundException 中止
@@ -376,6 +387,7 @@ public static class SnapshotService
         GrassCore.Qemu.TransactionalDiskOps? diskOps = null,
         string? upgradeProtectionBackupDir = null)
     {
+        EnsureDeleteRecoveryReady(package);
         if (config.Devices is null || config.Devices.Any(d => d is null || !DeviceIdPolicy.IsValid(d.DeviceId)))
             throw new GrassCoreException("虚拟机配置包含无效设备标识，必须是 UUID，无法创建快照。");
         if (config.Devices.Select(d => d.DeviceId).Distinct(StringComparer.OrdinalIgnoreCase).Count() != config.Devices.Count)
@@ -623,14 +635,17 @@ public static class SnapshotService
         AtomicFile.WriteJsonValidated(System.IO.Path.Combine(dir, "config.json"), snap.FullConfigSnapshot);
     }
 
-    public static SnapshotTree LoadTree(GrassVmPackage package)
+    public static SnapshotTree LoadTree(GrassVmPackage package, bool strict = false)
     {
         if (!Directory.Exists(package.SnapshotsPath)) return new SnapshotTree(Array.Empty<Snapshot>());
         var snaps = new List<Snapshot>();
         string[] dirs;
         try { dirs = Directory.EnumerateDirectories(package.SnapshotsPath).ToArray(); }
-        catch (IOException) { return new SnapshotTree(Array.Empty<Snapshot>()); }
-        catch (UnauthorizedAccessException) { return new SnapshotTree(Array.Empty<Snapshot>()); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            if (strict) throw new GrassCoreException("无法完整读取快照目录，已阻止删除。请关闭占用文件的程序后重试。");
+            return new SnapshotTree(Array.Empty<Snapshot>());
+        }
         Array.Sort(dirs, StringComparer.Ordinal);
         foreach (var dir in dirs)
         {
@@ -642,8 +657,13 @@ public static class SnapshotService
             try
             {
                 var snapshot = JsonSerializer.Deserialize<Snapshot>(File.ReadAllText(meta), Opts);
-                if (snapshot is null) continue;
+                if (snapshot is null)
+                {
+                    if (strict) throw new GrassCoreException("快照元数据无效，已阻止删除。");
+                    continue;
+                }
                 var dirUuid = Path.GetFileName(dir);
+                if (IsDeleteCleanupPending(package, dirUuid)) continue;
                 var uuidCmp = OperatingSystem.IsWindows()
                     ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
                 if (!SnapshotTree.IsValidUuid(snapshot.Uuid)
@@ -652,13 +672,17 @@ public static class SnapshotService
                     || snapshot.DiskOverlayRefs.Keys.Any(key => !DeviceIdPolicy.IsValid(key))
                     || snapshot.DiskOverlayRefs.Any(kv => !IsSafeOverlayReference(package, snapshot.Uuid, kv.Value))
                     || !TryLoadSnapshotConfig(package, snapshot, out _))
+                {
+                    if (strict) throw new GrassCoreException("快照元数据或磁盘引用无效，已阻止删除。");
                     continue;
+                }
                 snaps.Add(snapshot);
             }
             catch (Exception ex) when (ex is JsonException or ArgumentException or InvalidOperationException
                 or NotSupportedException or NullReferenceException or IOException
                 or UnauthorizedAccessException)
             {
+                if (strict) throw new GrassCoreException("无法完整读取快照元数据，已阻止删除。请关闭占用文件的程序或修复元数据后重试。");
                 // 快照树元数据或路径引用损坏：可能改数据的修复必须先征得用户确认
                 //（保守修复），这里跳过当前条目，不能让一个坏快照阻断整棵树。
             }
@@ -666,7 +690,9 @@ public static class SnapshotService
         // UUID 语义不区分大小写；大小写敏感文件系统上可能同时存在两个目录。
         // 这种情况无法安全判断用户要操作哪一层，宁可把整组歧义条目暂时隔离，
         // 也不能静默择一后让 Restore/Delete/LinkedClone 改错物理磁盘。
-        var groups = snaps.GroupBy(s => s.Uuid, StringComparer.OrdinalIgnoreCase);
+        var groups = snaps.GroupBy(s => s.Uuid, StringComparer.OrdinalIgnoreCase).ToList();
+        if (strict && groups.Any(group => group.Count() != 1))
+            throw new GrassCoreException("快照 UUID 存在大小写冲突，已阻止删除。");
         return new SnapshotTree(groups.Where(g => g.Count() == 1).SelectMany(g => g));
     }
 
@@ -805,7 +831,8 @@ public static class SnapshotService
     public static object List(GrassVmPackage package)
     {
         var tree = LoadTree(package);
-        return tree.All.Select(s => new
+        var currentSnapshotUuid = VmState.Load(package).CurrentSnapshotUuid;
+        var entries = tree.All.Select(s => (object)new
         {
             uuid = s.Uuid,
             parent = s.ParentSnapshotUuid,
@@ -814,7 +841,22 @@ public static class SnapshotService
             createdAt = s.CreatedAt,
             hasMemory = s.HasMemoryState,
             hidden = s.IsUpgradeProtection, // 升级保护快照对用户隐藏
+            cleanupPending = false,
+            isCurrent = string.Equals(currentSnapshotUuid, s.Uuid, StringComparison.OrdinalIgnoreCase),
         }).ToList();
+        entries.AddRange(PendingDeleteCleanups(package).Select(intent => (object)new
+        {
+            uuid = intent.Uuid,
+            parent = intent.ParentUuid,
+            name = intent.Name ?? "待清理快照",
+            description = (string?)null,
+            createdAt = intent.CreatedAt ?? DateTimeOffset.MinValue,
+            hasMemory = false,
+            hidden = false,
+            cleanupPending = true,
+            isCurrent = false,
+        }));
+        return entries;
     }
 
     /// <summary>
@@ -826,6 +868,7 @@ public static class SnapshotService
     public static void Restore(GrassVmPackage package, string uuid,
         GrassCore.Qemu.TransactionalDiskOps? diskOps = null)
     {
+        EnsureDeleteRecoveryReady(package);
         var tree = LoadTree(package);
         // 陈旧 UUID（快照列表刷新前被别处删掉）不该以裸 KeyNotFoundException
         // 冲到界面横幅里——与 Delete 的措辞一致，请用户刷新
@@ -1348,6 +1391,210 @@ public static class SnapshotService
         if (File.Exists(path)) File.Delete(path);
     }
 
+    private sealed record DeleteRebase(string Overlay, string Backing);
+
+    private sealed record DeleteCleanupIntent(int Version, string Uuid, bool KeepPhysical,
+        string? Name = null, DateTimeOffset? CreatedAt = null, string? ParentUuid = null,
+        Dictionary<string, string?>? Rebindings = null, bool MetadataFinalized = false,
+        bool PhysicalFinalized = true, DeleteRebase[]? Rebases = null, string[]? OwnedDiskFiles = null,
+        string[]? RetainedDiskFiles = null);
+
+    /// <summary>
+    /// 删除的逻辑提交点放在目标目录外：递归删除可能先删 metadata.json、再因被占用的
+    /// qcow2 失败。下次重试必须知道这些磁盘是“应删除的残留”还是“后代仍引用的链根”。
+    /// </summary>
+    internal static string DeleteCleanupIntentPath(GrassVmPackage package, string uuid) =>
+        System.IO.Path.Combine(package.SnapshotsPath, $".delete-cleanup-{uuid}.json");
+
+    private static void WriteDeleteCleanupIntent(GrassVmPackage package, DeleteCleanupIntent intent)
+    {
+        if (!IsValidDeleteCleanupIntent(package, intent, intent.Uuid))
+            throw new GrassCoreException("快照删除计划包含无效路径或阶段，已阻止磁盘变更。");
+        var path = DeleteCleanupIntentPath(package, intent.Uuid);
+        if (GrassVmPackage.IsReparsePointOrLink(path))
+            throw new GrassCoreException("快照删除清理标记包含不受支持的符号链接或目录联接。");
+        AtomicFile.WriteJsonValidated(path,
+            JsonSerializer.Serialize(intent, JournalOpts));
+    }
+
+    private static DeleteCleanupIntent? LoadDeleteCleanupIntent(GrassVmPackage package, string uuid)
+    {
+        if (!SnapshotTree.IsValidUuid(uuid)) return null;
+        try
+        {
+            var path = DeleteCleanupIntentPath(package, uuid);
+            var attributes = File.GetAttributes(path);
+            if ((attributes & (FileAttributes.ReparsePoint | FileAttributes.Directory)) != 0)
+                throw new GrassCoreException("快照删除清理标记不是安全的普通文件，已阻止操作。");
+            var intent = JsonSerializer.Deserialize<DeleteCleanupIntent>(File.ReadAllText(path), JournalOpts);
+            if (IsValidDeleteCleanupIntent(package, intent, uuid)) return intent;
+            throw new GrassCoreException("快照删除清理标记已损坏或版本不受支持，已阻止操作。");
+        }
+        catch (FileNotFoundException) { return null; }
+        catch (DirectoryNotFoundException) { return null; }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException
+            or ArgumentException or NotSupportedException)
+        {
+            throw new GrassCoreException("无法读取快照删除清理标记，已阻止操作。请关闭占用文件的程序或修复标记后重试。");
+        }
+    }
+
+    private static bool IsValidDeleteCleanupIntent(GrassVmPackage package, DeleteCleanupIntent? intent, string uuid) =>
+        intent is { Version: 1 or 2 or 3 }
+                   && string.Equals(intent.Uuid, uuid, StringComparison.OrdinalIgnoreCase)
+                   && SnapshotTree.IsValidUuid(intent.Uuid)
+                   && (!intent.MetadataFinalized || intent.PhysicalFinalized)
+                   && (intent.PhysicalFinalized || intent.Rebases is not null)
+                   && (intent.Rebases is null || intent.Rebases.All(rebase => rebase is not null
+                       && !string.IsNullOrWhiteSpace(rebase.Overlay) && !string.IsNullOrWhiteSpace(rebase.Backing)
+                       && PathPolicy.IsInsidePackage(package, rebase.Overlay)
+                       && PathPolicy.IsInsidePackage(package, rebase.Backing)))
+                   && (intent.OwnedDiskFiles is null || intent.OwnedDiskFiles.All(reference =>
+                       reference is not null && IsSafeOverlayReference(package, intent.Uuid, reference)))
+                   && (intent.Version < 3 || intent.OwnedDiskFiles is not null && intent.RetainedDiskFiles is not null)
+                   && (intent.RetainedDiskFiles is null || intent.RetainedDiskFiles.All(reference =>
+                       reference is not null && IsSafeOverlayReference(package, intent.Uuid, reference)
+                       && intent.OwnedDiskFiles is not null && intent.OwnedDiskFiles.Contains(reference)))
+                   && (intent.ParentUuid is null || SnapshotTree.IsValidUuid(intent.ParentUuid))
+                   && (intent.Rebindings is null || intent.Rebindings.All(binding =>
+                       SnapshotTree.IsValidUuid(binding.Key)
+                       && (binding.Value is null || SnapshotTree.IsValidUuid(binding.Value))));
+
+    internal static bool IsDeleteCleanupPending(GrassVmPackage package, string uuid) =>
+        LoadDeleteCleanupIntent(package, uuid) is not null;
+
+    private static bool EnsureDeleteRecoveryReady(GrassVmPackage package, string? allowedUuid = null)
+    {
+        var incomplete = PendingDeleteCleanups(package).Where(intent => !intent.MetadataFinalized).ToList();
+        if (incomplete.Any(intent => !string.Equals(intent.Uuid, allowedUuid, StringComparison.OrdinalIgnoreCase)))
+            throw new GrassCoreException("此虚拟机有未完成的快照删除。请先在快照列表中重试完成删除，再启动或修改虚拟机。");
+        return incomplete.Count > 0;
+    }
+
+    private static IEnumerable<DeleteCleanupIntent> PendingDeleteCleanups(GrassVmPackage package)
+    {
+        if (!Directory.Exists(package.SnapshotsPath)) yield break;
+        foreach (var path in Directory.EnumerateFiles(package.SnapshotsPath, ".delete-cleanup-*.json"))
+        {
+            var uuid = Path.GetFileName(path)[".delete-cleanup-".Length..^5];
+            if (LoadDeleteCleanupIntent(package, uuid) is { } intent) yield return intent;
+        }
+    }
+
+    private static DeleteCleanupIntent FinalizeDeleteMetadata(GrassVmPackage package, DeleteCleanupIntent intent)
+    {
+        if (!intent.PhysicalFinalized)
+            throw new GrassCoreException("快照磁盘重建尚未完成，不能提交元数据。");
+        if (intent.MetadataFinalized) return intent;
+        var tree = LoadTree(package);
+        if (intent.Rebindings is not null)
+            foreach (var (childUuid, newParent) in intent.Rebindings)
+            {
+                if (!tree.TryGet(childUuid, out var child) || child is null)
+                    throw new GrassCoreException("无法读取待重绑子快照，删除清理尚未完成。请关闭占用文件的程序或修复元数据后重试。");
+                if (string.Equals(child.ParentSnapshotUuid, intent.Uuid, StringComparison.OrdinalIgnoreCase))
+                {
+                    child.ParentSnapshotUuid = newParent;
+                    WriteSnapshot(package, child);
+                }
+                else if (!string.Equals(child.ParentSnapshotUuid, newParent, StringComparison.OrdinalIgnoreCase))
+                    throw new GrassCoreException("待重绑子快照的父节点发生变化，已阻止删除清理。");
+            }
+        var state = VmState.Load(package);
+        if (string.Equals(state.CurrentSnapshotUuid, intent.Uuid, StringComparison.OrdinalIgnoreCase))
+        {
+            state.CurrentSnapshotUuid = intent.ParentUuid;
+            state.Save(package);
+        }
+        var completed = intent with { MetadataFinalized = true };
+        WriteDeleteCleanupIntent(package, completed);
+        return completed;
+    }
+
+    private static void CompleteDeleteCleanup(GrassVmPackage package, DeleteCleanupIntent intent,
+        Action<string> recursiveDelete, GrassCore.Qemu.TransactionalDiskOps? diskOps)
+    {
+        if (!intent.PhysicalFinalized)
+        {
+            foreach (var rebase in intent.Rebases!)
+            {
+                if (diskOps is null) throw new GrassCoreException("快照删除需要磁盘重建工具才能继续。");
+                var overlay = PathPolicy.Resolve(package, rebase.Overlay);
+                var backing = PathPolicy.Resolve(package, rebase.Backing);
+                var currentBacking = diskOps.QueryBackingFileStrict(overlay);
+                if (currentBacking is null || !PathEquals(currentBacking, backing))
+                    diskOps.RebaseOverlay(overlay, backing, relativeBacking: true);
+            }
+            intent = intent with { PhysicalFinalized = true };
+            WriteDeleteCleanupIntent(package, intent);
+        }
+        intent = FinalizeDeleteMetadata(package, intent);
+        var dir = Path.Combine(package.SnapshotsPath, intent.Uuid);
+        if (GrassVmPackage.ContainsReparsePoint(dir))
+            throw new GrassCoreException("快照目录包含不受支持的链接文件，已拒绝删除。");
+        CleanupDeletedSnapshotDirectory(dir, intent.KeepPhysical, recursiveDelete, intent.OwnedDiskFiles,
+            intent.RetainedDiskFiles);
+        TryDeleteCleanupIntent(package, intent.Uuid);
+    }
+
+    private static void TryDeleteCleanupIntent(GrassVmPackage package, string uuid)
+    {
+        try
+        {
+            var path = DeleteCleanupIntentPath(package, uuid);
+            if (File.Exists(path) && !GrassVmPackage.IsReparsePointOrLink(path)) File.Delete(path);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // 目录已经按持久化决策处理完成；小标记删不掉无损，下次重试会清掉。
+        }
+    }
+
+    private static void CleanupDeletedSnapshotDirectory(string dir, bool keepPhysical,
+        Action<string> recursiveDelete, IReadOnlyCollection<string>? ownedDiskFiles = null,
+        IReadOnlyCollection<string>? retainedDiskFiles = null)
+    {
+        if (!Directory.Exists(dir)) return;
+        var comparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+        var files = Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories).Select(Path.GetFullPath).ToArray();
+        var directories = Directory.EnumerateDirectories(dir, "*", SearchOption.AllDirectories).Select(Path.GetFullPath).ToArray();
+        var sidecars = new HashSet<string>(comparer);
+        foreach (var name in new[] { "metadata.json", "config.json", "memory.state", "VARS.fd", "freeze-intent.json", "rescue-pending.json" })
+        {
+            sidecars.Add(Path.Combine(dir, name));
+            sidecars.Add(Path.Combine(dir, name + ".grass-tmp"));
+        }
+        var disksDir = Path.Combine(dir, "disks");
+        var disks = ownedDiskFiles is not null
+            ? new HashSet<string>(ownedDiskFiles.Select(reference => Path.GetFullPath(Path.Combine(dir, reference.Replace('/', Path.DirectorySeparatorChar)))), comparer)
+            : new HashSet<string>(files.Where(file => comparer.Equals(Path.GetDirectoryName(file), disksDir)
+                && Path.GetFileName(file).StartsWith("disk-", StringComparison.Ordinal)
+                && Path.GetFileName(file).EndsWith(".qcow2", StringComparison.Ordinal)
+                && DeviceIdPolicy.IsValid(Path.GetFileName(file)[5..^6])), comparer);
+        var ownedDirectories = new HashSet<string>(comparer) { disksDir };
+        var retained = retainedDiskFiles is not null
+            ? new HashSet<string>(retainedDiskFiles.Select(reference => Path.GetFullPath(Path.Combine(dir, reference.Replace('/', Path.DirectorySeparatorChar)))), comparer)
+            : keepPhysical ? new HashSet<string>(disks, comparer) : new HashSet<string>(comparer);
+        foreach (var disk in disks)
+            for (var parent = Path.GetDirectoryName(disk); parent is not null && !comparer.Equals(parent, dir); parent = Path.GetDirectoryName(parent))
+                ownedDirectories.Add(parent);
+        if (retained.Count == 0 && files.All(file => sidecars.Contains(file) || disks.Contains(file))
+            && directories.All(ownedDirectories.Contains))
+        {
+            recursiveDelete(dir);
+            return;
+        }
+        foreach (var file in files)
+            if (sidecars.Contains(file) || disks.Contains(file) && !retained.Contains(file)) File.Delete(file);
+        if (retained.Count == 0)
+        {
+            foreach (var directory in ownedDirectories.OrderByDescending(path => path.Length))
+                if (Directory.Exists(directory) && !Directory.EnumerateFileSystemEntries(directory).Any())
+                    Directory.Delete(directory);
+            if (!Directory.EnumerateFileSystemEntries(dir).Any()) Directory.Delete(dir);
+        }
+    }
+
     /// <summary>原子复制：先写 .grass-tmp 再改名（目标要么是旧内容要么是完整新内容）。</summary>
     private static void CopyAtomic(string from, string to)
     {
@@ -1385,17 +1632,155 @@ public static class SnapshotService
 
     /// <summary>
     /// 删除快照。物理链维护（磁盘先行、元数据最后）：
-    ///   有父：被删层 commit 并入父冻结点，其后代（孩子冻结文件 + 当前工作 overlay）rebase 到父；
+    ///   有父：依赖层安全 rebase 到父，保留依赖层数据且不改写父冻结点；
     ///   无父（链根基座）：冻结文件是所有后代的物理基座——只删元数据，物理文件保留
     ///   （"删除链根"= 忘掉这个检查点，磁盘内容当然还在）。
     /// 有链接克隆依赖时由调用方列出并获用户确认。
     /// </summary>
+    private sealed record DeleteStoragePlan(DeleteRebase[] Rebases, bool KeepsBase, string[]? RetainedDiskFiles = null);
+
+    internal static (bool RequiresMerge, bool KeepsBase) DescribeDeleteStorage(GrassVmPackage package,
+        SnapshotTree tree, Snapshot deleted, GrassCore.Qemu.TransactionalDiskOps diskOps)
+    {
+        var plan = BuildDeleteStoragePlan(package, tree, deleted, diskOps);
+        return (plan.Rebases.Length > 0, plan.KeepsBase);
+    }
+
+    private static DeleteStoragePlan BuildDeleteStoragePlan(GrassVmPackage package, SnapshotTree tree,
+        Snapshot deleted, GrassCore.Qemu.TransactionalDiskOps diskOps)
+    {
+        if (deleted.ParentSnapshotUuid is null) return new DeleteStoragePlan([], true);
+        var comparer = OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal;
+        var known = new HashSet<string>(comparer);
+        foreach (var snapshot in tree.All)
+            foreach (var deviceId in snapshot.DiskOverlayRefs.Keys)
+                if (FrozenPathOrNull(package, snapshot, deviceId) is { } path && File.Exists(path)) known.Add(path);
+        var config = new ConfigStore(package).Load();
+        var externalRoots = new HashSet<string>(comparer);
+        foreach (var disk in config.DevicesOfType<DiskDevice>())
+        {
+            var path = PathPolicy.Resolve(package, disk.Path);
+            if (!File.Exists(path)) continue;
+            if (PathPolicy.IsExternal(package, disk.Path)) externalRoots.Add(Path.GetFullPath(path));
+            else known.Add(Path.GetFullPath(path));
+        }
+        var options = new EnumerationOptions
+        {
+            RecurseSubdirectories = true,
+            IgnoreInaccessible = false,
+            AttributesToSkip = FileAttributes.ReparsePoint,
+        };
+        var roots = known.Concat(externalRoots)
+            .Concat(Directory.EnumerateFiles(package.SnapshotsPath, "*.qcow2", options).Select(Path.GetFullPath))
+            .Concat(Directory.EnumerateFiles(package.DisksPath, "*.qcow2", options).Select(Path.GetFullPath))
+            .Distinct(comparer).ToList();
+        var backings = new Dictionary<string, string?>(comparer);
+        foreach (var root in roots)
+        {
+            string? current = root;
+            var visited = new HashSet<string>(comparer);
+            while (current is not null)
+            {
+                if (!visited.Add(current) || visited.Count > 64)
+                    throw new GrassCoreException("快照磁盘链包含循环或过深，已阻止删除。");
+                if (GrassVmPackage.ContainsReparsePoint(current)
+                    || !externalRoots.Contains(root)
+                    && !PathPolicy.IsInsidePackage(package, PathPolicy.NormalizeReference(package, current)))
+                    throw new GrassCoreException("快照磁盘链包含包外路径或链接文件，已阻止删除。");
+                if (backings.ContainsKey(current)) break;
+                var backing = diskOps.QueryBackingFileStrict(current);
+                backings[current] = backing is null ? null : Path.GetFullPath(backing);
+                current = backings[current];
+            }
+        }
+        var rebases = new List<DeleteRebase>();
+        var retainedDiskFiles = new List<string>();
+        var keepsBase = false;
+        foreach (var deviceId in deleted.DiskOverlayRefs.Keys)
+        {
+            var frozen = FrozenPathOrNull(package, deleted, deviceId);
+            if (frozen is null || !File.Exists(frozen)) continue;
+            var dependents = backings.Where(pair => pair.Value is not null && comparer.Equals(pair.Value, frozen))
+                .Select(pair => pair.Key).ToList();
+            if (dependents.Count == 0) continue;
+            var parent = tree.TryGet(deleted.ParentSnapshotUuid, out var parentSnapshot) && parentSnapshot is not null
+                ? FrozenPathOrNull(package, parentSnapshot, deviceId) : null;
+            if (parent is null || !File.Exists(parent))
+            {
+                keepsBase = true;
+                retainedDiskFiles.Add(deleted.DiskOverlayRefs[deviceId]);
+                continue;
+            }
+            if (dependents.Any(dependent => !known.Contains(dependent)))
+                throw new GrassCoreException("存在元数据缺失或无法识别的磁盘依赖此快照，已阻止删除。请先修复快照元数据。");
+            rebases.AddRange(dependents.Select(dependent => new DeleteRebase(
+                PathPolicy.NormalizeReference(package, dependent), PathPolicy.NormalizeReference(package, parent))));
+        }
+        return new DeleteStoragePlan(rebases.ToArray(), keepsBase, retainedDiskFiles.ToArray());
+    }
+
     public static void Delete(GrassVmPackage package, string uuid,
-        GrassCore.Qemu.TransactionalDiskOps? diskOps = null)
+        GrassCore.Qemu.TransactionalDiskOps? diskOps = null) =>
+        DeleteCore(package, uuid, diskOps, dir => Directory.Delete(dir, recursive: true));
+
+    internal static void Delete(GrassVmPackage package, string uuid,
+        GrassCore.Qemu.TransactionalDiskOps? diskOps, Action<string> recursiveDelete) =>
+        DeleteCore(package, uuid, diskOps, recursiveDelete);
+
+    private static void DeleteCore(GrassVmPackage package, string uuid,
+        GrassCore.Qemu.TransactionalDiskOps? diskOps, Action<string> recursiveDelete)
+    {
+        EnsureDeleteRecoveryReady(package, uuid);
+        var affectedSnapshotIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { uuid };
+        var pending = LoadDeleteCleanupIntent(package, uuid);
+        if (pending is null || !pending.PhysicalFinalized)
+        {
+            var tree = LoadTree(package);
+            if (pending?.Rebindings is not null)
+                affectedSnapshotIds.UnionWith(pending.Rebindings.Keys);
+            var descendants = new Stack<string>(affectedSnapshotIds);
+            while (descendants.Count > 0)
+                foreach (var child in tree.ChildrenOf(descendants.Pop()))
+                    if (affectedSnapshotIds.Add(child.Uuid)) descendants.Push(child.Uuid);
+        }
+        var cloneLocks = new List<VmLock>();
+        try
+        {
+            foreach (var clone in FindLinkedCloneReferences(package)
+                .Where(clone => affectedSnapshotIds.Contains(clone.ParentSnapshotUuid)))
+            {
+                var cloneLock = new VmLock(new GrassVmPackage(clone.ChildVmPath));
+                try { cloneLock.Acquire(); }
+                catch (VmLockedException)
+                {
+                    throw new GrassCoreException(
+                        $"无法删除此快照：链接克隆“{clone.ChildVmName}”仍在运行或被占用。请先正常关机后重试。");
+                }
+                cloneLocks.Add(cloneLock);
+            }
+            DeleteLocked(package, uuid, diskOps, recursiveDelete);
+        }
+        finally
+        {
+            foreach (var cloneLock in cloneLocks) cloneLock.Dispose();
+        }
+    }
+
+    private static void DeleteLocked(GrassVmPackage package, string uuid,
+        GrassCore.Qemu.TransactionalDiskOps? diskOps, Action<string> recursiveDelete)
     {
         if (!SnapshotTree.IsValidUuid(uuid) || Path.GetFileName(uuid) != uuid)
             throw new GrassCoreException("快照不存在。");
-        var tree = LoadTree(package);
+        if (LoadDeleteCleanupIntent(package, uuid) is { } pending)
+        {
+            try { CompleteDeleteCleanup(package, pending, recursiveDelete, diskOps); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                throw new GrassCoreException("快照文件暂时被其他程序占用，清理未完成；稍后再重新删除一次即可。");
+            }
+            return;
+        }
+        var tree = LoadTree(package, strict: true);
         var deleted = tree.All.FirstOrDefault(s =>
             string.Equals(s.Uuid, uuid, StringComparison.OrdinalIgnoreCase));
         if (deleted is null)
@@ -1408,31 +1793,14 @@ public static class SnapshotService
             if (candidates.Count > 1)
                 throw new GrassCoreException("快照 UUID 存在大小写冲突，已拒绝清理；请先人工整理快照目录。");
             var dir = candidates.SingleOrDefault() ?? System.IO.Path.Combine(package.SnapshotsPath, uuid);
-            // 上次删除中途失败后的【重试】：树里已无此快照（metadata 已清），
-            // 直接 tree.Get 会抛裸 KeyNotFoundException——"稍后重删一次"的
-            // 承诺就永远兑现不了。保守规则：目录里还有 qcow2 = 无法断定上次
-            // 是否决定保留基座（链根/共享基座的后代还指着它）→ 只清非磁盘
-            // 文件；没有 qcow2 → 整目录删除。宁可漏删（留无主文件占空间）
-            // 也不能错删后代 overlay 的基座
+            if (!Directory.Exists(dir))
+                throw new GrassCoreException("快照不存在。");
             if (GrassVmPackage.ContainsReparsePoint(dir))
                 throw new GrassCoreException("快照目录包含不受支持的链接文件，已拒绝删除。");
-            if (!Directory.Exists(dir)) throw new GrassCoreException("快照不存在。");
             try
             {
-                var hasDisks = Directory.EnumerateFiles(dir, "*.qcow2", SearchOption.AllDirectories).Any();
-                if (hasDisks)
-                {
-                    foreach (var f in Directory.EnumerateFiles(dir))
-                    {
-                        var rel = System.IO.Path.GetRelativePath(dir, f);
-                        if (rel != "disks" && !rel.StartsWith("disks" + System.IO.Path.DirectorySeparatorChar, StringComparison.Ordinal))
-                            File.Delete(f);
-                    }
-                }
-                else
-                {
-                    Directory.Delete(dir, recursive: true);
-                }
+                var keepPhysical = Directory.EnumerateFiles(dir, "*.qcow2", SearchOption.AllDirectories).Any();
+                CleanupDeletedSnapshotDirectory(dir, keepPhysical, recursiveDelete);
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
@@ -1443,269 +1811,27 @@ public static class SnapshotService
         var deletedDir = System.IO.Path.Combine(package.SnapshotsPath, deleted.Uuid);
         var linkedClones = FindLinkedCloneReferences(package);
         var plan = SnapshotPlanner.PlanDelete(tree, uuid, linkedClones);
-        var state = VmState.Load(package);
-        // 与 SnapshotTree 同一大小写语义（OrdinalIgnoreCase）：位置判定若用 Ordinal，
-        // 大小写变体 UUID 会被树当作"在位"删掉物理层、却漏掉工作 overlay 的 rebase——链悬空
-        var positionWasHere = string.Equals(state.CurrentSnapshotUuid, uuid, StringComparison.OrdinalIgnoreCase);
         var parentUuid = deleted.ParentSnapshotUuid;
-
-        // 删除/合并快照会删除或改写 backing 文件。链接克隆即使属于另一 Core，
-        // 只要其 vm.lock 存在就可能正在读取这些文件；跨包不能依赖进程内 _running
-        // 判断，必须以持久化锁保守阻止操作，避免运行中克隆被静默损坏。
-        var affectedSnapshotIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { uuid };
-        if (parentUuid is not null) affectedSnapshotIds.Add(parentUuid);
-        var descendants = new Stack<string>();
-        descendants.Push(uuid);
-        while (descendants.Count > 0)
+        var storage = diskOps is not null
+            ? BuildDeleteStoragePlan(package, tree, deleted, diskOps)
+            : new DeleteStoragePlan([], true);
+        var cleanupKeepPhysical = parentUuid is null || storage.KeepsBase;
+        var rebases = storage.Rebases;
+        var intent = new DeleteCleanupIntent(3, deleted.Uuid, cleanupKeepPhysical, deleted.Name, deleted.CreatedAt,
+            parentUuid, plan.Rebindings.ToDictionary(binding => binding.ChildUuid,
+                binding => binding.NewParentUuid == "__root__" ? null : binding.NewParentUuid),
+            PhysicalFinalized: false, Rebases: rebases, OwnedDiskFiles: deleted.DiskOverlayRefs.Values.ToArray(),
+            RetainedDiskFiles: storage.RetainedDiskFiles ?? deleted.DiskOverlayRefs.Values.ToArray());
+        WriteDeleteCleanupIntent(package, intent);
+        try
         {
-            foreach (var child in tree.ChildrenOf(descendants.Pop()))
-                if (affectedSnapshotIds.Add(child.Uuid)) descendants.Push(child.Uuid);
+            CompleteDeleteCleanup(package, intent, recursiveDelete, diskOps);
         }
-        var runningLinkedClone = linkedClones.FirstOrDefault(lc =>
-            (File.Exists(Path.Combine(lc.ChildVmPath, GrassVmPackage.LockFile))
-             || File.Exists(Path.Combine(lc.ChildVmPath, GrassVmPackage.LockGuardFile)))
-            && affectedSnapshotIds.Contains(lc.ParentSnapshotUuid));
-        if (runningLinkedClone is not null)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
             throw new GrassCoreException(
-                $"无法删除此快照：链接克隆“{runningLinkedClone.ChildVmName}”仍在运行。请先正常关机后重试。");
-
-        // 任一设备落入"链根保留"分支 → 物理目录就不能整体删除（后代 overlay 还指着它）
-        var anyDeviceKeptAsBase = false;
-        if (diskOps is not null)
-        {
-            // 两阶段：先对【全部】设备完成依赖者/共享判定（此阶段不写任何文件——
-            // 任何一张盘不合格立即抛，快照原样无损），再统一执行 commit/rebase。
-            // 单循环交错执行的话，"第 1 张盘已 commit、第 2 张盘判定失败"会把父
-            // 检查点污染了一半——重试又把已 commit 的盘当"无依赖者"直接丢弃，
-            // 污染永远无法被发现或修复
-            var devicePlan = new List<(string FrozenAbs, string ParentFrozen, List<string> Dependents)>();
-            foreach (var (deviceId, frozenRel) in deleted.DiskOverlayRefs)
-            {
-                var frozenAbs = System.IO.Path.Combine(package.SnapshotsPath, deleted.Uuid,
-                    frozenRel.Replace('/', System.IO.Path.DirectorySeparatorChar));
-                if (!File.Exists(frozenAbs)) continue;
-                // 父 UUID 可能指向已不存在的快照（其 metadata 损坏被 LoadTree 跳过）：
-                // TryGet 解析不了就按链根处理（保留物理文件做基座）。tree.Get 在
-                // 这里裸抛 KeyNotFoundException 会把这台 VM 的删除永久卡死
-                string? parentFrozen = null;
-                if (parentUuid is not null && tree.TryGet(parentUuid, out var parentNode))
-                    parentFrozen = FrozenPathOrNull(package, parentNode!, deviceId);
-                // 父没有这张盘（配置分歧/旧元数据）→ 按链根处理：保留物理文件，只动元数据
-
-                // 物理依赖者 = backing 指向本层冻结文件的【任何】层：孩子的冻结文件 +
-                // 活动 overlay（按物理指针判定——位置标记只反映"该挂哪"，不反映
-                // "实际压在哪"；恢复到旧点后删"未来"快照时，活动盘根本不在这层上）
-                var dependents = new List<string>();
-                foreach (var childUuid in tree.ChildrenOf(uuid).Select(c => c.Uuid))
-                {
-                    var p = FrozenPathOrNull(package, tree.Get(childUuid), deviceId);
-                    if (p is null || !File.Exists(p)) continue;
-                    // 上一轮删除可能已把这个孩子 rebase 到父：物理改挂先于元数据改挂
-                    //（逐个写 metadata），崩溃夹在中间 = 部分孩子"物理已就位、元数据
-                    // 还挂在本层"。backing 已指向父 = 本事务上一轮自己的产物，不是
-                    // 待办依赖者。不排除的话：它的兄弟（元数据未改挂）让设备照走
-                    // commit+共享扫描，而这个孩子已被【另一份元数据】视作子树外
-                    // 分支——扫描看到"外来层压着父基座"→ 永久误判"共享父"拒绝，
-                    // 提示还会引导用户删掉一个想保留的检查点（重删承诺失效）
-                    if (parentFrozen is not null && File.Exists(parentFrozen))
-                    {
-                        try
-                        {
-                            var cb = diskOps.QueryBackingFileStrict(p);
-                            if (cb is not null && PathEquals(cb, parentFrozen))
-                                continue; // 已被上一轮 rebase：只差元数据改挂（Rebindings 完成）
-                        }
-                        catch (GrassCore.Qemu.QemuImgException)
-                        {
-                            // 查询失败：保守计为依赖者（多一次幂等 rebase 无害）
-                        }
-                    }
-                    dependents.Add(p);
-                }
-                string? activeBacking = null;
-                var activeQueryFailed = false;
-                {
-                    var config = new ConfigStore(package).Load();
-                    var diskNow = config.Devices.OfType<DiskDevice>().FirstOrDefault(d => d.DeviceId == deviceId);
-                    if (diskNow is not null)
-                    {
-                        var active = GrassCore.GrassVm.PathPolicy.Resolve(package, diskNow.Path);
-                        if (File.Exists(active))
-                        {
-                            // 严格查询区分"查询失败"与"真的没有 backing"：宽松版把两者
-                            // 都折叠成 null，查询失败（AV/索引器短暂锁文件）时若位置
-                            // 标记又恰好不在本层（崩溃残留的分歧现场），活动盘会被漏判
-                            // 成依赖者——无孩子 + 无依赖 = 物理基座被删，工作盘断链。
-                            // 失败时保守计为依赖者：多一次幂等 rebase 无害，断链致命
-                            try
-                            {
-                                activeBacking = diskOps.QueryBackingFileStrict(active);
-                            }
-                            catch (GrassCore.Qemu.QemuImgException)
-                            {
-                                activeQueryFailed = true;
-                            }
-                            if (activeBacking is not null && PathEquals(activeBacking, frozenAbs))
-                                dependents.Add(active);
-                            else if (activeQueryFailed)
-                                // 查询失败：物理位置不可知——按最坏情形计为依赖者。
-                                // 宁可多一次幂等 rebase，不可在"查询恰好失败"时
-                                // 把可能压在本层的盘漏判成无依赖（无孩子时 = 物理基座
-                                // 被直接删掉，工作盘从此断链）
-                                dependents.Add(active);
-                            else if (activeBacking is null && positionWasHere)
-                            {
-                                // 确认无 backing + 位置标记在本层：退回位置标记
-                                //（保守——宁可多做一次幂等 rebase 也不漏 rebase 断链）
-                                dependents.Add(active);
-                            }
-                        }
-                    }
-                    // 当前配置已没有该设备（增删盘后的分歧）：没有工作 overlay 需要 rebase
-                }
-
-                if (dependents.Count == 0)
-                {
-                    // 没有任何层指着它：这层的数据随删除【直接丢弃】。绝不 commit 进父——
-                    // 父是"恢复点"（恢复语义承诺它分毫不差），也可能正被兄弟分支/当前
-                    // 世界踩着；无依赖层的合并 = 静默改写别人的检查点
-                    // 物理文件随目录删除（非根 + 非 keptAsBase 时 keepPhysical=false）
-                    continue;
-                }
-
-                if (parentFrozen is not null && File.Exists(parentFrozen))
-                {
-                    // 合并合法性：commit 会改写父基座的内容。父基座若被【本事务之外】
-                    // 的层引用（兄弟分支的冻结层、直接压在父上的活动盘），合并会污染
-                    // 它们读到的数据——如实拒绝，绝不静默改写。
-                    // 排除对象 = 被删节点的【全部后代】（不只它自己）：本事务正把
-                    // 后代 rebase 到父上。阶段 2 中途失败后重删时，已 rebase 的孩子
-                    // 物理上已坐在父基座上、元数据却仍挂在本子树（改挂在最后）——
-                    // 不排除后代，重删会被自己上一轮的成果卡死（"共享"误判，永不成功）
-                    var subtree = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { uuid };
-                    var stack = new Stack<string>();
-                    stack.Push(uuid);
-                    while (stack.Count > 0)
-                    {
-                        var cur = stack.Pop();
-                        foreach (var c in tree.ChildrenOf(cur))
-                            if (subtree.Add(c.Uuid))
-                                stack.Push(c.Uuid);
-                    }
-                    var parentShared = tree.All.Any(s =>
-                    {
-                        if (subtree.Contains(s.Uuid)) return false; // 本子树（含已被 rebase 的后代）
-                        // 父基座自己不可能"共享"自己：即便其元数据被指回自身
-                        //（指针损坏/外物写入），也不能据此永远拒绝删除
-                        if (parentUuid is not null
-                            && string.Equals(s.Uuid, parentUuid, StringComparison.OrdinalIgnoreCase))
-                            return false;
-                        var f = FrozenPathOrNull(package, s, deviceId);
-                        if (f is null || !File.Exists(f)) return false;
-                        try
-                        {
-                            // 严格查询：失败≠"无 backing"。宽松版把 AV/索引器短暂
-                            // 锁文件也折叠成"不共享"，真正共享父基座的兄弟分支会被
-                            // 漏判——随后 commit 静默改写它脚下的检查点。失败按
-                            // 【共享】拒绝删除：用户重试即可，改写无法撤销
-                            var b = diskOps.QueryBackingFileStrict(f);
-                            return b is not null
-                                   && string.Equals(System.IO.Path.GetFullPath(b),
-                                       System.IO.Path.GetFullPath(parentFrozen), StringComparison.OrdinalIgnoreCase);
-                        }
-                        catch (GrassCore.Qemu.QemuImgException) { return true; } // 查询失败：按共享拒绝
-                    });
-                    // 活动盘直接压在【父】上 = 子树外的共享者：合并会改写它脚下的基座。
-                    // 例外：位置就在被删快照上（positionWasHere）——那是阶段 2 上一轮
-                    // 已把它 rebase 到父的【本事务产物】（元数据位置未变，仍是判定依据）
-                    if (activeBacking is not null && PathEquals(activeBacking, parentFrozen)
-                        && !positionWasHere)
-                        parentShared = true;
-                    // 跨包共享者：基于【父】快照建立的链接克隆——它们的工作 overlay
-                    // 直接压在父冻结文件上（另一个包里）。commit 改写父内容 = 悄悄
-                    // 改写克隆脚下的基线，而 UI 的克隆警告只覆盖"删基线本身"这种
-                    // 直接形态，这种"经由子层合并改写基线"的路径必须在这里拦下
-                    if (parentUuid is not null && linkedClones.Any(lc =>
-                            string.Equals(lc.ParentSnapshotUuid, parentUuid, StringComparison.OrdinalIgnoreCase)))
-                        parentShared = true;
-                    if (parentShared)
-                        throw new GrassCoreException(
-                            "无法删除此快照：合并会改写其父快照的磁盘内容，而父快照正被其他快照分支或链接克隆共享。" +
-                            "请先删除/完整克隆共享父快照的其他分支与克隆，再删除此快照。");
-
-                    devicePlan.Add((frozenAbs, parentFrozen, dependents));
-                }
-                else
-                {
-                    // 链根基座（无父）或父缺这张盘：物理文件必须保留（后代 overlay 的 backing），
-                    // 只做元数据删除——目录级决策必须知道这件事
-                    anyDeviceKeptAsBase = true;
-                }
-            }
-
-            // 阶段 2：判定全部通过后才动文件。中途失败（qemu-img 错误/文件被占用）
-            // 留下的是"部分已合并"的物理状态 + 未变的元数据——重删幂等（已合并的
-            // 盘在新一轮里无依赖者→丢弃；未合并的盘重走判定）
-            foreach (var (frozenAbs, parentFrozen, dependents) in devicePlan)
-            {
-                // 正常路径：commit + rebase
-                // 被删层先并入父（客户机可见内容不变），后代改挂父
-                diskOps.CommitOverlay(frozenAbs);
-                foreach (var dep in dependents)
-                    if (!string.Equals(dep, frozenAbs, StringComparison.OrdinalIgnoreCase))
-                        diskOps.RebaseOverlay(dep, parentFrozen, relativeBacking: true);
-            }
-        }
-
-        foreach (var (childUuid, newParent) in plan.Rebindings)
-        {
-            var child = tree.Get(childUuid);
-            child.ParentSnapshotUuid = newParent == "__root__" ? null : newParent;
-            WriteSnapshot(package, child);
-        }
-
-        // 物理目录：链根保留 disks/（仍是后代的基座），其余整目录删除。
-        // 没有 diskOps（无法做 commit/rebase 链维护）而冻结文件还在 → 只删元数据：
-        // 物理文件是某条 overlay 链的一部分，删了就是数据丢失/断链。
-        // 删除顺序不变式（崩溃/IO 失败后重删必须安全）：后代 overlay 的【物理
-        // rebase】（上面的循环）先于【元数据改挂】完成——重试时 ChildrenOf 仍能
-        // 算出未改挂的孩子（幂等 rebase），已改挂的孩子物理上也已不再指向本层。
-        // 这里若因文件被占用（杀毒/索引器是常态）删不掉：树状态一致、链完好，
-        // 把原始 IOException 翻译成"可重试"的明确提示，而不是裸抛
-        if (Directory.Exists(deletedDir))
-        {
-            var frozenFiles = Directory.EnumerateFiles(deletedDir, "*.qcow2", SearchOption.AllDirectories).ToList();
-            var keepPhysical = parentUuid is null || anyDeviceKeptAsBase
-                || diskOps is null && frozenFiles.Count > 0;
-            try
-            {
-                if (keepPhysical)
-                {
-                    foreach (var f in Directory.EnumerateFiles(deletedDir))
-                    {
-                        var rel = System.IO.Path.GetRelativePath(deletedDir, f);
-                        if (rel != "disks" && !rel.StartsWith("disks" + System.IO.Path.DirectorySeparatorChar, StringComparison.Ordinal))
-                            File.Delete(f);
-                    }
-                }
-                else
-                {
-                    Directory.Delete(deletedDir, recursive: true);
-                }
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                throw new GrassCoreException(
-                    "快照已合并完成，但其文件暂时被其他程序占用，未能清理干净。稍后重新删除一次即可完成清理。" +
-                    $"（{ex.Message}）");
-            }
-        }
-
-        // 当前位置被删除 → 位置回到其父（保持"下一步快照挂哪"有确定答案）
-        if (positionWasHere)
-        {
-            state.CurrentSnapshotUuid = parentUuid;
-            state.Save(package);
+                "快照删除未完成，文件可能被其他程序占用或未能清理干净。稍后重新删除一次即可继续。" +
+                $"（{ex.Message}）");
         }
     }
 

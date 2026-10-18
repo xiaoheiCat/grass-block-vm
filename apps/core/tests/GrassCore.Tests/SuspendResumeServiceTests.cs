@@ -463,4 +463,53 @@ public class SuspendResumeServiceTests : IDisposable
         Assert.Empty(launcher.Commands);
         Assert.False(File.Exists(pkg.LockPath), "安全预检拒绝后必须释放 vm.lock");
     }
+
+    [Fact]
+    public async Task ShutdownTimeout_ReleasesPackageGate_SoForceOffCanProceed()
+    {
+        using var fakeQmp = new FakeQmpServer();
+        var releasePowerdown = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        fakeQmp.OnCommand = async (cmd, _) =>
+        {
+            if (cmd == "system_powerdown")
+                await releasePowerdown.Task;
+            return """{"return":{}}""";
+        };
+        _ = fakeQmp.AcceptAsync();
+
+        using var launcher = new RecordingLauncher();
+        using var db = new HostDb(Path.Combine(_dir, "shutdown-timeout.db"));
+        var root = Path.Combine(_dir, "shutdown-timeout-root");
+        var fw = Path.Combine(_dir, "shutdown-timeout-fw");
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(fw);
+        db.SetPreference("libraryRoot", root);
+        File.WriteAllText(Path.Combine(fw, "OVMF_VARS.fd"), "vars-template");
+
+        var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(),
+            fw, "11", launcher,
+            qmpTransportFactory: _ => new TcpTransport("127.0.0.1", fakeQmp.Port));
+        var vmPath = ((GrassCoreService.CreateVmResult)service.CreateVm(JsonSerializer.SerializeToElement(new
+        {
+            name = "ShutdownTimeout", profileId = "ubuntu", diskGiB = 8,
+            isoPath = (string?)null, cpuCores = 1, memoryMiB = 1024, startAfterCreate = false,
+        }))).Path;
+        service.StartVm(vmPath);
+
+        // QMP 管道仍连着但永不回复 system_powerdown。关机请求必须有界退出，
+        // 否则它会永久占用包级门，后续已确认的 forceOff 连自己的兜底都进不去。
+        var shutdownTask = Task.Run(() => Record.Exception(() => service.PowerAction(vmPath, "shutdown")));
+        var shutdownWinner = await Task.WhenAny(shutdownTask, Task.Delay(TimeSpan.FromSeconds(8)));
+        releasePowerdown.TrySetResult(true); // 失败断言也不把假服务永久挂住
+        Assert.Same(shutdownTask, shutdownWinner);
+        var shutdownError = await shutdownTask;
+        var timeoutError = Assert.IsType<GrassCoreException>(shutdownError);
+        Assert.Contains("超时", timeoutError.Message);
+
+        var forceOffTask = Task.Run(() => Record.Exception(() => service.PowerAction(vmPath, "forceOff")));
+        var forceOffWinner = await Task.WhenAny(forceOffTask, Task.Delay(TimeSpan.FromSeconds(3)));
+        Assert.Same(forceOffTask, forceOffWinner);
+        Assert.Null(await forceOffTask);
+        Assert.Contains("quit", fakeQmp.ExecutedCommands);
+    }
 }

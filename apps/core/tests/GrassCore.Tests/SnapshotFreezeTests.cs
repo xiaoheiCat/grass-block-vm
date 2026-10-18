@@ -5,6 +5,9 @@ using GrassCore.Qemu;
 using GrassCore.Rpc;
 using GrassCore.Snapshots;
 using System.Diagnostics;
+using System.Text.Json;
+using GrassCore.Clone;
+using GrassCore.Library;
 using Xunit;
 
 namespace GrassCore.Tests;
@@ -13,7 +16,7 @@ namespace GrassCore.Tests;
 /// 快照数据冻结语义（外部 QCOW2 overlay 链）：
 /// 创建 = 工作盘移入快照（冻结）+ 原路径开新 overlay；
 /// 恢复 = 丢弃工作 overlay，在冻结点上开新 overlay；
-/// 删除 = commit 并入父 + 后代 rebase（链根基座保留物理文件）。
+/// 删除 = 后代安全 rebase，父快照保持不变（链根基座保留物理文件）。
 /// </summary>
 public class SnapshotFreezeTests : IDisposable
 {
@@ -91,43 +94,447 @@ public class SnapshotFreezeTests : IDisposable
     }
 
     [Fact]
-    public void Delete_Middle_CommitsIntoParent_AndRebasesPositionOverlay()
+    public void List_ReportsRestoredPositionRatherThanLatestSnapshot()
     {
         var config = new ConfigStore(_pkg).Load();
-        var s1 = SnapshotService.Create(_pkg, config, "s1", diskOps: Ops);
-        var s2 = SnapshotService.Create(_pkg, config, "s2", diskOps: Ops);
-        var s3 = SnapshotService.Create(_pkg, config, "s3", diskOps: Ops); // 位置在 s3
+        var first = SnapshotService.Create(_pkg, config, "first", diskOps: Ops);
+        SnapshotService.Create(_pkg, config, "later", diskOps: Ops);
+        SnapshotService.Restore(_pkg, first.Uuid, Ops);
+        var state = VmState.Load(_pkg);
+        state.CurrentSnapshotUuid = first.Uuid.ToUpperInvariant();
+        state.Save(_pkg);
 
-        SnapshotService.Delete(_pkg, s2.Uuid, Ops);
+        var entries = JsonSerializer.SerializeToElement(SnapshotService.List(_pkg));
+        var current = Assert.Single(entries.EnumerateArray(), entry => entry.GetProperty("isCurrent").GetBoolean());
+        Assert.Equal(first.Uuid, current.GetProperty("uuid").GetString());
 
-        // 中间层删除：目录移除，树重绑（s3 的父变 s1），位置回到有效快照
-        Assert.False(Directory.Exists(Path.Combine(_pkg.SnapshotsPath, s2.Uuid)));
-        var tree = SnapshotService.LoadTree(_pkg);
-        Assert.Equal(s1.Uuid, tree.Get(s3.Uuid).ParentSnapshotUuid);
-        // 链根基座 s1 与孙辈 s3 的冻结文件都还在
-        Assert.True(File.Exists(FrozenDisk(_pkg, s1)));
-        Assert.True(File.Exists(FrozenDisk(_pkg, s3)));
+        state.CurrentSnapshotUuid = null;
+        state.Save(_pkg);
+        entries = JsonSerializer.SerializeToElement(SnapshotService.List(_pkg));
+        Assert.All(entries.EnumerateArray(), entry => Assert.False(entry.GetProperty("isCurrent").GetBoolean()));
+    }
 
-        // 链维护真发生了：commit(s2 冻结) + rebase(依赖者 → s1 冻结)都记录在案，
-        // 且 rebase 的目标文件此刻真实存在（backing 可解析 = 链没断）。
-        // 每个 overlay 只看【最后一条】rebase：历史条目的目标（如 s3 原来挂 s2）
-        // 在后续删除中合法消失了，现役指针才是链的现状。
-        var log = File.ReadAllText(_fakeImg + ".chain-ops.log");
-        Assert.Contains("commit", log);
-        Assert.Contains(s1.Uuid, log);
-        var latestBackingByOverlay = new Dictionary<string, string>();
-        foreach (var line in log.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-            if (line.Contains("rebase") && line.Contains("-b "))
+    [Fact]
+    public void Delete_Middle_PreservesParentAndRebasesDependentsWithTheirData()
+    {
+        var config = new ConfigStore(_pkg).Load();
+        var first = SnapshotService.Create(_pkg, config, "first", diskOps: Ops);
+        var parentBefore = File.ReadAllBytes(FrozenDisk(_pkg, first));
+        File.AppendAllText(ActiveDisk, "\nUNIQUE-MIDDLE-DATA\n");
+        var middle = SnapshotService.Create(_pkg, config, "middle", diskOps: Ops);
+        var last = SnapshotService.Create(_pkg, config, "last", diskOps: Ops);
+
+        SnapshotService.Delete(_pkg, middle.Uuid, Ops);
+
+        Assert.Equal(parentBefore, File.ReadAllBytes(FrozenDisk(_pkg, first)));
+        Assert.Contains("UNIQUE-MIDDLE-DATA", File.ReadAllText(FrozenDisk(_pkg, last)));
+        Assert.False(Directory.Exists(Path.Combine(_pkg.SnapshotsPath, middle.Uuid)));
+        Assert.Equal(first.Uuid, SnapshotService.LoadTree(_pkg).Get(last.Uuid).ParentSnapshotUuid);
+        Assert.Equal(Path.GetFullPath(FrozenDisk(_pkg, first)), Path.GetFullPath(Ops.QueryBackingFileStrict(FrozenDisk(_pkg, last))!));
+        Assert.Equal(Path.GetFullPath(FrozenDisk(_pkg, last)), Path.GetFullPath(Ops.QueryBackingFileStrict(ActiveDisk)!));
+        Assert.DoesNotContain("commit", File.ReadAllText(_fakeImg + ".chain-ops.log"));
+    }
+
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Delete_RetryThroughRpcAfterCleanupFailure_DeletesOrphanedDisks(bool removeMetadata)
+    {
+        var config = new ConfigStore(_pkg).Load();
+        var first = SnapshotService.Create(_pkg, config, "first", diskOps: Ops);
+        var last = SnapshotService.Create(_pkg, config, "last", diskOps: Ops);
+        var dir = Path.Combine(_pkg.SnapshotsPath, last.Uuid);
+        var intent = SnapshotService.DeleteCleanupIntentPath(_pkg, last.Uuid);
+        var error = Assert.Throws<GrassCoreException>(() => SnapshotService.Delete(
+            _pkg, last.Uuid, Ops, deleteDir =>
             {
-                var overlay = line.Trim().Split(' ')[^1].Trim();
-                latestBackingByOverlay[overlay] = line.Split("-b ")[1].Split(' ')[0].Trim();
-            }
-        foreach (var (overlay, backing) in latestBackingByOverlay)
+                if (removeMetadata)
+                {
+                    File.Delete(Path.Combine(deleteDir, "metadata.json"));
+                    File.Delete(Path.Combine(deleteDir, "config.json"));
+                }
+                throw new IOException("simulated qcow2 sharing violation");
+            }));
+        Assert.Contains("未能清理干净", error.Message);
+        Assert.Equal(!removeMetadata, File.Exists(Path.Combine(dir, "metadata.json")));
+        Assert.True(Directory.EnumerateFiles(dir, "*.qcow2", SearchOption.AllDirectories).Any());
+        Assert.True(File.Exists(intent));
+        Assert.Equal(first.Uuid, VmState.Load(_pkg).CurrentSnapshotUuid);
+
+        using var db = new HostDb(Path.Combine(_dir, "cleanup.db"));
+        db.SetPreference("libraryRoot", _dir);
+        var service = new GrassCoreService(db, "missing-qemu", _fakeImg, _dir, "11");
+        var listed = JsonSerializer.SerializeToElement(service.ListSnapshots(_pkg.Path));
+        var pending = listed.EnumerateArray().Single(entry => entry.GetProperty("uuid").GetString() == last.Uuid);
+        Assert.True(pending.GetProperty("cleanupPending").GetBoolean());
+        Assert.False(pending.GetProperty("isCurrent").GetBoolean());
+        var current = listed.EnumerateArray().Single(entry => entry.GetProperty("uuid").GetString() == first.Uuid);
+        Assert.True(current.GetProperty("isCurrent").GetBoolean());
+        Assert.Throws<GrassCoreException>(() => service.PlanRestoreSnapshot(_pkg.Path, last.Uuid));
+        var plan = JsonSerializer.SerializeToElement(service.PlanDeleteSnapshot(_pkg.Path, last.Uuid));
+        Assert.True(plan.GetProperty("cleanupOnly").GetBoolean());
+        service.DeleteSnapshot(_pkg.Path, last.Uuid);
+        Assert.False(Directory.Exists(dir));
+        Assert.False(File.Exists(intent));
+    }
+
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Delete_ThroughRpc_RespectsLinkedCloneLockOwnership(bool cloneRunning)
+    {
+        var config = new ConfigStore(_pkg).Load();
+        var snapshot = SnapshotService.Create(_pkg, config, "base", diskOps: Ops);
+        var clone = new CloneService(Ops).LinkedClone(_pkg, snapshot.Uuid, "linked-child");
+        using var db = new HostDb(Path.Combine(_dir, "clone-lock.db"));
+        db.SetPreference("libraryRoot", _dir);
+        var service = new GrassCoreService(db, "missing-qemu", _fakeImg, _dir, "11");
+        using var cloneLock = new VmLock(clone);
+        if (cloneRunning)
         {
-            // backing 是相对引用（相对 overlay 自身目录）；按 overlay 位置解析后必须真实存在
-            var resolved = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(Path.GetFullPath(overlay))!, backing));
-            Assert.True(File.Exists(resolved), $"overlay {overlay} 的现役 backing 不存在：{backing}");
+            cloneLock.Acquire();
+            Assert.Throws<GrassCoreException>(() => service.DeleteSnapshot(_pkg.Path, snapshot.Uuid));
+            Assert.True(SnapshotService.LoadTree(_pkg).TryGet(snapshot.Uuid, out _));
+            Assert.True(File.Exists(clone.LockPath));
         }
+        else
+        {
+            service.DeleteSnapshot(_pkg.Path, snapshot.Uuid);
+            Assert.False(SnapshotService.LoadTree(_pkg).TryGet(snapshot.Uuid, out _));
+            Assert.False(File.Exists(clone.LockPath));
+            Assert.False(File.Exists(clone.LockGuardPath));
+        }
+        Assert.False(File.Exists(_pkg.LockPath));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Delete_ThroughRpc_OnlyLocksAffectedCloneBranches(bool affectedClone)
+    {
+        var config = new ConfigStore(_pkg).Load();
+        var first = SnapshotService.Create(_pkg, config, "first", diskOps: Ops);
+        var middle = SnapshotService.Create(_pkg, config, "middle", diskOps: Ops);
+        var child = SnapshotService.Create(_pkg, config, "child", diskOps: Ops);
+        var clone = new CloneService(Ops).LinkedClone(_pkg, affectedClone ? child.Uuid : first.Uuid, "linked-child");
+        using var cloneLock = new VmLock(clone);
+        cloneLock.Acquire();
+        var frozenBefore = File.ReadAllBytes(FrozenDisk(_pkg, first));
+        using var db = new HostDb(Path.Combine(_dir, "clone-branches.db"));
+        db.SetPreference("libraryRoot", _dir);
+        var service = new GrassCoreService(db, "missing-qemu", _fakeImg, _dir, "11");
+
+        if (affectedClone)
+        {
+            Assert.Throws<GrassCoreException>(() => service.DeleteSnapshot(_pkg.Path, middle.Uuid));
+            Assert.True(SnapshotService.LoadTree(_pkg).TryGet(middle.Uuid, out _));
+        }
+        else
+        {
+            service.DeleteSnapshot(_pkg.Path, child.Uuid);
+            Assert.False(SnapshotService.LoadTree(_pkg).TryGet(child.Uuid, out _));
+            Assert.True(SnapshotService.LoadTree(_pkg).TryGet(middle.Uuid, out _));
+        }
+        Assert.Equal(frozenBefore, File.ReadAllBytes(FrozenDisk(_pkg, first)));
+        Assert.True(File.Exists(clone.LockPath));
+        Assert.False(File.Exists(_pkg.LockPath));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Delete_MixedRetainedDisks_DoesNotLeaveUnknownAncestorDependencies(bool replayCleanup)
+    {
+        var config = new ConfigStore(_pkg).Load();
+        var first = SnapshotService.Create(_pkg, config, "first", diskOps: Ops);
+        var ancestor = SnapshotService.Create(_pkg, config, "ancestor", diskOps: Ops);
+        var systemId = config.DevicesOfType<DiskDevice>().Single().DeviceId;
+        var addedDisk = new DiskDevice { Path = "disks/added.qcow2", SizeBytes = 1024 * 1024, CreatedOrder = 11 };
+        config.Devices.Add(addedDisk);
+        new ConfigStore(_pkg).Save(config);
+        File.WriteAllText(Path.Combine(_pkg.DisksPath, "added.qcow2"), "ADDED-DISK-BASE");
+        var middle = SnapshotService.Create(_pkg, config, "middle", diskOps: Ops);
+        var child = SnapshotService.Create(_pkg, config, "child", diskOps: Ops);
+        var middleDir = Path.Combine(_pkg.SnapshotsPath, middle.Uuid);
+        var systemFrozen = Path.Combine(middleDir, middle.DiskOverlayRefs[systemId]);
+        var systemBefore = File.ReadAllBytes(systemFrozen);
+        var addedFrozen = Path.Combine(middleDir, middle.DiskOverlayRefs[addedDisk.DeviceId]);
+        var addedBefore = File.ReadAllBytes(addedFrozen);
+
+        SnapshotService.Delete(_pkg, middle.Uuid, Ops);
+        if (replayCleanup)
+        {
+            File.WriteAllBytes(systemFrozen, systemBefore);
+            File.WriteAllText(SnapshotService.DeleteCleanupIntentPath(_pkg, middle.Uuid), JsonSerializer.Serialize(new
+            {
+                version = 3, uuid = middle.Uuid, keepPhysical = true,
+                physicalFinalized = true, metadataFinalized = true,
+                ownedDiskFiles = middle.DiskOverlayRefs.Values.ToArray(),
+                retainedDiskFiles = new[] { middle.DiskOverlayRefs[addedDisk.DeviceId] },
+            }));
+            SnapshotService.Delete(_pkg, middle.Uuid, Ops);
+        }
+
+        Assert.False(File.Exists(systemFrozen));
+        Assert.Equal(addedBefore, File.ReadAllBytes(addedFrozen));
+        Assert.False(File.Exists(SnapshotService.DeleteCleanupIntentPath(_pkg, middle.Uuid)));
+        SnapshotService.Delete(_pkg, ancestor.Uuid, Ops);
+        Assert.False(SnapshotService.LoadTree(_pkg).TryGet(ancestor.Uuid, out _));
+        Assert.Equal(first.Uuid, SnapshotService.LoadTree(_pkg).Get(child.Uuid).ParentSnapshotUuid);
+        Assert.Equal(addedBefore, File.ReadAllBytes(addedFrozen));
+    }
+
+    [Fact]
+    public void Delete_RetryRetainedBase_PreservesDisksAndFinalizesMetadata()
+    {
+        var config = new ConfigStore(_pkg).Load();
+        var first = SnapshotService.Create(_pkg, config, "first", diskOps: Ops);
+        var child = SnapshotService.Create(_pkg, config, "child", diskOps: Ops);
+        var frozenBefore = File.ReadAllBytes(FrozenDisk(_pkg, first));
+        var intentPath = SnapshotService.DeleteCleanupIntentPath(_pkg, first.Uuid);
+        File.WriteAllText(intentPath, JsonSerializer.Serialize(new
+        {
+            version = 1, uuid = first.Uuid, keepPhysical = true,
+            parentUuid = (string?)null,
+            rebindings = new Dictionary<string, string?> { [child.Uuid] = null },
+        }));
+
+        SnapshotService.Delete(_pkg, first.Uuid, Ops);
+
+        Assert.Equal(frozenBefore, File.ReadAllBytes(FrozenDisk(_pkg, first)));
+        Assert.Null(SnapshotService.LoadTree(_pkg).Get(child.Uuid).ParentSnapshotUuid);
+        Assert.False(File.Exists(Path.Combine(_pkg.SnapshotsPath, first.Uuid, "metadata.json")));
+        Assert.False(File.Exists(intentPath));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Delete_UnreadableCleanupIntent_BlocksRestoreUntilRecovered(bool lockFile)
+    {
+        var config = new ConfigStore(_pkg).Load();
+        SnapshotService.Create(_pkg, config, "first", diskOps: Ops);
+        var last = SnapshotService.Create(_pkg, config, "last", diskOps: Ops);
+        Assert.Throws<GrassCoreException>(() => SnapshotService.Delete(_pkg, last.Uuid, Ops,
+            _ => throw new IOException("cleanup failed")));
+        var intentPath = SnapshotService.DeleteCleanupIntentPath(_pkg, last.Uuid);
+        var intentBefore = File.ReadAllText(intentPath);
+        var activeBefore = File.ReadAllBytes(ActiveDisk);
+        using (var held = lockFile ? new FileStream(intentPath, FileMode.Open, FileAccess.Read, FileShare.None) : null)
+        {
+            if (!lockFile) File.WriteAllText(intentPath, "{broken-json");
+            Assert.Throws<GrassCoreException>(() => SnapshotService.List(_pkg));
+            Assert.Throws<GrassCoreException>(() => SnapshotService.Restore(_pkg, last.Uuid, Ops));
+            Assert.Throws<GrassCoreException>(() => SnapshotService.Delete(_pkg, last.Uuid, Ops));
+            Assert.Equal(activeBefore, File.ReadAllBytes(ActiveDisk));
+        }
+        if (!lockFile) File.WriteAllText(intentPath, intentBefore);
+        SnapshotService.Delete(_pkg, last.Uuid, Ops);
+        Assert.False(Directory.Exists(Path.Combine(_pkg.SnapshotsPath, last.Uuid)));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Delete_UnreadableRebindingChild_RetainsIntentUntilRecovered(bool lockFile)
+    {
+        var config = new ConfigStore(_pkg).Load();
+        var first = SnapshotService.Create(_pkg, config, "first", diskOps: Ops);
+        var middle = SnapshotService.Create(_pkg, config, "middle", diskOps: Ops);
+        var child = SnapshotService.Create(_pkg, config, "child", diskOps: Ops);
+        Ops.RebaseOverlay(FrozenDisk(_pkg, child), FrozenDisk(_pkg, first), relativeBacking: true);
+        var intentPath = SnapshotService.DeleteCleanupIntentPath(_pkg, middle.Uuid);
+        File.WriteAllText(intentPath, JsonSerializer.Serialize(new
+        {
+            version = 1, uuid = middle.Uuid, keepPhysical = false, parentUuid = first.Uuid,
+            rebindings = new Dictionary<string, string?> { [child.Uuid] = first.Uuid },
+        }));
+        var childMetadata = Path.Combine(_pkg.SnapshotsPath, child.Uuid, "metadata.json");
+        var metadataBefore = File.ReadAllText(childMetadata);
+        using (var held = lockFile ? new FileStream(childMetadata, FileMode.Open, FileAccess.Read, FileShare.None) : null)
+        {
+            if (!lockFile) File.WriteAllText(childMetadata, "{broken-json");
+            Assert.Throws<GrassCoreException>(() => SnapshotService.Delete(_pkg, middle.Uuid, Ops));
+            Assert.True(File.Exists(intentPath));
+            Assert.True(File.Exists(FrozenDisk(_pkg, middle)));
+        }
+        if (!lockFile) File.WriteAllText(childMetadata, metadataBefore);
+        SnapshotService.Delete(_pkg, middle.Uuid, Ops);
+        Assert.False(File.Exists(intentPath));
+        Assert.Equal(first.Uuid, SnapshotService.LoadTree(_pkg).Get(child.Uuid).ParentSnapshotUuid);
+    }
+
+    [Fact]
+    public void Delete_FinalizedMetadata_AllowsCleanupAfterChildIsDeleted()
+    {
+        var config = new ConfigStore(_pkg).Load();
+        SnapshotService.Create(_pkg, config, "first", diskOps: Ops);
+        var middle = SnapshotService.Create(_pkg, config, "middle", diskOps: Ops);
+        var child = SnapshotService.Create(_pkg, config, "child", diskOps: Ops);
+        Assert.Throws<GrassCoreException>(() => SnapshotService.Delete(_pkg, middle.Uuid, Ops,
+            _ => throw new IOException("cleanup failed")));
+        var intentPath = SnapshotService.DeleteCleanupIntentPath(_pkg, middle.Uuid);
+        using (var intent = JsonDocument.Parse(File.ReadAllText(intentPath)))
+            Assert.True(intent.RootElement.GetProperty("MetadataFinalized").GetBoolean());
+
+        SnapshotService.Delete(_pkg, child.Uuid, Ops);
+        SnapshotService.Delete(_pkg, middle.Uuid, Ops);
+
+        Assert.False(File.Exists(intentPath));
+        Assert.False(Directory.Exists(Path.Combine(_pkg.SnapshotsPath, middle.Uuid)));
+    }
+
+    [Fact]
+    public void Delete_UnreadableChildBeforePlanning_DoesNotDeleteItsBacking()
+    {
+        var config = new ConfigStore(_pkg).Load();
+        SnapshotService.Create(_pkg, config, "first", diskOps: Ops);
+        var middle = SnapshotService.Create(_pkg, config, "middle", diskOps: Ops);
+        var child = SnapshotService.Create(_pkg, config, "child", diskOps: Ops);
+        File.WriteAllText(Path.Combine(_pkg.SnapshotsPath, child.Uuid, "metadata.json"), "{broken-json");
+
+        Assert.Throws<GrassCoreException>(() => SnapshotService.Delete(_pkg, middle.Uuid, Ops));
+
+        Assert.True(File.Exists(FrozenDisk(_pkg, middle)));
+        Assert.False(File.Exists(SnapshotService.DeleteCleanupIntentPath(_pkg, middle.Uuid)));
+    }
+
+    [Fact]
+    public void Delete_InterruptedPhysicalRebase_BlocksOtherMutationsAndResumesThroughRpc()
+    {
+        var config = new ConfigStore(_pkg).Load();
+        var first = SnapshotService.Create(_pkg, config, "first", diskOps: Ops);
+        var parent = SnapshotService.Create(_pkg, config, "parent", diskOps: Ops);
+        File.AppendAllText(ActiveDisk, "\nINTERRUPTED-MIDDLE-DATA\n");
+        var middle = SnapshotService.Create(_pkg, config, "middle", diskOps: Ops);
+        var child = SnapshotService.Create(_pkg, config, "child", diskOps: Ops);
+        var failingImg = Path.Combine(_dir, OperatingSystem.IsWindows() ? "fail-rebase.bat" : "fail-rebase.sh");
+        if (OperatingSystem.IsWindows())
+            File.WriteAllText(failingImg, $"@echo off\r\nif \"%~1\"==\"rebase\" exit /b 1\r\ncall \"{_fakeImg}\" %*\r\n");
+        else
+        {
+            File.WriteAllText(failingImg, $"#!/bin/sh\nif [ \"$1\" = rebase ]; then exit 1; fi\nexec \"{_fakeImg}\" \"$@\"\n");
+            File.SetUnixFileMode(failingImg, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
+        Assert.Throws<QemuImgException>(() => SnapshotService.Delete(_pkg, middle.Uuid, new TransactionalDiskOps(failingImg)));
+        var intentPath = SnapshotService.DeleteCleanupIntentPath(_pkg, middle.Uuid);
+        using (var intent = JsonDocument.Parse(File.ReadAllText(intentPath)))
+        {
+            Assert.False(intent.RootElement.GetProperty("PhysicalFinalized").GetBoolean());
+            Assert.Single(intent.RootElement.GetProperty("Rebases").EnumerateArray());
+        }
+        Ops.RebaseOverlay(FrozenDisk(_pkg, child), FrozenDisk(_pkg, parent), relativeBacking: true);
+        using var db = new HostDb(Path.Combine(_dir, "physical-recovery.db"));
+        db.SetPreference("libraryRoot", _dir);
+        var service = new GrassCoreService(db, "missing-qemu", _fakeImg, _dir, "11");
+        Assert.Throws<GrassCoreException>(() => service.DeleteSnapshot(_pkg.Path, parent.Uuid));
+        Assert.Throws<GrassCoreException>(() => SnapshotService.Create(_pkg, config, "blocked", diskOps: Ops));
+        Assert.Throws<GrassCoreException>(() => SnapshotService.Restore(_pkg, first.Uuid, Ops));
+        Assert.Throws<GrassCoreException>(() => SnapshotService.RepairStagedOverlays(_pkg, Ops));
+
+        service.DeleteSnapshot(_pkg.Path, middle.Uuid);
+        service.DeleteSnapshot(_pkg.Path, parent.Uuid);
+
+        Assert.False(File.Exists(intentPath));
+        Assert.Equal(first.Uuid, SnapshotService.LoadTree(_pkg).Get(child.Uuid).ParentSnapshotUuid);
+        Assert.Equal(Path.GetFullPath(FrozenDisk(_pkg, first)), Path.GetFullPath(Ops.QueryBackingFileStrict(FrozenDisk(_pkg, child))!));
+        Assert.Contains("INTERRUPTED-MIDDLE-DATA", File.ReadAllText(FrozenDisk(_pkg, child)));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Delete_PreservesUnknownFilesAndDirectories(bool keepPhysical)
+    {
+        var config = new ConfigStore(_pkg).Load();
+        var first = SnapshotService.Create(_pkg, config, "first", diskOps: Ops);
+        var last = SnapshotService.Create(_pkg, config, "last", diskOps: Ops);
+        var target = keepPhysical ? first : last;
+        var dir = Path.Combine(_pkg.SnapshotsPath, target.Uuid);
+        var notes = Path.Combine(dir, "notes");
+        var emptyUnknown = Path.Combine(dir, "empty-user-directory");
+        Directory.CreateDirectory(notes);
+        Directory.CreateDirectory(emptyUnknown);
+        var note = Path.Combine(notes, "metadata.json");
+        var topFile = Path.Combine(dir, "personal.txt");
+        var unknownDisk = Path.Combine(dir, "disks", "personal.qcow2");
+        File.WriteAllText(note, "user notes");
+        File.WriteAllText(topFile, "user file");
+        File.WriteAllText(unknownDisk, "user disk backup");
+
+        SnapshotService.Delete(_pkg, target.Uuid, Ops);
+
+        Assert.Equal("user notes", File.ReadAllText(note));
+        Assert.Equal("user file", File.ReadAllText(topFile));
+        Assert.Equal("user disk backup", File.ReadAllText(unknownDisk));
+        Assert.True(Directory.Exists(emptyUnknown));
+        Assert.Equal(keepPhysical, File.Exists(FrozenDisk(_pkg, target)));
+        Assert.False(File.Exists(Path.Combine(dir, "metadata.json")));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Delete_RelocatedExternalDisk_IsNeverRebased(bool dependsOnSnapshot)
+    {
+        var config = new ConfigStore(_pkg).Load();
+        SnapshotService.Create(_pkg, config, "first", diskOps: Ops);
+        var last = SnapshotService.Create(_pkg, config, "last", diskOps: Ops);
+        var external = Path.Combine(_dir, "external.qcow2");
+        if (dependsOnSnapshot) Ops.CreateOverlay(FrozenDisk(_pkg, last), external);
+        else File.WriteAllText(external, "INDEPENDENT-EXTERNAL-DATA");
+        File.Delete(ActiveDisk);
+        config.DevicesOfType<DiskDevice>().Single().Path = external;
+        new ConfigStore(_pkg).Save(config);
+        var externalBefore = File.ReadAllBytes(external);
+        using var db = new HostDb(Path.Combine(_dir, "external-delete.db"));
+        db.SetPreference("libraryRoot", _dir);
+        var service = new GrassCoreService(db, "missing-qemu", _fakeImg, _dir, "11");
+
+        if (dependsOnSnapshot)
+        {
+            Assert.Throws<GrassCoreException>(() => service.PlanDeleteSnapshot(_pkg.Path, last.Uuid));
+            Assert.Throws<GrassCoreException>(() => service.DeleteSnapshot(_pkg.Path, last.Uuid));
+            Assert.True(File.Exists(FrozenDisk(_pkg, last)));
+        }
+        else
+        {
+            var plan = JsonSerializer.SerializeToElement(service.PlanDeleteSnapshot(_pkg.Path, last.Uuid));
+            Assert.False(plan.GetProperty("requiresMerge").GetBoolean());
+            service.DeleteSnapshot(_pkg.Path, last.Uuid);
+            Assert.False(File.Exists(FrozenDisk(_pkg, last)));
+            Assert.Null(Ops.QueryBackingFileStrict(external));
+        }
+        Assert.Equal(externalBefore, File.ReadAllBytes(external));
+        Assert.False(File.Exists(SnapshotService.DeleteCleanupIntentPath(_pkg, last.Uuid)));
+    }
+
+    [Fact]
+    public void Delete_MissingDescendantMetadata_PreservesPhysicalBackingChain()
+    {
+        var config = new ConfigStore(_pkg).Load();
+        SnapshotService.Create(_pkg, config, "first", diskOps: Ops);
+        var middle = SnapshotService.Create(_pkg, config, "middle", diskOps: Ops);
+        var child = SnapshotService.Create(_pkg, config, "child", diskOps: Ops);
+        var childMetadata = Path.Combine(_pkg.SnapshotsPath, child.Uuid, "metadata.json");
+        var metadataBefore = File.ReadAllText(childMetadata);
+        File.Delete(childMetadata);
+        var middleBefore = File.ReadAllBytes(FrozenDisk(_pkg, middle));
+        using var db = new HostDb(Path.Combine(_dir, "missing-metadata.db"));
+        db.SetPreference("libraryRoot", _dir);
+        var service = new GrassCoreService(db, "missing-qemu", _fakeImg, _dir, "11");
+
+        Assert.Throws<GrassCoreException>(() => service.PlanDeleteSnapshot(_pkg.Path, middle.Uuid));
+        Assert.Throws<GrassCoreException>(() => service.DeleteSnapshot(_pkg.Path, middle.Uuid));
+
+        Assert.Equal(middleBefore, File.ReadAllBytes(FrozenDisk(_pkg, middle)));
+        Assert.Equal(Path.GetFullPath(FrozenDisk(_pkg, middle)), Path.GetFullPath(Ops.QueryBackingFileStrict(FrozenDisk(_pkg, child))!));
+        Assert.False(File.Exists(SnapshotService.DeleteCleanupIntentPath(_pkg, middle.Uuid)));
+        File.WriteAllText(childMetadata, metadataBefore);
+        service.DeleteSnapshot(_pkg.Path, middle.Uuid);
+        Assert.False(File.Exists(FrozenDisk(_pkg, middle)));
     }
 
     [Fact]
@@ -176,29 +583,27 @@ public class SnapshotFreezeTests : IDisposable
     }
 
     [Fact]
-    public void Delete_MiddleWithSiblingBranch_RefusesSharedParentMerge()
+    public void Delete_MiddleWithSiblingBranch_PreservesSharedParent()
     {
         var config = new ConfigStore(_pkg).Load();
-        var s1 = SnapshotService.Create(_pkg, config, "s1", diskOps: Ops);
-        var s2 = SnapshotService.Create(_pkg, config, "s2", diskOps: Ops);
-        var s3 = SnapshotService.Create(_pkg, config, "s3", diskOps: Ops); // s2 的孩子
-        // 回到 s1 再建 s2b = s1 的另一个分支：s1 的基座现在被两条链共享
-        SnapshotService.Restore(_pkg, s1.Uuid, Ops);
-        var s2b = SnapshotService.Create(_pkg, config, "sibling", diskOps: Ops);
-        var baseBefore = File.ReadAllBytes(FrozenDisk(_pkg, s1));
+        var first = SnapshotService.Create(_pkg, config, "first", diskOps: Ops);
+        var middle = SnapshotService.Create(_pkg, config, "middle", diskOps: Ops);
+        var last = SnapshotService.Create(_pkg, config, "last", diskOps: Ops);
+        SnapshotService.Restore(_pkg, first.Uuid, Ops);
+        var sibling = SnapshotService.Create(_pkg, config, "sibling", diskOps: Ops);
+        var baseBefore = File.ReadAllBytes(FrozenDisk(_pkg, first));
+        var siblingBefore = File.ReadAllBytes(FrozenDisk(_pkg, sibling));
 
-        // 删 s2 需要把 s2 的数据 commit 进 s1 的基座——那会改写 s2b 脚下的内容。
-        // 必须如实拒绝，而不是静默污染
-        var ex = Assert.Throws<GrassCore.Rpc.GrassCoreException>(() => SnapshotService.Delete(_pkg, s2.Uuid, Ops));
+        SnapshotService.Delete(_pkg, middle.Uuid, Ops);
 
-        Assert.Contains("共享", ex.Message);
-        Assert.Equal(baseBefore, File.ReadAllBytes(FrozenDisk(_pkg, s1)));
+        Assert.Equal(baseBefore, File.ReadAllBytes(FrozenDisk(_pkg, first)));
+        Assert.Equal(siblingBefore, File.ReadAllBytes(FrozenDisk(_pkg, sibling)));
         Assert.DoesNotContain("commit", File.ReadAllText(_fakeImg + ".chain-ops.log"));
-        // 树原样（s2 还在）：拒绝 = 无副作用
         var tree = SnapshotService.LoadTree(_pkg);
-        Assert.Equal(4, tree.All.Count);
-        Assert.Equal(s2.Uuid, tree.Get(s3.Uuid).ParentSnapshotUuid);
+        Assert.Equal(3, tree.All.Count);
+        Assert.Equal(first.Uuid, tree.Get(last.Uuid).ParentSnapshotUuid);
     }
+
 
     [Fact]
     public void Delete_RetryAfterPartialRebase_CompletesInsteadOfFalseShared()

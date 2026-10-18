@@ -188,7 +188,7 @@ public sealed class TransactionalDiskOps
         }
         // tempTarget 只在失败清理时使用：commit 的目标就是真文件，绝不能被删，
         // 传一个不会被创建的哨兵路径（失败清理 File.Delete 对不存在的文件是 no-op）
-        using var op = Run(["commit", "-f", "qcow2", overlayFile], overlayFile + ".commit-sentinel");
+        using var op = Run(["commit", "-d", "-f", "qcow2", overlayFile], overlayFile + ".commit-sentinel");
         // qemu-img 返回成功后，父盘已经包含 overlay 数据。之后的 check、journal
         // 更新或临时文件清理即使失败，也绝不能再用旧备份覆盖父盘。
         var commitCompleted = false;
@@ -284,8 +284,9 @@ public sealed class TransactionalDiskOps
     }
 
     /// <summary>
-    /// 把 overlay 的 backing 指针改到新的 backing（qemu-img rebase；不迁移数据，
-    /// 只改指针——数据已在 commit 阶段归并）。backing 为 null 表示断开引用。
+    /// 把 overlay 改挂到新的 backing。默认安全 rebase 会将维持客户机可见内容所需的
+    /// 旧 backing 差异写入 overlay，不改写新旧 backing；unsafe 模式只改指针。
+    /// backing 为 null 时使用 unsafe 模式断开引用，不保留继承数据。
     /// </summary>
     /// <param name="unsafeMode">
     /// 追加 -u（unsafe rebase）：不打开【旧】backing、只改指针。用于快照冻结——

@@ -87,11 +87,13 @@ public static class FakeQemuImg
                     $lines = $text -split "`r?`n"
                     $dataLines = $lines | Where-Object { $_ -notmatch '-b\s+' }
                     [IO.File]::AppendAllText($rbPath, ($dataLines -join "`n") + "`n", $lat)
-                    $first = $lines[0]
-                    $lastb = $lines | Where-Object { $_ -match '-b\s+' } | Select-Object -Last 1
-                    $out = $first + "`n"
-                    if ($lastb) { $out = $out + $lastb + "`n" }
-                    [IO.File]::WriteAllBytes($target, $lat.GetBytes($out))
+                    if ($Rest -notcontains '-d') {
+                        $first = $lines[0]
+                        $lastb = $lines | Where-Object { $_ -match '-b\s+' } | Select-Object -Last 1
+                        $out = $first + "`n"
+                        if ($lastb) { $out = $out + $lastb + "`n" }
+                        [IO.File]::WriteAllBytes($target, $lat.GetBytes($out))
+                    }
                     [IO.File]::AppendAllText($opsLog, ($Rest -join ' ') + "`n", $lat)
                     exit 0
                 }
@@ -101,13 +103,39 @@ public static class FakeQemuImg
                         exit 1
                     }
                     $bi = [Array]::IndexOf($Rest, '-b')
+                    $newBackingPath = ''
                     if ($bi -ge 0 -and $bi + 1 -lt $Rest.Count) {
                         $newBacking = $Rest[$bi + 1]
+                        $newBackingPath = Resolve-Backing $target $newBacking
                         if ($Rest -notcontains '-u') {
-                            if (-not (Test-Path (Resolve-Backing $target $newBacking))) {
+                            if (-not (Test-Path $newBackingPath)) {
                                 [Console]::Error.WriteLine("qemu-img: Could not open backing image '$newBacking'")
                                 exit 1
                             }
+                        }
+                    }
+                    if ($Rest -notcontains '-u') {
+                        $inherited = [Collections.Generic.List[string]]::new()
+                        $visited = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                        $currentImage = [IO.Path]::GetFullPath($target)
+                        [void]$visited.Add($currentImage)
+                        $oldBacking = Get-ContentBacking $currentImage
+                        while ($oldBacking) {
+                            $oldBackingPath = Resolve-Backing $currentImage $oldBacking
+                            if ($oldBackingPath -eq $newBackingPath) { break }
+                            if (-not $visited.Add($oldBackingPath) -or -not (Test-Path $oldBackingPath)) {
+                                [Console]::Error.WriteLine("qemu-img: Invalid old backing chain '$oldBackingPath'")
+                                exit 1
+                            }
+                            $oldText = $lat.GetString([IO.File]::ReadAllBytes($oldBackingPath))
+                            foreach ($dataLine in ($oldText -split "`r?`n")) {
+                                if ($dataLine -notmatch '-b\s+') { $inherited.Add($dataLine) }
+                            }
+                            $currentImage = $oldBackingPath
+                            $oldBacking = Get-ContentBacking $currentImage
+                        }
+                        if ($inherited.Count -gt 0) {
+                            [IO.File]::AppendAllText($target, ($inherited -join "`n") + "`n", $lat)
                         }
                     }
                     [IO.File]::AppendAllText($target, ($Rest -join ' ') + "`n", $lat)
@@ -153,14 +181,14 @@ public static class FakeQemuImg
               case "$b" in
                 /*) printf '%s' "$b" ;;
                 *)  d=$(dirname "$b")
-                    (cd "$(dirname "$target")/$d" 2>/dev/null && printf '%s/%s' "$(pwd)" "$(basename "$b")") ;;
+                    (cd "$(dirname "${2:-$target}")/$d" 2>/dev/null && printf '%s/%s' "$(pwd)" "$(basename "$b")") ;;
               esac
             }
             # 从镜像自身内容提取 backing（create/rebase 都把自己的参数行追加了进去——
             # 内容随 File.Move/Copy 一起旅行，比 sidecar 可靠）。LC_ALL=C：镜像里的
             # QCOW2 魔数（0xFB）在 UTF-8 locale 下会让 BSD sed 报 illegal byte sequence
             backing_from_content() {
-              LC_ALL=C sed -n 's/.*-b \([^ ]*\).*/\1/p' "$target" | tail -1
+              LC_ALL=C sed -n 's/.*-b \([^ ]*\).*/\1/p' "${1:-$target}" | tail -1
             }
             case "$1" in
               check)
@@ -201,12 +229,14 @@ public static class FakeQemuImg
                 # 相对 -b 路径从【backing 自己的目录】解析会指回 backing 自己
                 #（同级快照目录同深度），info 就报出"自己 backing 自己"的假链
                 LC_ALL=C grep -av -- '-b ' "$target" >> "$rb"
-                firstline=$(LC_ALL=C head -n 1 "$target")
-                lastb=$(LC_ALL=C grep -a -- '-b ' "$target" | tail -1)
-                { LC_ALL=C printf '%s\n' "$firstline"
-                  [ -n "$lastb" ] && printf '%s\n' "$lastb"
-                } > "$target.cmt-tmp"
-                mv "$target.cmt-tmp" "$target"
+                if ! printf '%s\n' "$@" | grep -qx -- '-d'; then
+                  firstline=$(LC_ALL=C head -n 1 "$target")
+                  lastb=$(LC_ALL=C grep -a -- '-b ' "$target" | tail -1)
+                  { LC_ALL=C printf '%s\n' "$firstline"
+                    [ -n "$lastb" ] && printf '%s\n' "$lastb"
+                  } > "$target.cmt-tmp"
+                  mv "$target.cmt-tmp" "$target"
+                fi
                 printf '%s\n' "$*" >> "$0.chain-ops.log"; exit 0;;
               rebase)
                 # 测试注入：本假件目录里放 fail-rebase.marker → rebase 一律失败
@@ -217,11 +247,33 @@ public static class FakeQemuImg
                 fi
                 # 从 "$*"（单行、空格连接）提取 -b："$@" 是每参数一行，"-b 值"跨行正则永远匹配不上
                 nb=$(printf '%s\n' "$*" | sed -n 's/.*-b \([^ ]*\).*/\1/p')
+                rnb=''
                 if [ -n "$nb" ]; then
                   rnb=$(resolve "$nb")
-                  if [ ! -e "$rnb" ]; then
+                  if ! printf '%s\n' "$@" | grep -qx -- '-u' && [ ! -e "$rnb" ]; then
                     echo "qemu-img: Could not open backing image '$nb'" >&2; exit 1
                   fi
+                fi
+                if ! printf '%s\n' "$@" | grep -qx -- '-u'; then
+                  current_image="$target"
+                  visited_images="|$target|"
+                  inherited_data=''
+                  old_backing=$(backing_from_content "$current_image")
+                  while [ -n "$old_backing" ]; do
+                    old_backing_path=$(resolve "$old_backing" "$current_image")
+                    [ "$old_backing_path" = "$rnb" ] && break
+                    case "$visited_images" in
+                      *"|$old_backing_path|"*) echo 'qemu-img: Cyclic old backing chain' >&2; exit 1;;
+                    esac
+                    if [ ! -f "$old_backing_path" ]; then
+                      echo "qemu-img: Could not open old backing image '$old_backing_path'" >&2; exit 1
+                    fi
+                    visited_images="$visited_images$old_backing_path|"
+                    inherited_data=$(printf '%s\n' "$inherited_data"; LC_ALL=C grep -av -- '-b ' "$old_backing_path")
+                    current_image="$old_backing_path"
+                    old_backing=$(backing_from_content "$current_image")
+                  done
+                  [ -z "$inherited_data" ] || printf '%s\n' "$inherited_data" >> "$target"
                 fi
                 # rebase 后 overlay 的 backing 指针变了：把参数行追加进镜像（此后
                 # backing_from_content 取最后一条 = 新 backing）
