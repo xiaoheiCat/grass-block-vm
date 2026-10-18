@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/GrassCore/GrassCore.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/GrassCore.Tests/GrassCore.Tests.csproj" />
+  </Folder>
+</Solution>

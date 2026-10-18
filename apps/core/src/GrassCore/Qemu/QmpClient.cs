@@ -1,0 +1,316 @@
+using System.Net.Sockets;
+using System.IO.Pipes;
+using System.Text;
+using System.Text.Json;
+
+namespace GrassCore.Qemu;
+
+/// <summary>QMP 传输抽象：Windows Named Pipe；开发/测试用 TCP 或内存双工流。</summary>
+public interface IQmpTransport : IDisposable
+{
+    Stream Stream { get; }
+    string Describe();
+}
+
+public sealed class WindowsNamedPipeTransport : IQmpTransport
+{
+    private readonly NamedPipeClientStream _pipe;
+    public WindowsNamedPipeTransport(string pipeName)
+    {
+        var name = pipeName.StartsWith(@"\\.\pipe\", StringComparison.OrdinalIgnoreCase)
+            ? pipeName[@"\\.\pipe\".Length..]
+            : pipeName;
+        _pipe = new NamedPipeClientStream(".", name, PipeDirection.InOut, PipeOptions.Asynchronous);
+        _pipe.Connect(5000);
+    }
+    public Stream Stream => _pipe;
+    public string Describe() => "named-pipe:" + _pipe.SafePipeHandle;
+    public void Dispose() => _pipe.Dispose();
+}
+
+public sealed class TcpTransport : IQmpTransport
+{
+    private readonly TcpClient _client;
+    public TcpTransport(string host, int port)
+    {
+        _client = new TcpClient(host, port);
+    }
+    public Stream Stream => _client.GetStream();
+    public string Describe() => $"tcp:{_client.Client.RemoteEndPoint}";
+    public void Dispose() => _client.Dispose();
+}
+
+public sealed class StreamTransport : IQmpTransport
+{
+    public StreamTransport(Stream duplex) => Stream = duplex;
+    public Stream Stream { get; }
+    public string Describe() => "stream";
+    public void Dispose() => Stream.Dispose();
+}
+
+/// <summary>
+/// QMP 客户端：JSON 行协议（greeting → qmp_capabilities → commands + asynchronous events）。
+/// UI 或 GrassCore 崩溃不杀 QEMU；Core 重启后凭 session.json + 管道重连无损接管。
+/// </summary>
+public sealed class QmpClient : IDisposable
+{
+    private readonly IQmpTransport _transport;
+    private readonly StreamReader _reader;
+    private readonly StreamWriter _writer;
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, Action<JsonElement>> _eventHandlers = new();
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<int, TaskCompletionSource<JsonDocument>> _pending = new();
+    private Task? _readLoop;
+    private volatile bool _disposed;
+
+    /// <summary>连接已关闭（管道重置/读循环退出后 Dispose）。调用方据此重建连接。</summary>
+    public bool IsDisposed => _disposed;
+    private int _nextId = 1;
+    private readonly SemaphoreSlim _sendLock = new(1, 1);
+
+    public QmpClient(IQmpTransport transport)
+    {
+        _transport = transport;
+        _reader = new StreamReader(transport.Stream, Encoding.UTF8);
+        _writer = new StreamWriter(transport.Stream, new UTF8Encoding(false)) { AutoFlush = true };
+    }
+
+    public event Action<JsonElement, string>? UnhandledEvent;
+
+    /// <summary>读 greeting 并完成能力协商（QMP 握手）。</summary>
+    public async Task ConnectAsync(CancellationToken ct = default)
+    {
+        ThrowIfDisposed();
+        using var greeting = await ReadMessageAsync(ct).ConfigureAwait(false);
+        if (!greeting.RootElement.TryGetProperty("QMP", out _))
+            throw new QmpException("对端不是 QMP 服务（缺少 greeting）。");
+        // 读循环从这里接管接收侧（greeting 之后的全部消息）
+        _readLoop = Task.Run(ReadLoopAsync);
+        using var resp = await ExecuteRawAsync(new { execute = "qmp_capabilities" }, ct).ConfigureAwait(false);
+        if (resp.RootElement.TryGetProperty("error", out _))
+            throw new QmpException("qmp_capabilities 被拒绝。");
+    }
+
+    /// <summary>执行 QMP 命令，返回 return 节点；error 转为异常。</summary>
+    public async Task<JsonElement> ExecuteAsync(string command, object? args = null, CancellationToken ct = default)
+    {
+        var payload = args is null
+            ? (object)new { execute = command }
+            : new Dictionary<string, object?> { ["execute"] = command, ["arguments"] = args };
+        using var resp = await ExecuteRawAsync(payload, ct).ConfigureAwait(false);
+        if (resp.RootElement.TryGetProperty("error", out var err))
+            throw new QmpException($"QMP {command} 失败：{err.GetProperty("desc").GetString()}");
+        // JsonDocument 在本方法内拥有底层缓冲；返回前 clone，避免调用方拿到
+        // 文档释放后的悬空 JsonElement，同时让每条 QMP 命令都及时回收缓冲。
+        return resp.RootElement.TryGetProperty("return", out var ret) ? ret.Clone() : default;
+    }
+
+    /// <summary>注册事件处理（BLOCK_JOB_COMPLETED / SPICE_CONNECTED / DEVICE_DELETED …）。</summary>
+    public void On(string eventName, Action<JsonElement> handler) => _eventHandlers[eventName] = handler;
+
+    /// <summary>发送前检查 disposed，给出干净的 QMP 不可用错误（而不是 ObjectDisposedException）。</summary>
+    private void ThrowIfDisposed()
+    {
+        if (_disposed) throw new QmpException("QMP 连接已关闭。");
+    }
+
+    private async Task<JsonDocument> ExecuteRawAsync(object payload, CancellationToken ct)
+    {
+        int id = -1;
+        var tcs = new TaskCompletionSource<JsonDocument>(TaskCreationOptions.RunContinuationsAsynchronously);
+        ThrowIfDisposed();
+        try
+        {
+            await _sendLock.WaitAsync(ct).ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            // 检查与等待之间被 Dispose：给调用方干净的"QMP 不可用"而不是裸 ODE
+            throw new QmpException("QMP 连接已关闭。");
+        }
+        try
+        {
+            ThrowIfDisposed(); // 等锁期间可能已被释放
+            id = _nextId++;
+            _pending[id] = tcs;
+            var json = JsonSerializer.Serialize(payload);
+            // 注入 id（QMP 需要；事件没有 id）
+            json = json.Insert(json.Length - 1, $",\"id\":{id}");
+            await _writer.WriteLineAsync(json).ConfigureAwait(false);
+        }
+        catch (ObjectDisposedException)
+        {
+            // 拿到锁之后、写完之前被 Dispose：给调用方干净的"QMP 不可用"，
+            // 并清掉刚登记的挂起项
+            if (id >= 0) _pending.TryRemove(id, out _);
+            throw new QmpException("QMP 连接已关闭。");
+        }
+        finally
+        {
+            try { _sendLock.Release(); }
+            catch (ObjectDisposedException) { /* 信号量随连接一起释放了 */ }
+        }
+        // 响应由常驻读循环匹配 id 后完成；ct 取消 → 唤醒等待方（而不是永远挂起）
+        using var reg = ct.Register(() =>
+        {
+            _pending.TryRemove(id, out _);
+            tcs.TrySetCanceled(ct);
+        });
+        return await tcs.Task.ConfigureAwait(false);
+    }
+
+    /// <summary>常驻读循环：带 id 的响应完成对应命令；事件即时派发（无需命令在途）。</summary>
+    private async Task ReadLoopAsync()
+    {
+        while (!_disposed)
+        {
+            try
+            {
+                var msg = await ReadMessageAsync(CancellationToken.None).ConfigureAwait(false);
+                using (msg)
+                {
+                    if (msg.RootElement.TryGetProperty("id", out var msgId) &&
+                        _pending.TryRemove(msgId.GetInt32(), out var tcs))
+                    {
+                        // 文档所有权转移给等待方（重解析一份，原始文档在本作用域释放）
+                        tcs.TrySetResult(JsonDocument.Parse(msg.RootElement.GetRawText()));
+                    }
+                    else
+                    {
+                        DispatchEvent(msg);
+                    }
+                }
+            }
+            catch
+            {
+                // 连接关闭/损坏：让所有在途命令失败并停止循环。
+                // 标记自身已死：QEMU 还活着、管道却断了的情况（对端重置/瞬态读错误），
+                // 没有这个标记的话持有方永远不重建连接——后续所有电源操作一直抛
+                foreach (var kv in _pending) kv.Value.TrySetException(new QmpException("QMP 连接已关闭。"));
+                _pending.Clear();
+                _disposed = true;
+                return;
+            }
+        }
+    }
+
+    private void DispatchEvent(JsonDocument msg)
+    {
+        if (!msg.RootElement.TryGetProperty("event", out var ev)) return;
+        var name = ev.GetString()!;
+        try
+        {
+            if (_eventHandlers.TryGetValue(name, out var h)) h(msg.RootElement);
+            else UnhandledEvent?.Invoke(msg.RootElement, name);
+        }
+        catch
+        {
+            // 观察者异常不能被读循环误判成 QMP 传输损坏。
+        }
+    }
+
+    private async Task<JsonDocument> ReadMessageAsync(CancellationToken ct)
+    {
+        var line = await _reader.ReadLineAsync(ct).ConfigureAwait(false);
+        if (line is null) throw new QmpException("QMP 连接已关闭。");
+        return JsonDocument.Parse(line);
+    }
+
+    public void Dispose()
+    {
+        // 先立牌再拿锁：新的发送者会在锁内被 ThrowIfDisposed 拦住；
+        // 已在锁内注册的命令一定在 _pending 里——失效不会漏。
+        _disposed = true;
+        try
+        {
+            _sendLock.Wait(TimeSpan.FromSeconds(5));
+        }
+        catch (ObjectDisposedException)
+        {
+            // 已被并发释放过
+        }
+        try
+        {
+            // 在途命令立即失败（否则只能等读循环碰巧观察到流关闭，调用方白白挂住）
+            foreach (var (_, tcs) in _pending)
+                tcs.TrySetException(new QmpException("QMP 连接已关闭。"));
+            _pending.Clear();
+            try { _writer.Dispose(); } catch (ObjectDisposedException) { }
+            try { _reader.Dispose(); } catch (ObjectDisposedException) { }
+            _transport.Dispose();
+        }
+        finally
+        {
+            try { _sendLock.Release(); } catch (Exception) { /* SemaphoreFullException/ODE 均可 */ }
+            try { _sendLock.Dispose(); } catch (ObjectDisposedException) { }
+        }
+    }
+}
+
+public sealed class QmpException(string message) : Exception(message);
+
+/// <summary>QMP 高层操作（产品语义 → QMP 命令）。</summary>
+public static class QmpOps
+{
+    /// <summary>向客户机发送 Ctrl+Alt+Delete（Windows 登录/安全界面）。</summary>
+    public static Task<JsonElement> SendCtrlAltDelAsync(this QmpClient qmp, CancellationToken ct = default) =>
+        qmp.ExecuteAsync("send-key", new
+        {
+            keys = new[] { new { type = "qcode", data = "ctrl" }, new { type = "qcode", data = "alt" }, new { type = "qcode", data = "delete" } },
+        }, ct);
+
+    /// <summary>SPICE 实际监听端口（-spice port=0 自动分配后查询）。</summary>
+    public static async Task<int> QuerySpicePortAsync(this QmpClient qmp, CancellationToken ct = default)
+    {
+        var ret = await qmp.ExecuteAsync("query-spice", null, ct);
+        return ret.GetProperty("port").GetInt32();
+    }
+
+    /// <summary>正常关机 = ACPI 电源按钮请求（永远先于强制关机）。</summary>
+    public static Task<JsonElement> AcpiShutdownAsync(this QmpClient qmp, CancellationToken ct = default) =>
+        qmp.ExecuteAsync("system_powerdown", null, ct);
+
+    /// <summary>强制关机 = 用户在电源菜单选择并二次确认后才允许调用。</summary>
+    public static Task<JsonElement> ForceQuitAsync(this QmpClient qmp, CancellationToken ct = default) =>
+        qmp.ExecuteAsync("quit", null, ct);
+
+    /// <summary>Core 重启接管时为 SPICE 设置新的随机 ticket，避免凭据落盘。</summary>
+    public static Task<JsonElement> SetSpicePasswordAsync(this QmpClient qmp, string password, CancellationToken ct = default) =>
+        qmp.ExecuteAsync("set_password", new { protocol = "spice", password }, ct);
+
+    /// <summary>挂起第一步：暂停虚拟机（保存状态前的稳定点）。</summary>
+    public static Task<JsonElement> StopAsync(this QmpClient qmp, CancellationToken ct = default) =>
+        qmp.ExecuteAsync("stop", null, ct);
+
+    /// <summary>挂起第二步：完整运行状态（内存/CPU/设备）迁移到文件。Windows 构建使用 file: 目标。</summary>
+    public static Task<JsonElement> MigrateToFileAsync(this QmpClient qmp, string stateFilePath, CancellationToken ct = default) =>
+        qmp.ExecuteAsync("migrate", new { uri = $"file:{stateFilePath}" }, ct);
+
+    /// <summary>热插拔换盘：CD/DVD 运行中更换镜像（blockdev-change-medium：filename + read-only-mode）。</summary>
+    public static Task<JsonElement> InsertMediumAsync(this QmpClient qmp, string deviceId, string isoPath, CancellationToken ct = default) =>
+        qmp.ExecuteAsync("blockdev-change-medium",
+            new Dictionary<string, object?>
+            {
+                ["device"] = deviceId,
+                ["filename"] = isoPath,
+                ["format"] = "raw",
+                ["read-only-mode"] = "read-only",
+            }, ct);
+
+    /// <summary>热插拔取出介质（eject 命令；等价于"空光驱"）。</summary>
+    public static Task<JsonElement> EjectMediumAsync(this QmpClient qmp, string deviceId, CancellationToken ct = default) =>
+        qmp.ExecuteAsync("eject", new Dictionary<string, object?> { ["device"] = deviceId }, ct);
+
+    /// <summary>查询迁移状态（active/completed/failed/cancelled…）。</summary>
+    public static async Task<string> MigrationStatusAsync(this QmpClient qmp, CancellationToken ct = default)
+    {
+        var ret = await qmp.ExecuteAsync("query-migrate", null, ct);
+        return ret.TryGetProperty("status", out var s) ? s.GetString() ?? "unknown" : "unknown";
+    }
+
+    /// <summary>查询虚拟机运行状态（running/paused/…；-incoming 恢复完成的判定）。</summary>
+    public static async Task<string> VmStatusAsync(this QmpClient qmp, CancellationToken ct = default)
+    {
+        var ret = await qmp.ExecuteAsync("query-status", null, ct);
+        return ret.TryGetProperty("status", out var s) ? s.GetString() ?? "unknown" : "unknown";
+    }
+}

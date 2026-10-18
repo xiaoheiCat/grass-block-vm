@@ -1,0 +1,201 @@
+using System.IO.Pipes;
+using System.Net;
+using System.Security.Cryptography;
+using System.Security.Principal;
+using System.Text;
+using System.Text.Json;
+
+namespace GrassCore.Rpc;
+
+/// <summary>
+/// JSON-RPC 2.0。UI ↔ GrassCore 走 Windows Named Pipe（不占 TCP 端口、可用 Windows ACL）。
+/// 非 Windows 开发机上以 stdio 承载同一协议，便于本地联调与测试。
+/// </summary>
+public sealed class JsonRpcConnection
+{
+    public const int MaxFrameBytes = 16 * 1024 * 1024;
+    private readonly Stream _stream;
+
+    public JsonRpcConnection(Stream stream) => _stream = stream;
+
+    private readonly SemaphoreSlim _sendGate = new(1, 1);
+
+    /// <summary>并发请求的响应可能同时回写：整帧（长度+JSON+flush）持锁串行，防止帧交错。</summary>
+    public async Task SendAsync(JsonElement response, CancellationToken ct = default)
+    {
+        var bytes = JsonSerializer.SerializeToUtf8Bytes(response);
+        // 帧格式：4 字节小端长度 + JSON（简单可靠，避免粘包）
+        var len = BitConverter.GetBytes((int)bytes.Length);
+        await _sendGate.WaitAsync(ct);
+        try
+        {
+            await _stream.WriteAsync(len, ct);
+            await _stream.WriteAsync(bytes, ct);
+            await _stream.FlushAsync(ct);
+        }
+        finally
+        {
+            _sendGate.Release();
+        }
+    }
+
+    public async Task<JsonElement?> ReceiveAsync(CancellationToken ct = default)
+    {
+        var lenBuf = new byte[4];
+        if (!await ReadExactAsync(lenBuf, ct)) return null;
+        var len = BitConverter.ToInt32(lenBuf);
+        // RPC 只承载配置/控制数据，不应允许单帧占用几十 MiB；限制在途帧大小
+        // 可避免同一用户通过命名管道反复提交超大 JSON 把 Core 推到 OOM。
+        if (len <= 0 || len > MaxFrameBytes) throw new IOException("非法帧长度。");
+        var buf = new byte[len];
+        if (!await ReadExactAsync(buf, ct)) return null;
+        using var doc = JsonDocument.Parse(buf);
+        return doc.RootElement.Clone();
+    }
+
+    private async Task<bool> ReadExactAsync(byte[] buffer, CancellationToken ct)
+    {
+        var off = 0;
+        while (off < buffer.Length)
+        {
+            var n = await _stream.ReadAsync(buffer.AsMemory(off), ct);
+            if (n == 0) return false;
+            off += n;
+        }
+        return true;
+    }
+
+    public static JsonElement Ok(object? result, object id) => ToElement(new Dictionary<string, object?>
+    {
+        ["jsonrpc"] = "2.0",
+        ["id"] = id,
+        ["result"] = result,
+    });
+
+    public static JsonElement Error(int code, string message, object id) => ToElement(new Dictionary<string, object?>
+    {
+        ["jsonrpc"] = "2.0",
+        ["id"] = id,
+        ["error"] = new Dictionary<string, object?> { ["code"] = code, ["message"] = message },
+    });
+
+    /// <summary>RPC 线上格式：camelCase 属性 + camelCase 枚举（与 apps/desktop 的 TS 契约一致）。</summary>
+    internal static readonly JsonSerializerOptions WireOpts = new(JsonSerializerDefaults.General)
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+        DictionaryKeyPolicy = JsonNamingPolicy.CamelCase,
+        Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter(
+            System.Text.Json.JsonNamingPolicy.CamelCase) },
+    };
+
+    private static JsonElement ToElement(object obj)
+    {
+        var json = JsonSerializer.Serialize(obj, WireOpts);
+        return JsonDocument.Parse(json).RootElement.Clone();
+    }
+}
+
+/// <summary>IPC 传输端点选择：Windows 用 Named Pipe；其他平台（开发）用 stdio。</summary>
+public static class Transport
+{
+    // 保留旧常量供测试/外部诊断代码编译；服务端默认端点已改为用户专属名称。
+    public const string DefaultPipeName = "grassvm-core";
+    /// <summary>按当前用户隔离管道和互斥锁，避免不同用户互相阻塞却无法连接。</summary>
+    public static string CurrentUserPipeName => "grassvm-core-" + CurrentUserKey();
+    public static string CurrentUserMutexName => "Local\\GrassBlockVM.Core." + CurrentUserKey();
+
+    private static string CurrentUserKey()
+    {
+        var identity = Environment.UserName;
+        if (OperatingSystem.IsWindows())
+        {
+            try { identity = WindowsIdentity.GetCurrent().User?.Value ?? identity; }
+            catch { /* 受限宿主环境回退到用户名；两端仍使用同一回退规则 */ }
+        }
+        var bytes = SHA256.HashData(Encoding.UTF8.GetBytes(identity.ToUpperInvariant()));
+        return Convert.ToHexString(bytes)[..16].ToLowerInvariant();
+    }
+    public const int MaxConnections = 16;
+
+    /// <summary>当前活跃连接数（空闲退出判定用）。</summary>
+    public static int ActiveConnections => _activeConnections;
+    private static int _activeConnections;
+
+    public static async Task RunServerAsync(Func<JsonRpcConnection, Task> handler, string? pipeName = null, CancellationToken ct = default)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            var name = pipeName ?? CurrentUserPipeName;
+            while (!ct.IsCancellationRequested)
+            {
+                var server = new NamedPipeServerStream(name, PipeDirection.InOut,
+                    NamedPipeServerStream.MaxAllowedServerInstances, PipeTransmissionMode.Byte,
+                    // RPC 管道承载所有 Core 写操作，必须显式限制为当前 Windows 用户，
+                    // 避免依赖系统默认 DACL 导致同机其他用户可抢占或调用固定管道名。
+                    PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly);
+                try
+                {
+                    await server.WaitForConnectionAsync(ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    server.Dispose();
+                    break;
+                }
+                catch (IOException)
+                {
+                    server.Dispose(); // 单次瞬时失败不杀整个服务
+                    await Task.Delay(200, CancellationToken.None);
+                    continue;
+                }
+                // 同一用户下的脚本仍可反复打开当前用户管道；限制连接总数，
+                // 避免每个连接各自拥有请求队列后耗尽线程池和内存。用原子
+                // 预占而不是“检查后再递增”，避免并发连接在检查窗口全部通过。
+                if (Interlocked.Increment(ref _activeConnections) > MaxConnections)
+                {
+                    Interlocked.Decrement(ref _activeConnections);
+                    server.Dispose();
+                    await Task.Delay(200, ct);
+                    continue;
+                }
+                var conn = new JsonRpcConnection(server);
+                // 释放归连接处理器所有：循环体的 await using 会在【每次迭代末】就把刚接上的
+                // 管道关掉（作用域是迭代而不是外层函数）——Core 在 Windows 上完全不可达。
+                // 任务不绑 ct：取消时应照样释放管道并递减计数（否则空闲退出计数永久虚高）。
+                _ = Task.Run(async () =>
+                {
+                    try { await handler(conn); }
+                    finally
+                    {
+                        Interlocked.Decrement(ref _activeConnections);
+                        server.Dispose();
+                    }
+                });
+            }
+        }
+        else
+        {
+            var conn = new JsonRpcConnection(Console.OpenStandardInput() is { } i && Console.IsInputRedirected ? new DualStream(i, Console.OpenStandardOutput()) : new DualStream(Console.OpenStandardInput(), Console.OpenStandardOutput()));
+            Interlocked.Increment(ref _activeConnections);
+            try { await handler(conn); }
+            finally { Interlocked.Decrement(ref _activeConnections); }
+        }
+    }
+
+    /// <summary>合并输入/输出两个半双工流的简单 Stream。</summary>
+    private sealed class DualStream(Stream read, Stream write) : Stream
+    {
+        public override bool CanRead => true;
+        public override bool CanSeek => false;
+        public override bool CanWrite => true;
+        public override long Length => throw new NotSupportedException();
+        public override long Position { get => 0; set => throw new NotSupportedException(); }
+        public override void Flush() => write.Flush();
+        public override int Read(byte[] buffer, int offset, int count) => read.Read(buffer, offset, count);
+        public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken ct) => read.ReadAsync(buffer, offset, count, ct);
+        public override void Write(byte[] buffer, int offset, int count) => write.Write(buffer, offset, count);
+        public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken ct) => write.WriteAsync(buffer, offset, count, ct);
+        public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+        public override void SetLength(long value) => throw new NotSupportedException();
+    }
+}

@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!--
+      GrassCore 发布形态（按计划）：self-contained 单一可执行文件，用户机器零依赖。
+      实际发布参数（win-x64、PublishSingleFile 等）在 release 流程中给定；
+      开发机（含非 Windows CI）允许 AnyCPU + framework-dependent 以便 `dotnet test`。
+    -->
+    <RootNamespace>GrassCore</RootNamespace>
+    <AssemblyName>GrassCore</AssemblyName>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="GrassCore.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.0" />
+    <!-- 提升 SQLitePCLRaw native bundle 以规避 GHSA-2m69-gcr7-jv3q -->
+    <PackageReference Include="SQLitePCLRaw.bundle_e_sqlite3" Version="2.1.12" />
+    <!-- Win32_Processor/Win32_ComputerSystem WMI 查询（仅 Windows 上调用；包本身跨平台安装） -->
+    <PackageReference Include="System.Management" Version="9.0.0" />
+  </ItemGroup>
+
+</Project>
