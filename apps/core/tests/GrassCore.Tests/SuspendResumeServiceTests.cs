@@ -420,4 +420,47 @@ public class SuspendResumeServiceTests : IDisposable
         Assert.True(File.Exists(pkg.LockPath), "vm.lock 被拒绝路径删除——互斥被破坏");
         Assert.Equal(sessionJson, File.ReadAllText(pkg.SessionPath));
     }
+
+    [Fact]
+    public void StartVm_ExternalDiskWithBacking_IsRejectedBeforeQemuLaunch()
+    {
+        using var launcher = new RecordingLauncher();
+        using var db = new HostDb(Path.Combine(_dir, "external-backing.db"));
+        var root = Path.Combine(_dir, "external-backing-root");
+        var fw = Path.Combine(_dir, "external-backing-fw");
+        Directory.CreateDirectory(root);
+        Directory.CreateDirectory(fw);
+        db.SetPreference("libraryRoot", root);
+        File.WriteAllText(Path.Combine(fw, "OVMF_VARS.fd"), "vars-template");
+
+        var service = new GrassCoreService(db, "qemu-system-x86_64", CreateFakeQemuImg(),
+            fw, "11", launcher, qmpTransportFactory: _ => null);
+        var vmPath = ((GrassCoreService.CreateVmResult)service.CreateVm(JsonSerializer.SerializeToElement(new
+        {
+            name = "ExternalBacking", profileId = "ubuntu", diskGiB = 8,
+            isoPath = (string?)null, cpuCores = 1, memoryMiB = 1024, startAfterCreate = false,
+        }))).Path;
+        var pkg = new GrassVm.GrassVmPackage(vmPath);
+
+        // 用户只选择了 external.qcow2；镜像暗中引用同目录的宿主文件 victim.bin。
+        // 假 qemu-img 从镜像内容中的最后一个 -b 参数返回完整 backing 路径。
+        var externalDir = Path.Combine(_dir, "external-images");
+        Directory.CreateDirectory(externalDir);
+        var victim = Path.Combine(externalDir, "victim.bin");
+        var externalDisk = Path.Combine(externalDir, "external.qcow2");
+        File.WriteAllText(victim, "host-secret");
+        File.WriteAllBytes(externalDisk, new byte[] { (byte)'Q', (byte)'F', (byte)'I', 0xfb, (byte)'\n' });
+        File.AppendAllText(externalDisk,
+            $"create -f qcow2 -b {Path.GetFileName(victim)} -F qcow2 {externalDisk}\n",
+            System.Text.Encoding.Latin1);
+
+        var config = new Config.ConfigStore(pkg).Load();
+        config.Devices.OfType<Config.DiskDevice>().Single().Path = externalDisk;
+        new Config.ConfigStore(pkg).Save(config);
+
+        var ex = Assert.Throws<GrassCoreException>(() => service.StartVm(vmPath));
+        Assert.Contains("外部虚拟磁盘带有 backing", ex.Message);
+        Assert.Empty(launcher.Commands);
+        Assert.False(File.Exists(pkg.LockPath), "安全预检拒绝后必须释放 vm.lock");
+    }
 }

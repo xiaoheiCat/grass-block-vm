@@ -10,6 +10,7 @@ import net from 'node:net';
 import http from 'node:http';
 import { WebSocketServer } from './ws-lite';
 import { CoreBridge } from './core-bridge';
+import { isAutostartLaunch } from './startup-mode';
 
 // UI 也收敛为单实例：Core 端虽然有跨进程 mutex，但第二个 Electron 若继续
 // 留下会产生重复 Library/Display 窗口和重复轮询。第二次启动只把已有窗口置前。
@@ -240,19 +241,21 @@ app.on('window-all-closed', () => {
 
 app.whenReady().then(async () => {
   if (!isPrimaryInstance) return;
+  // 登录自启动是无窗口任务：必须在创建 Library/注册 activate 之前分流。
+  // 否则主窗口会在 VM 串行启动及间隔等待期间一直显示在桌面上。
+  if (isAutostartLaunch(process.argv)) {
+    try {
+      const b = await createBridge();
+      await b.call('runAutostart', {});
+    } catch (e) {
+      console.error('[autostart] bridge unavailable:', e);
+    } finally {
+      app.quit();
+    }
+    return;
+  }
   createLibraryWindow();
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createLibraryWindow();
   });
-  // 自启动只在【开机登录触发的启动】跑（实际用户的登录项带 --autostart）。
-  // 用户手动打开应用不拉清单——否则每次打开库都把所有 autostart VM 开一遍
-  if (!process.argv.includes('--autostart')) return;
-  try {
-    const b = await createBridge();
-    await b.call('runAutostart', {});
-    app.quit();
-  } catch (e) {
-    console.error('[autostart] bridge unavailable:', e);
-    app.quit();
-  }
 });

@@ -2875,7 +2875,7 @@ public sealed class GrassCoreService
         var ops = new TransactionalDiskOps(_qemuImgPath);
         foreach (var disk in config.Devices.OfType<DiskDevice>())
         {
-            if (PathPolicy.IsExternal(package, disk.Path)) continue;
+            var externalTopLevel = PathPolicy.IsExternal(package, disk.Path);
             var current = PathPolicy.Resolve(package, disk.Path);
             var seen = new HashSet<string>(OperatingSystem.IsWindows()
                 ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
@@ -2890,6 +2890,12 @@ public sealed class GrassCoreService
                 try { backing = ops.QueryBackingFileStrict(current); }
                 catch (QemuImgException e) { throw new GrassCoreException($"无法验证虚拟磁盘 backing 链：{e.Message}"); }
                 if (backing is null) break;
+                // 用户只明确选择了顶层外部镜像，并未授权它间接读取任意 backing。
+                // 当前产品没有逐层展示并确认 backing 路径的交互，因此外部镜像只
+                // 接受独立盘；带 backing 的镜像必须先转换/扁平化后才能挂载。
+                if (externalTopLevel)
+                    throw new GrassCoreException(
+                        "外部虚拟磁盘带有 backing 引用，可能读取未授权的宿主文件，已拒绝启动。请先将它转换为独立磁盘后重试。");
                 var backingFull = Path.GetFullPath(backing);
                 var cmp = OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
                 if (!allowedRoots.Any(root => backingFull.StartsWith(root.TrimEnd(Path.DirectorySeparatorChar,
